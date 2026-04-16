@@ -1,0 +1,16 @@
+{
+  "folders": [
+    {
+      "name": "agentmail-take-home",
+      "path": "."
+    }
+  ],
+  "settings": {
+    "git.enabled": true,
+    "git.autoRepositoryDetection": true,
+    "git.timeline.enabled": true,
+    "scm.diffDecorations": "all",
+    "explorer.decorations.badges": true,
+    "explorer.decorations.colors": true
+  }
+}
