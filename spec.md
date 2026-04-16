@@ -28,17 +28,18 @@ Here is the fully formatted Markdown for the specification document. The content
                                           │
                                           │ metadata
                                           ▼
-                                    ┌──────────┐
-                                    │  SQLite  │
-                                    │ (agents, │
-                                    │  convos, │
-                                    │ cursors) │
-                                    └──────────┘
+                                    ┌──────────────┐
+                                    │  PostgreSQL   │
+                                    │  (Neon)       │
+                                    │  agents,      │
+                                    │  convos,      │
+                                    │  cursors      │
+                                    └──────────────┘
 ```
 
 **Two storage layers, cleanly separated:**
 * **S2:** All message content. One stream per conversation. Records are events (`message_start`, `message_append`, `message_end`, system events). S2 handles ordering, durability, replay, real-time tailing.
-* **SQLite:** All metadata. Agent registry, conversation membership, read cursors. Embedded, zero-config, transactional.
+* **PostgreSQL (Neon):** All metadata. Agent registry, conversation membership, read cursors. Managed serverless PostgreSQL via Neon, accessed over direct TCP from Go server on Fly.io.
 
 **Transport:**
 * **HTTP POST** for all writes — two tiers: complete messages (single request-response) and streaming messages (NDJSON streaming body over a single persistent HTTP connection)
@@ -56,13 +57,13 @@ Here is the fully formatted Markdown for the specification document. The content
 **What the spec says:** Register provisions a new agent, returns an opaque ID. No metadata. No authentication. Each call creates a new identity. The ID scopes all access.
 
 **Hidden complexities:**
-* The agent ID is the sole credential. Leaking it means impersonation. The spec says no auth, so we accept this — but the ID should be a cryptographically random UUID, not a sequential integer, to prevent enumeration.
+* The agent ID is the sole credential. Leaking it means impersonation. The spec says no auth, so we accept this — but the ID should be a UUIDv7 (time-ordered, RFC 9562), not a sequential integer, to prevent enumeration.
 * "No metadata" means no name, no description, nothing. This is intentional — the spec wants you to avoid building user management.
 * The spec doesn't mention agent deletion. Agents are permanent. An agent that's a member of conversations cannot be garbage-collected without orphaning messages.
 
 **Implementation:**
-* `POST /agents` → generates UUIDv4, inserts into agents table, returns `{ "agent_id": "uuid" }`
-* SQLite table: `agents(id TEXT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`
+* `POST /agents` → generates UUIDv7 via `uuid.NewV7()`, inserts into agents table, returns `{ "agent_id": "uuid" }`
+* PostgreSQL table: `agents(id UUID PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL DEFAULT now())`
 * No request body needed. No idempotency concerns (each call creates a new agent).
 * Validate agent existence on every subsequent API call via middleware.
 
@@ -71,7 +72,7 @@ Here is the fully formatted Markdown for the specification document. The content
 * Invalid agent ID in subsequent requests: return 404 with clear error message
 * Empty database on fresh deploy: first agent registration works with no special handling
 
-**Files:** `internal/api/agents.go`, `internal/store/sqlite.go`
+**Files:** `internal/api/agents.go`, `internal/store/postgres.go`
 
 ---
 
@@ -82,8 +83,8 @@ Here is the fully formatted Markdown for the specification document. The content
 **Hidden complexities:**
 
 * **Create:**
-    * Must atomically: (a) create conversation in SQLite, (b) add creator as member, (c) create S2 stream for the conversation.
-    * If S2 stream creation fails after SQLite insert, we have an orphaned conversation. Handle this: create S2 stream first, then insert into SQLite. If SQLite fails, we have an empty S2 stream (harmless).
+    * Must atomically: (a) create conversation in PostgreSQL, (b) add creator as member, (c) create S2 stream for the conversation.
+    * If S2 stream creation fails after PostgreSQL insert, we have an orphaned conversation. Handle this: create S2 stream first, then insert into PostgreSQL. If PostgreSQL fails, we have an empty S2 stream (harmless).
     * The S2 stream name should encode the conversation ID for easy lookup (e.g., `conv-{conversation_id}`).
 * **List:**
     * Returns conversations where the agent is currently a member.
@@ -116,12 +117,12 @@ Here is the fully formatted Markdown for the specification document. The content
 * Leave + immediate re-invite: should work. The agent gets a fresh start but full history is visible.
 * Create conversation with no one to talk to: valid. An agent can create a conversation with itself. The spec explicitly says "A single agent can create a conversation with itself."
 
-**Files:** `internal/api/conversations.go`, `internal/store/sqlite.go`
+**Files:** `internal/api/conversations.go`, `internal/store/postgres.go`
 
-**SQLite tables:**
+**PostgreSQL tables:**
 ```sql
-CREATE TABLE conversations(id TEXT PRIMARY KEY, created_at TIMESTAMP);
-CREATE TABLE members(conversation_id TEXT, agent_id TEXT, joined_at TIMESTAMP, PRIMARY KEY(conversation_id, agent_id));
+CREATE TABLE conversations(id UUID PRIMARY KEY, s2_stream_name TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE members(conversation_id UUID NOT NULL REFERENCES conversations(id), agent_id UUID NOT NULL REFERENCES agents(id), joined_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(conversation_id, agent_id));
 ```
 
 ---
@@ -199,7 +200,7 @@ Header: Content-Type: application/x-ndjson
 **Server-side mechanics (Go):**
 ```go
 func (h *Handler) StreamMessage(w http.ResponseWriter, r *http.Request) {
-    msgID := uuid.New().String()
+    msgID := uuid.NewV7().String()
     h.s2.AppendRecord(convID, messageStartEvent(msgID, agentID))
 
     scanner := bufio.NewScanner(r.Body)
@@ -356,14 +357,14 @@ data: {"agent_id":"a2","timestamp":"2026-04-14T10:01:00Z"}
 3.  Server determines starting position:
     * If `from` query param: use that sequence number.
     * If `Last-Event-ID` header: use that + 1.
-    * If neither: look up agent's stored cursor from SQLite.
+    * If neither: look up agent's stored cursor from in-memory cache (falling back to PostgreSQL).
     * If no stored cursor: start from sequence 0 (beginning of conversation).
 4.  Server opens S2 read session from the starting position.
 5.  S2 returns historical records (replay/catchup phase).
 6.  Server translates each S2 record to an SSE event and writes to the HTTP response.
 7.  When S2 reaches the end of the stream, it transitions to real-time tailing.
 8.  New records appended to the S2 stream are immediately forwarded as SSE events.
-9.  Server periodically updates the agent's read cursor in SQLite.
+9.  Server periodically flushes the agent's read cursor from in-memory cache to PostgreSQL (batched every 5 seconds).
 
 **Connection lifecycle:**
 * Register connection in the connection registry: `activeConnections[(agent_id, cid)] = cancelFunc`
@@ -372,7 +373,7 @@ data: {"agent_id":"a2","timestamp":"2026-04-14T10:01:00Z"}
 * On server shutdown: graceful drain — send final event, close all connections.
 
 **Cursor management:**
-* Store in SQLite: `cursors(agent_id TEXT, conversation_id TEXT, seq_num INTEGER, updated_at TIMESTAMP)`
+* Store in PostgreSQL (warm tier): `cursors(agent_id UUID, conversation_id UUID, seq_num BIGINT, updated_at TIMESTAMPTZ)`. Hot tier: in-memory `sync.RWMutex` map updated on every event delivery.
 * Update strategy: batch updates — every 10 events or every 5 seconds, whichever comes first.
 * On disconnect: flush final cursor position.
 * On reconnect: resume from stored cursor.
@@ -450,68 +451,431 @@ Response: 200 OK
 
 ---
 
-### 1.6 Metadata Storage (SQLite)
+### 1.6 Metadata Storage (PostgreSQL / Neon)
 
-**Why SQLite:**
-* Zero external dependencies. Embedded in the Go binary.
-* Sufficient for this scale (the spec isn't testing database expertise).
-* Transactional. ACID. WAL mode for concurrent readers.
-* Single file, easy to back up, easy to deploy.
-* Keeps the focus on the core messaging problem, not database administration.
+#### 1.6.1 Why PostgreSQL, Not SQLite
 
-**Schema:**
+| SQLite Constraint | Impact at scale |
+|---|---|
+| **Single-writer lock** | ALL writes serialize — cursor flushes, invites, leaves, agent registration queue behind each other. At 10K cursor writes/sec, this is a hard wall. |
+| **Database-level locks, not row-level** | Two agents leaving DIFFERENT conversations block each other. PostgreSQL's `FOR UPDATE` locks only the rows in the relevant conversation. |
+| **No concurrent write connections** | WAL mode allows concurrent readers, but only one writer at a time. Every write-path goroutine contends for the same lock. |
+| **No `LISTEN/NOTIFY`** | No path to multi-instance cache invalidation without adding another dependency. |
+| **No native UUID type** | UUIDs stored as 36-byte TEXT, not 16-byte binary. 2.25x storage overhead on every UUID column and index. |
+| **No `unnest()` batch operations** | Cursor flush requires N individual INSERT statements or brittle multi-value INSERT strings. |
+| **Embedded = single process** | If you need a second server instance (horizontal scaling), you need a separate database entirely. |
+
+**What PostgreSQL provides:**
+- **Row-level locking** (`FOR UPDATE`) — concurrent leave operations on different conversations don't block each other
+- **Connection pooling** with true concurrent writers — pgxpool manages 15 connections handling 30K+ queries/sec
+- **`unnest()` batch upserts** — flush 10K cursor updates in a single 5-20ms statement
+- **Native UUID type** — 16-byte binary storage, 55% smaller than TEXT representation
+- **`LISTEN/NOTIFY`** — multi-instance cache invalidation (scaling path)
+- **Mature ecosystem** — pgx, sqlc, monitoring, backups, replicas, partitioning — all battle-tested at scale
+
+**What we lose:** Zero-config embedded deployment. PostgreSQL is an external dependency. Single-binary simplicity. The Go binary now requires a database connection string. **These costs are already paid** by the decision to deploy on Fly.io + Neon.
+
+#### 1.6.2 Hosting: Neon Serverless PostgreSQL
+
+Fly.io's own documentation is titled **"This Is Not Managed Postgres."** Their unmanaged Postgres is a VM running a Postgres Docker image — you handle backups, failover, monitoring, and recovery. Their truly managed offering starts at $38/month with no free tier.
+
+| Dimension | Neon | Fly.io Postgres (unmanaged) | Fly.io Managed Postgres |
+|---|---|---|---|
+| **Management** | Fully managed | Self-managed | Fully managed |
+| **Cost** | Free tier (0.5 GB, 100 CU-hours/mo) | ~$0 (VM cost only) | $38/mo minimum |
+| **Backups** | Automatic, point-in-time recovery | Manual | Automatic |
+| **Failover** | Automatic | Manual | Automatic |
+| **PostgreSQL version** | 16, 17 | Whatever you install | 16 |
+| **Connection pooling** | Built-in PgBouncer | DIY | Built-in |
+
+**Architecture:**
+```text
+┌─────────────────────┐         TCP (direct)        ┌──────────────────────┐
+│  Go Server          │ ──────────────────────────→  │  Neon PostgreSQL     │
+│  (Fly.io, iad)      │         ~1-5ms latency       │  (AWS us-east-1)     │
+│                     │ ←──────────────────────────   │  PostgreSQL 17       │
+│  pgxpool (15 conns) │                              │                      │
+└─────────────────────┘                              └──────────────────────┘
+```
+
+**Our choice: Direct connection.** We manage our own pool via pgxpool. pgx's built-in statement caching (`QueryExecModeCacheStatement`) gives us the performance benefit of prepared statements without PgBouncer's limitations.
+
+**Neon-specific considerations:**
+- **Scale-to-zero:** Neon suspends compute after 5 minutes of inactivity. Cold start is <500ms. For the live service evaluation, disable scale-to-zero to eliminate cold starts.
+- **Storage:** Free tier is 0.5 GB. At our actual take-home scale (hundreds of agents), well under 0.5 GB. At 1M agents the footprint is ~700 MB — upgrade to Neon Launch ($19/mo, 10 GB).
+- **Compute hours:** 100 CU-hours/month at 0.25 CU = 400 hours of runtime = ~16 days continuous. Sufficient for evaluation.
+
+#### 1.6.3 Driver Stack: pgx v5 + sqlc
+
+**pgx v5 native interface (not `database/sql` wrapper):**
+- ~50% faster than `database/sql` due to binary wire protocol and statement caching
+- Native PostgreSQL type support (UUID, JSONB, arrays, composite types)
+- Batch operations (`pgx.Batch`, `pgx.CopyFrom`) not available through `database/sql`
+- pgxpool is purpose-built for pgx, not a generic pool
+
+**Key packages:**
+- `github.com/jackc/pgx/v5` — driver
+- `github.com/jackc/pgx/v5/pgxpool` — connection pool
+- `github.com/jackc/pgx/v5/pgtype` — type system for UUID, arrays, etc.
+
+**sqlc code generation:** Write SQL queries in `.sql` files. sqlc parses them against the schema at build time and generates type-safe Go structs + functions that call pgx. Compile-time SQL validation, no manual row scanning, zero runtime overhead. Where sqlc doesn't apply: `unnest()` batch upserts for cursor flush — use raw pgx.
+
+**Configuration (`sqlc.yaml`):**
+```yaml
+version: "2"
+sql:
+  - engine: "postgresql"
+    queries: "internal/store/queries/"
+    schema: "internal/store/schema/"
+    gen:
+      go:
+        package: "db"
+        out: "internal/store/db"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_empty_slices: true
+```
+
+#### 1.6.4 Primary Key Strategy: UUIDv7
+
+UUIDv4 is random — every INSERT scatters across the B-tree, causing random page splits and cache thrashing. UUIDv7 is time-ordered (embeds a millisecond timestamp, RFC 9562), so inserts append to the rightmost leaf page.
+
+| Metric | UUIDv4 | UUIDv7 | Improvement |
+|---|---|---|---|
+| Bulk insert throughput | Baseline | +49% | Sequential page writes vs random |
+| Index size (1M rows) | Baseline | -25% | Fewer page splits → less fragmentation |
+| Buffer cache hit ratio | Lower | Higher | Hot rightmost pages stay cached |
+
+**Go side:** Generate with `uuid.NewV7()` from `github.com/google/uuid` (v1.6.0+, RFC 9562 compliant).
+**PostgreSQL side:** Store as `UUID` type (16 bytes binary), NOT `TEXT` (36 bytes).
+**No `DEFAULT gen_random_uuid()`** — we always generate in Go to ensure UUIDv7. If a row is inserted without an explicit ID, it should fail loudly.
+
+**UUIDv7 and opacity:** The spec says "opaque identifier." UUIDv7 embeds a timestamp, but "opaque" means the client shouldn't depend on internal structure for functionality. The embedded timestamp is an implementation detail useful for debugging. No security implication (no auth to protect).
+
+#### 1.6.5 Schema Design
+
 ```sql
+-- ============================================================
+-- AgentMail Metadata Schema
+-- PostgreSQL 17 / Neon Serverless
+-- ============================================================
+
+-- Agents: each row is a registered agent identity
 CREATE TABLE agents (
-    id TEXT PRIMARY KEY,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    id          UUID PRIMARY KEY,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Conversations: each row maps to one S2 stream
 CREATE TABLE conversations (
-    id TEXT PRIMARY KEY,
-    s2_stream_name TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    id              UUID PRIMARY KEY,
+    s2_stream_name  TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- One S2 stream per conversation, one conversation per stream
+CREATE UNIQUE INDEX idx_conversations_s2_stream ON conversations(s2_stream_name);
+
+-- Members: many-to-many join between conversations and agents
+-- Hard-deleted on leave. S2 stream has the full membership event history.
 CREATE TABLE members (
-    conversation_id TEXT NOT NULL REFERENCES conversations(id),
-    agent_id TEXT NOT NULL REFERENCES agents(id),
-    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    conversation_id  UUID NOT NULL REFERENCES conversations(id),
+    agent_id         UUID NOT NULL REFERENCES agents(id),
+    joined_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (conversation_id, agent_id)
 );
 
+-- For "list conversations for agent" queries
+CREATE INDEX idx_members_agent_id ON members(agent_id);
+
+-- Cursors: server-managed read positions for at-least-once delivery
+-- No foreign keys — validated at API layer, and cursors may outlive membership
+-- (preserved on leave for potential re-invite resume)
 CREATE TABLE cursors (
-    agent_id TEXT NOT NULL,
-    conversation_id TEXT NOT NULL,
-    seq_num INTEGER NOT NULL DEFAULT 0,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    agent_id         UUID NOT NULL,
+    conversation_id  UUID NOT NULL,
+    seq_num          BIGINT NOT NULL DEFAULT 0,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (agent_id, conversation_id)
 );
 ```
 
-**Indexes:**
-* `members(agent_id)` — for listing conversations by agent
-* `cursors(agent_id, conversation_id)` — already the primary key
+**Table rationale:**
+* **`agents`:** No indexes beyond PK. No metadata columns (spec says "no metadata"). Agents are permanent (no soft-delete).
+* **`conversations`:** `s2_stream_name` decouples conversation ID from S2 stream name (format: `conv-{conversation_id}`). UNIQUE index prevents two conversations pointing to the same stream.
+* **`members`:** PK order `(conversation_id, agent_id)` optimized for the hottest queries: membership check (`WHERE conversation_id = $1 AND agent_id = $2`) and member list (`WHERE conversation_id = $1`). Separate index on `(agent_id)` for "list conversations for agent." Foreign keys with no CASCADE — agents and conversations are permanent. **Hard delete on leave:** simpler queries (no `AND left_at IS NULL`), S2 stream has full membership event history, re-invite is a fresh INSERT.
+* **`cursors`:** No foreign keys (validated at API layer, cursors may outlive membership). **Cursors survive leave** — on re-invite, agent resumes from where they left off, catching up on missed messages. `BIGINT` for `seq_num` (S2 sequence numbers are 64-bit). PK order `(agent_id, conversation_id)` optimized for disconnect cleanup.
 
-**Connection management:** Single `*sql.DB` with WAL mode enabled. `PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`
+**Why exactly four tables:** No `messages` table (messages live in S2). No `sessions`/`connections` table (tracked in-memory). No `events`/`audit` table (S2 streams ARE the audit log).
 
-**Files:** `internal/store/sqlite.go`
+#### 1.6.6 Connection Pooling
+
+```go
+poolConfig, _ := pgxpool.ParseConfig(os.Getenv("DATABASE_URL"))
+
+poolConfig.MaxConns = 15                              // Optimal for 4-core SSD: (cores * 2) + headroom
+poolConfig.MinConns = 5                               // Pre-warm 5 connections on startup
+poolConfig.MaxConnLifetime = 30 * time.Minute         // Recycle connections to prevent stale state
+poolConfig.MaxConnLifetimeJitter = 5 * time.Minute    // Stagger recycling to prevent thundering herd
+poolConfig.MaxConnIdleTime = 5 * time.Minute          // Release idle connections
+poolConfig.HealthCheckPeriod = 30 * time.Second       // Detect dead connections
+```
+
+**Why 15 connections handles thousands of goroutines:** Membership checks are indexed point lookups (~100-500µs execution). Throughput: `15 conns × (1,000,000µs / 300µs) = 50,000 queries/sec`. Goroutines waiting for a connection are queued by pgxpool — wait is negligible.
+
+**Critical rule: Never hold a connection during SSE.** SSE handlers touch the database exactly twice (cursor read on connect, cursor flush on disconnect), both sub-millisecond. The pool stays healthy.
+
+#### 1.6.7 Membership Caching
+
+Every API call validates membership — the #1 query by volume. In-process LRU cache with TTL reduces Postgres load.
+
+```go
+type MembershipCache struct {
+    cache *lru.Cache[membershipKey, membershipEntry]
+    ttl   time.Duration  // 60 seconds
+    pool  *pgxpool.Pool
+}
+```
+
+**Configuration:** Max 100,000 entries (~4.8 MB). TTL 60 seconds. LRU eviction.
+
+**Read path:** Check cache → if hit and not expired, return → if miss, query Postgres, populate cache.
+**Invite:** Insert into Postgres + set cache to true.
+**Leave:** Delete from Postgres + delete from cache (don't set false — let next check query Postgres fresh).
+
+**Why in-process, not Redis:** In-process is 10,000x faster (~50ns vs ~500µs network hop), zero operational cost, no additional dependency. Redis is only needed at 2+ server instances with shared cache.
+
+**Multi-instance scaling path (documented, not implemented):** Use `LISTEN/NOTIFY` — on invite/leave, `NOTIFY membership_changed, 'conversation_id'`. All instances listen, invalidate local cache. TTL remains as safety net.
+
+#### 1.6.8 Concurrency & Locking
+
+**Race Condition 1: Last Member Cannot Leave**
+
+Two agents in a conversation both call leave simultaneously. Both check count, both see 2, both proceed → 0 members.
+
+**Solution:** `SELECT ... FOR UPDATE` serializes concurrent leave operations per conversation:
+```sql
+BEGIN;
+SELECT agent_id FROM members WHERE conversation_id = $1 FOR UPDATE;
+-- Application checks: (1) Is leaving agent in result set? (2) Is count == 1?
+DELETE FROM members WHERE conversation_id = $1 AND agent_id = $2;
+COMMIT;
+```
+
+No deadlock: both transactions lock the same rows in the same B-tree order. Second transaction blocks until first commits.
+
+**Race Condition 2: Invite Idempotency**
+
+`INSERT ... ON CONFLICT DO NOTHING RETURNING conversation_id`. If RETURNING returns a row → newly added, write `agent_joined` to S2. If no row → already a member, skip.
+
+**Race Condition 3: Invite vs. Leave on Same Agent**
+
+PostgreSQL serializes them. Leave-first: row deleted, then invite inserts fresh row. Invite-first: `ON CONFLICT DO NOTHING`, then leave deletes. Both outcomes consistent.
+
+**Race Condition 4: Last Member Leave vs. Invite**
+
+Leave uses `FOR UPDATE` (locks existing rows), invite uses `INSERT` (new row). Leave-first with count=1: rejects, invite proceeds. Invite-first: count becomes 2, leave proceeds. Both outcomes safe.
+
+**Race Condition 5: Concurrent Agent Registration**
+
+No race. UUIDv7s are unique. Independent rows. No locking needed.
+
+#### 1.6.9 Connection Registry (Active Stream Termination)
+
+The spec requires: "Active streaming connections are terminated on leave."
+
+```go
+type ConnRegistry struct {
+    mu    sync.Mutex
+    conns map[connKey]*connEntry
+}
+
+type connEntry struct {
+    Cancel context.CancelFunc   // cancels the SSE/stream goroutine
+    Done   chan struct{}         // closed when the goroutine exits
+}
+```
+
+**Leave handler flow:**
+1. Begin Postgres transaction → `SELECT ... FOR UPDATE` → check count > 1 → DELETE → commit
+2. Invalidate membership cache
+3. Look up `(agent_id, conversation_id)` in ConnRegistry
+4. If found: call `entry.Cancel()`, then `<-entry.Done` (wait for goroutine exit, 5s timeout)
+5. Write `agent_left` event to S2 stream
+6. Return 200
+
+**One SSE connection per (agent, conversation):** If agent opens a second connection, cancel the old one first. Prevents resource leaks.
+
+#### 1.6.10 Store Interface: Go Design
+
+```go
+// Top-level
+type Store interface {
+    Agents() AgentStore
+    Conversations() ConversationStore
+    Members() MembershipService
+    Cursors() CursorStore
+    ConnRegistry() *ConnRegistry
+    Close() error
+}
+
+type AgentStore interface {
+    Create(ctx context.Context) (uuid.UUID, error)
+    Exists(ctx context.Context, id uuid.UUID) (bool, error)
+}
+
+type ConversationStore interface {
+    Create(ctx context.Context, id uuid.UUID, s2StreamName string) error
+    Get(ctx context.Context, id uuid.UUID) (*Conversation, error)
+    Exists(ctx context.Context, id uuid.UUID) (bool, error)
+}
+
+type MembershipService interface {
+    IsMember(ctx context.Context, agentID, convID uuid.UUID) (bool, error)
+    AddMember(ctx context.Context, convID, agentID uuid.UUID) error
+    RemoveMember(ctx context.Context, convID, agentID uuid.UUID) error
+    ListMembers(ctx context.Context, convID uuid.UUID) ([]uuid.UUID, error)
+    ListConversations(ctx context.Context, agentID uuid.UUID) ([]ConversationWithMembers, error)
+}
+
+type CursorStore interface {
+    GetCursor(ctx context.Context, agentID, convID uuid.UUID) (uint64, error)
+    UpdateCursor(agentID, convID uuid.UUID, seqNum uint64)  // memory-only, no error
+    FlushOne(ctx context.Context, agentID, convID uuid.UUID) error
+    FlushAll(ctx context.Context) error
+    Start(ctx context.Context)
+}
+```
+
+#### 1.6.11 SQL Queries (sqlc Source)
+
+**agents.sql:**
+```sql
+-- name: CreateAgent :one
+INSERT INTO agents (id, created_at) VALUES ($1, now()) RETURNING id, created_at;
+-- name: AgentExists :one
+SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1);
+```
+
+**conversations.sql:**
+```sql
+-- name: CreateConversation :exec
+INSERT INTO conversations (id, s2_stream_name, created_at) VALUES ($1, $2, now());
+-- name: GetConversation :one
+SELECT id, s2_stream_name, created_at FROM conversations WHERE id = $1;
+```
+
+**members.sql:**
+```sql
+-- name: AddMember :one
+INSERT INTO members (conversation_id, agent_id, joined_at) VALUES ($1, $2, now())
+ON CONFLICT (conversation_id, agent_id) DO NOTHING RETURNING conversation_id;
+-- name: RemoveMember :exec
+DELETE FROM members WHERE conversation_id = $1 AND agent_id = $2;
+-- name: IsMember :one
+SELECT EXISTS(SELECT 1 FROM members WHERE conversation_id = $1 AND agent_id = $2);
+-- name: LockMembersForUpdate :many
+SELECT agent_id FROM members WHERE conversation_id = $1 FOR UPDATE;
+-- name: ListConversationsForAgent :many
+SELECT m.conversation_id, c.created_at FROM members m
+JOIN conversations c ON c.id = m.conversation_id WHERE m.agent_id = $1 ORDER BY c.created_at DESC;
+```
+
+**cursors.sql:**
+```sql
+-- name: GetCursor :one
+SELECT seq_num FROM cursors WHERE agent_id = $1 AND conversation_id = $2;
+-- name: UpsertCursor :exec
+INSERT INTO cursors (agent_id, conversation_id, seq_num, updated_at) VALUES ($1, $2, $3, now())
+ON CONFLICT (agent_id, conversation_id) DO UPDATE SET seq_num = $3, updated_at = now()
+WHERE cursors.seq_num < $3;
+```
+
+Batch cursor flush uses raw pgx with `unnest()` arrays (not sqlc).
+
+#### 1.6.12 Migration Strategy
+
+**For take-home:** Embedded SQL with `CREATE TABLE IF NOT EXISTS` run on startup. No migration tool needed for single-version schema.
+**For production:** golang-migrate (`github.com/golang-migrate/migrate`). Numbered migration files, `schema_migrations` tracking table, backward-incompatible changes require multi-step deploys.
+
+#### 1.6.13 Scaling Roadmap (Millions → Billions)
+
+**Phase 1 — Current Design (Millions):** Single Fly.io instance + Neon Postgres. In-process membership cache (LRU, 100K entries, 60s TTL). In-memory cursor hot tier + batched Postgres flush. pgxpool with 15 connections. Handles ~1M agents, ~5M conversations, ~50K concurrent SSE connections.
+
+**Phase 2 — Read Replicas (Tens of Millions):** Add Neon read replicas. Route reads to replicas, keep writes on primary. Membership cache reduces replica load by 90%+.
+
+**Phase 3 — Partitioning (Hundreds of Millions):** Hash-partition `members` by `conversation_id` (64-128 partitions). Hash-partition `cursors` by `agent_id`. Tradeoff: `ListConversationsForAgent` scans all partitions — mitigate with denormalized table or accept cross-partition scan.
+
+**Phase 4 — Dedicated Instances (Billions):** Replace Neon with dedicated PostgreSQL (AWS RDS). Shard by tenant/region. Redis between hot tier and Postgres. LISTEN/NOTIFY for cross-instance invalidation. PgBouncer for connection pooling across instances.
+
+#### 1.6.14 Edge Cases & Failure Modes
+
+* **Server crash during leave transaction:** PostgreSQL rolls back. Member row restored. Leave didn't happen. Correct.
+* **Server crash during invite (after Postgres commit, before S2 event):** Agent is a member but no `agent_joined` event on S2 stream. Functional (agent can read/write), cosmetic gap in history. Production mitigation: reconciliation sweep on startup.
+* **Neon cold start during evaluation:** Disable scale-to-zero, or use Fly.io health checks to keep Neon compute warm.
+* **pgxpool exhaustion:** pgxpool queues goroutines. Sub-millisecond queries mean wait is negligible. Set `context.WithTimeout(ctx, 5*time.Second)` on all DB ops for fail-fast.
+* **Membership cache poisoning (direct Postgres manipulation):** 60-second TTL self-corrects. Don't bypass the API.
+
+**Files:** `internal/store/postgres.go`, `internal/store/cursor_cache.go`, `internal/store/membership_cache.go`, `internal/store/conn_registry.go`, `internal/store/schema/schema.sql`, `internal/store/queries/*.sql`, `internal/store/db/` (sqlc generated), `sqlc.yaml`
 
 ---
 
-### 1.7 Read Cursor Management
+### 1.7 Read Cursor Management — Two-Tier Architecture
 
-**Design:** Server-managed cursors. The server tracks where each agent has read to in each conversation.
+**Design:** Server-managed cursors with a two-tier architecture: in-memory hot tier for zero-cost updates, batched PostgreSQL warm tier for durability.
 
 **Why server-managed (not client-managed):**
 * The spec recommends it: "We recommend that the server track each agent's read position."
 * AI agents are stateless between sessions. They can't reliably persist their own cursors.
 * Server-side cursors mean reconnection is seamless — no state to pass from client.
 
-**Cursor update strategy:** Batch updates to reduce SQLite write pressure.
-* In-memory: track the latest delivered `seq_num` per `(agent, conversation)`.
-* Flush to SQLite: every 10 events delivered OR every 5 seconds, whichever first.
-* On disconnect: immediate flush of final position.
-* On reconnect: read cursor from SQLite, resume from there.
+**Architecture:**
+```text
+                    In-Memory (Hot Tier)                     PostgreSQL (Warm Tier)
+                    ────────────────────                     ──────────────────────
+SSE event delivered
+        │
+        ▼
+┌─────────────────────┐                              ┌──────────────────────────┐
+│   CursorCache       │     every 5 seconds          │   cursors table          │
+│   sync.RWMutex      │  ─────────────────────────→  │   (agent_id, conv_id,    │
+│   map[key]entry     │     batch UPSERT via         │    seq_num, updated_at)  │
+│   dirty set         │     unnest() arrays          │                          │
+└─────────────────────┘                              └──────────────────────────┘
+        │                                                       ↑
+        │  on disconnect / leave                                │
+        └───────────────────────────────────────────────────────┘
+                    immediate single flush
+```
+
+**Hot tier (in-memory):** `sync.RWMutex` + `map[cursorKey]cursorEntry` + dirty set. Updated on every event delivery. Zero I/O cost. Why `sync.RWMutex`, not `sync.Map`: cursor updates are write-heavy from many goroutines on overlapping keys — neither `sync.Map` optimization pattern applies. At extreme scale (>100K concurrent SSE connections): shard into 64 buckets by `hash(agent_id) % 64`.
+
+**Warm tier (PostgreSQL):** Background goroutine flushes all dirty cursors every 5 seconds via `unnest()` batch upsert:
+```sql
+INSERT INTO cursors (agent_id, conversation_id, seq_num, updated_at)
+SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::bigint[], $4::timestamptz[])
+ON CONFLICT (agent_id, conversation_id)
+DO UPDATE SET seq_num = EXCLUDED.seq_num, updated_at = EXCLUDED.updated_at
+WHERE cursors.seq_num < EXCLUDED.seq_num;
+```
+The `WHERE cursors.seq_num < EXCLUDED.seq_num` clause prevents stale flushes from regressing a cursor.
+
+**Flush triggers:**
+
+| Trigger | What happens | Why |
+|---|---|---|
+| **Periodic (every 5 sec)** | Background goroutine flushes ALL dirty cursors | Bounds data loss on crash to 5 seconds |
+| **Clean disconnect** | SSE handler flushes THIS agent's cursor immediately | Zero data loss on graceful close |
+| **Server shutdown** | Graceful shutdown flushes ALL dirty cursors before exit | Zero data loss on planned restart |
+| **Agent leave** | Flush this agent's cursor for this conversation | Preserve accurate position for potential re-invite |
+
+**Crash recovery:** Server crashes → in-memory cursors lost. Agent reconnects → server reads cursor from PostgreSQL (at most 5 seconds stale) → S2 read session starts from that position → agent re-receives up to ~150 events (5 sec × ~30 events/sec) → events carry sequence numbers for client-side deduplication. Textbook **at-least-once delivery**.
+
+**Cursor behavior on leave and re-invite:**
+* On leave: flush cursor to PostgreSQL, remove from in-memory cache, do NOT delete from PostgreSQL.
+* On re-invite + SSE connect: cache miss → fall back to PostgreSQL → cursor exists from before leave → resume from that position → agent catches up on messages sent while gone.
+* This is better than deleting cursors (which would force re-reading the entire conversation from sequence 0).
+* The spec's "access to full conversation history" is satisfied by the S2 stream — agent CAN read from 0 via `?from=0`.
 
 **Delivery semantics:** At-least-once.
 * If server crashes between delivering an event and flushing the cursor, the event will be re-delivered on reconnect.
@@ -617,7 +981,7 @@ CREATE TABLE cursors (
 * **#: 10**
     * **Assumption:** The server is a single instance
     * **Type:** Implicit
-    * **My Position:** Accept for now. The take-home doesn't require horizontal scaling. But the design should not preclude it — stateless request handling + external storage (S2 + SQLite/Postgres) is naturally scalable.
+    * **My Position:** Accept for now. The take-home doesn't require horizontal scaling. But the design should not preclude it — stateless request handling + external storage (S2 + PostgreSQL (Neon)) is naturally scalable.
 
 ### Challenges to Spec Assumptions
 
@@ -694,9 +1058,7 @@ Polling: `GET /conversations/:cid/messages?after=seq_num` every N seconds.
 * **Position:** SSE as primary. Add the history GET endpoint for polling-style access as a fallback. Both read from the same S2 stream.
 
 **Challenge 5: "SQLite for metadata" — should we use PostgreSQL?**
-* For the take-home: SQLite is the right choice. Zero ops, embedded, sufficient.
-* For production: PostgreSQL. WAL replication, connection pooling, better concurrent write handling, LISTEN/NOTIFY for cache invalidation.
-* **Position:** SQLite now. The abstraction layer (`internal/store/`) makes swapping trivial. Document PostgreSQL as the production upgrade in `FUTURE.md`.
+* **Position: PostgreSQL chosen.** SQLite fails at scale due to single-writer lock, database-level locking, no concurrent write connections, no `LISTEN/NOTIFY`, no native UUID type, no `unnest()` batch operations, and embedded single-process constraint. PostgreSQL provides row-level locking, concurrent writers via pgxpool, batch upserts, native UUID, and a clear scaling path. Neon serverless PostgreSQL: fully managed, free tier, zero ops. See Section 1.6 for the complete design.
 
 ---
 
@@ -710,11 +1072,11 @@ Instead of treating S2 as a dumb append-only log, treat each conversation stream
 * Complete message count
 * Per-agent metadata (last active time, message count)
 
-This means: the S2 stream is the single source of truth for everything. No separate membership table in SQLite needed — membership is derived from `agent_joined` and `agent_left` events on the stream. Cursors could be stored as special events on a per-agent metadata stream.
+This means: the S2 stream is the single source of truth for everything. No separate membership table in PostgreSQL needed — membership is derived from `agent_joined` and `agent_left` events on the stream. Cursors could be stored as special events on a per-agent metadata stream.
 
-**Why this is better:** Single source of truth. No split-brain between SQLite and S2. Replay the stream → reconstruct all state. Perfect for disaster recovery and debugging.
+**Why this is better:** Single source of truth. No split-brain between PostgreSQL and S2. Replay the stream → reconstruct all state. Perfect for disaster recovery and debugging.
 
-**Why I'm not doing it:** It makes every membership check require reading the stream (or maintaining an in-memory materialized view). SQLite is a fine materialized view of conversation metadata. The hybrid approach (S2 for messages + SQLite for metadata) is simpler to implement and reason about. Document this alternative in `FUTURE.md` as the "event sourcing" evolution.
+**Why I'm not doing it:** It makes every membership check require reading the stream (or maintaining an in-memory materialized view). PostgreSQL is a fine materialized view of conversation metadata. The hybrid approach (S2 for messages + PostgreSQL for metadata) is simpler to implement and reason about. Document this alternative in `FUTURE.md` as the "event sourcing" evolution.
 
 ---
 
@@ -762,7 +1124,7 @@ Additionally, deploy two Claude-powered agents with different personalities that
 **Observability**
 * Structured logging (zerolog or slog): every API request, every S2 operation, every connection lifecycle event
 * Metrics: active SSE connections, messages/sec, S2 latency, API response times
-* Health endpoint: `GET /health` → checks SQLite and S2 connectivity
+* Health endpoint: `GET /health` → checks PostgreSQL and S2 connectivity
 
 ---
 
@@ -796,7 +1158,7 @@ The result: a Go server with ~1500 lines of code that does exactly what the spec
 
 * **Step 1: Project scaffolding (30 min)**
     * `go mod init`, directory structure, `main.go` with chi router
-    * SQLite initialization with schema migration
+    * PostgreSQL (Neon) connection setup, schema migration via embedded SQL with `CREATE TABLE IF NOT EXISTS`
     * Health endpoint
     * Makefile with build/run/test targets
 * **Step 2: S2 client wrapper (1 hr)**
@@ -805,7 +1167,7 @@ The result: a Go server with ~1500 lines of code that does exactly what the spec
     * Test against real S2 (integration test)
 * **Step 3: Agent registry (30 min)**
     * `POST /agents` endpoint
-    * SQLite CRUD
+    * PostgreSQL CRUD via sqlc-generated code
     * Middleware: extract `X-Agent-ID` header, validate agent exists
 * **Step 4: Conversation management (1.5 hr)**
     * Create, list, invite, leave endpoints
@@ -862,7 +1224,21 @@ agentmail-take-home/
 │   │   ├── history.go              # GET /messages (reconstructed)
 │   │   └── middleware.go           # Agent ID extraction/validation
 │   ├── store/
-│   │   ├── sqlite.go               # SQLite operations
+│   │   ├── schema/
+│   │   │   └── schema.sql          # Complete DDL
+│   │   ├── queries/
+│   │   │   ├── agents.sql          # sqlc queries for agents
+│   │   │   ├── conversations.sql   # sqlc queries for conversations
+│   │   │   ├── members.sql         # sqlc queries for members
+│   │   │   └── cursors.sql         # sqlc queries for cursors
+│   │   ├── db/                     # sqlc generated code (git-committed)
+│   │   │   ├── db.go
+│   │   │   ├── models.go
+│   │   │   └── *.sql.go
+│   │   ├── postgres.go             # Store implementation (composes sub-stores)
+│   │   ├── cursor_cache.go         # In-memory cursor hot tier
+│   │   ├── membership_cache.go     # In-memory membership LRU cache
+│   │   ├── conn_registry.go        # Active connection tracking
 │   │   ├── s2.go                   # S2 stream operations
 │   │   └── s2_test.go              # S2 integration test
 │   ├── model/
@@ -887,6 +1263,7 @@ agentmail-take-home/
 ├── Dockerfile
 ├── fly.toml
 ├── Makefile
+├── sqlc.yaml                       # sqlc code generation config
 └── README.md                       # (already exists)
 ```
 
@@ -895,8 +1272,9 @@ agentmail-take-home/
 * `github.com/go-chi/chi/v5` — HTTP router
 * `github.com/s2-streamstore/s2-sdk-go` — S2 client
 * `github.com/anthropics/anthropic-sdk-go` — Claude API
-* `github.com/google/uuid` — UUID generation
-* `modernc.org/sqlite` — Pure-Go SQLite (no CGO)
+* `github.com/google/uuid` — UUIDv7 generation (v1.6.0+, RFC 9562)
+* `github.com/jackc/pgx/v5` — PostgreSQL driver (native interface + pgxpool)
+* sqlc (build-time CLI) — Type-safe SQL code generation
 * `github.com/rs/zerolog` — Structured logging
 
 ---
@@ -907,7 +1285,7 @@ agentmail-take-home/
 | :--- | :--- | :--- |
 | **Go as language** | Slower to prototype than Python | Low — full rewrite. But Go is the right call for this domain. |
 | **S2 as stream storage** | S2 has an outage or API breaking change | Medium — swap S2 client for direct S3 + custom sequencing. The S2 wrapper (`internal/store/s2.go`) isolates the blast radius. |
-| **SQLite for metadata** | Concurrent write contention under load | High — swap to PostgreSQL. Same SQL, same schema, different driver. |
+| **PostgreSQL (Neon) for metadata** | Neon outage or cold-start latency | Medium — fallback to Fly.io managed Postgres or self-hosted. Schema and queries are standard PostgreSQL. |
 | **SSE for reads** | Client doesn't support SSE | High — history polling endpoint exists as alternative. |
 | **NDJSON streaming POST for writes** | Proxy buffers the body, losing real-time streaming | High — complete message POST works universally as fallback. Proxy config (`proxy_request_buffering off`) resolves for self-hosted. |
 | **One stream per conversation** | Hot conversation with many writers | Low — but S2 handles 100 MiBps per stream. LLM token rates won't come close. |
