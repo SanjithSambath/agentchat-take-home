@@ -1,7 +1,3 @@
-Here is the fully formatted Markdown for the specification document. The content remains exactly the same, but the hard line-breaks have been removed, the headers have been properly structured, code blocks have been added for APIs and schemas, and the ASCII tables/diagrams have been preserved appropriately.
-
-***
-
 # AgentMail: Exhaustive Spec Analysis & Implementation Plan
 
 ## Context
@@ -101,7 +97,7 @@ Here is the fully formatted Markdown for the specification document. The content
     * Write an `agent_joined` system event to the S2 stream so it appears in conversation history.
     * The invitee gets access to full history — this is automatic since they'll read from the S2 stream which contains everything.
 * **Leave:**
-    * Reject if the agent is the last member (return 400 or 409).
+    * Reject if the agent is the last member (return 409 `last_member` — the request is syntactically valid; the conflict is with current resource state).
     * Write an `agent_left` system event to the S2 stream.
     * **Critical:** terminate active SSE connections and in-progress streaming writes for this agent on this conversation.
         * The ConnRegistry tracks **both** SSE read connections and streaming write connections per `(agent_id, conversation_id)`.
@@ -409,12 +405,23 @@ Query: ?limit=50&before=<seq_num>
 Response: 200 OK
 {
   "messages": [
-    {"message_id":"m1","sender_id":"a1","content":"Hello, how are you?","seq_start":42,"seq_end":45,"complete":true},
-    {"message_id":"m2","sender_id":"a2","content":"I'm well, thanks","seq_start":46,"seq_end":49,"complete":true}
-  ]
+    {"message_id":"m1","sender_id":"a1","content":"Hello, how are you?","seq_start":42,"seq_end":45,"status":"complete"},
+    {"message_id":"m2","sender_id":"a2","content":"I'm well, thanks","seq_start":46,"seq_end":49,"status":"complete"}
+  ],
+  "has_more": false
 }
 ```
 *(This reconstructs complete messages from the raw event stream. Reads from S2, groups events by message_id, assembles content, returns structured messages. Useful for agents that want to see conversation history without processing raw events.)*
+
+**`status` field:** Three-valued string enum replacing the original `complete` boolean, because aborted messages are neither complete nor in-progress:
+
+| Value | Meaning |
+|---|---|
+| `"complete"` | `message_end` received. Full content available. |
+| `"in_progress"` | `message_start` received but no `message_end` or `message_abort` yet. Currently being streamed. |
+| `"aborted"` | `message_abort` received. Partial content — agent disconnected or was removed. |
+
+**Pagination:** Default limit 50, max 100. `before` is an exclusive upper bound (return messages whose `seq_start` < `before`). Response includes `has_more` boolean for pagination. Messages ordered newest-first (descending `seq_start`). See `http-api-layer-plan.md` §3 for complete query parameter specification.
 
 **Edge cases:**
 * Agent connects to conversation they're not a member of: 403.
@@ -1094,6 +1101,135 @@ The `WHERE cursors.seq_num < EXCLUDED.seq_num` clause prevents stale flushes fro
 
 ---
 
+### 1.9 HTTP API Layer — Router, Middleware, Error Format, Contracts
+
+> **Full design:** [`http-api-layer-plan.md`](http-api-layer-plan.md) — exhaustive design document covering error format, middleware chain, request/response Go types with wire examples, Content-Type handling, timeout architecture, agent existence caching, and scaling roadmap from thousands to billions. What follows is the executive summary.
+
+The HTTP API layer is the skeleton every endpoint hangs on. Without a consistent, pre-designed API layer, each handler makes ad-hoc decisions during coding — inconsistent error shapes, forgotten validations, mismatched Content-Types. This section specifies the cross-cutting machinery.
+
+**Core decisions:**
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Error format | `{"error":{"code":"...","message":"..."}}` envelope on every error | Machine-readable `code` for AI agent branching; human-readable `message` for debugging. Single top-level `error` key makes error detection trivial: `if "error" in data`. |
+| Middleware chain | Recovery → Request ID → Logger → (Agent Auth) → (Timeout) → Handler | Three route groups: unauthenticated, authenticated+30s timeout, authenticated+streaming (no timeout) |
+| Request/response types | Complete Go structs per endpoint; `snake_case` JSON; `DisallowUnknownFields()` | Catches AI agent typos (`agnet_id`) immediately. Empty slices marshal as `[]`, not `null`. |
+| Content-Type validation | Required on all POSTs with a body; NDJSON endpoint accepts `application/x-ndjson` and `application/ndjson` | Wrong Content-Type on streaming endpoint returns helpful redirect to the complete-message endpoint |
+| Timeouts | 30s CRUD, 5s health, none for SSE/streaming (handler-managed idle detection + safety caps) | SSE: 30s heartbeat + 24h absolute cap. Streaming write: 5-minute idle timeout + 1h absolute cap via `http.ResponseController.SetReadDeadline` |
+| Agent validation caching | `sync.Map` existence cache (write-once, read-many), warmed from Postgres on startup | Zero-contention reads (~50ns). Agents are permanent → no eviction needed. Scaling path: Bloom filter + LRU at billions. |
+| 403 vs 404 | 403 for not-a-member; 404 for doesn't-exist | UUIDv7 makes enumeration impractical; no-auth means nothing to protect; distinct errors help AI agents debug faster |
+
+**Error code registry (comprehensive):**
+
+Every error condition across every endpoint is mapped to a specific HTTP status code and machine-readable error code. Key codes:
+
+| HTTP Status | Error Code | When |
+|---|---|---|
+| 400 | `missing_agent_id` | `X-Agent-ID` header absent |
+| 400 | `invalid_agent_id` | `X-Agent-ID` not a valid UUID |
+| 400 | `invalid_json` | Malformed JSON body |
+| 400 | `unknown_field` | Unrecognized field in request body (typo protection) |
+| 400 | `empty_content` | Message content is empty string |
+| 403 | `not_member` | Agent is not a member of the conversation |
+| 404 | `agent_not_found` | Agent ID doesn't exist |
+| 404 | `conversation_not_found` | Conversation ID doesn't exist |
+| 404 | `invitee_not_found` | Agent being invited doesn't exist |
+| 409 | `last_member` | Cannot leave — last member in conversation |
+| 409 | `concurrent_write` | Agent already has an active streaming write to this conversation |
+| 415 | `unsupported_media_type` | Wrong Content-Type on POST |
+| 500 | `internal_error` | Server error (DB/S2 failure) |
+| 503 | `unhealthy` | Health check: Postgres or S2 unreachable |
+| 504 | `timeout` | CRUD request exceeded 30s |
+
+Error codes are a **stable API contract** — they never change between versions. Messages may change. CLIENT.md documents: "Branch on `code`, not `message`."
+
+**Route architecture:**
+
+```text
+┌───────┬──────────────────────────────────────────┬──────────┬────────┬───────────┬─────────┐
+│ Method│ Path                                     │ Auth     │Timeout │ Body In   │ Body Out│
+├───────┼──────────────────────────────────────────┼──────────┼────────┼───────────┼─────────┤
+│ POST  │ /agents                                  │ No       │ 30s    │ (none)    │ JSON    │
+│ GET   │ /agents/resident                         │ No       │ 30s    │ (none)    │ JSON    │
+│ GET   │ /health                                  │ No       │ 5s     │ (none)    │ JSON    │
+│ POST  │ /conversations                           │ Yes      │ 30s    │ (none)    │ JSON    │
+│ GET   │ /conversations                           │ Yes      │ 30s    │ (none)    │ JSON    │
+│ POST  │ /conversations/{cid}/invite              │ Yes      │ 30s    │ JSON      │ JSON    │
+│ POST  │ /conversations/{cid}/leave               │ Yes      │ 30s    │ (none)    │ JSON    │
+│ POST  │ /conversations/{cid}/messages            │ Yes      │ 30s    │ JSON      │ JSON    │
+│ GET   │ /conversations/{cid}/messages            │ Yes      │ 30s    │ (none)    │ JSON    │
+│ POST  │ /conversations/{cid}/messages/stream     │ Yes      │ (none) │ NDJSON    │ JSON    │
+│ GET   │ /conversations/{cid}/stream              │ Yes      │ (none) │ (none)    │ SSE     │
+└───────┴──────────────────────────────────────────┴──────────┴────────┴───────────┴─────────┘
+```
+
+**Middleware details** (see `http-api-layer-plan.md` §2):
+- **Recovery:** Custom panic handler returns error envelope (not chi's plain-text stack trace). Outermost layer.
+- **Request ID:** UUIDv4, respects client-provided `X-Request-ID` (≤128 chars). Propagated via context and response header.
+- **Logger:** Structured JSON (zerolog). Method, path, status, duration, request_id, agent_id. 2xx=INFO, 4xx=WARN, 5xx=ERROR.
+- **Agent Auth:** Reads `X-Agent-ID`, validates UUID, checks `sync.Map` cache → Postgres fallback. Exemptions: `POST /agents`, `GET /health`, `GET /agents/resident`.
+- **Timeout:** `context.WithTimeout` with custom 504 error envelope on expiry. Applied to CRUD routes only.
+
+**Request/response contracts** (see `http-api-layer-plan.md` §3):
+
+Complete Go structs and wire examples for every endpoint. Key types:
+
+```go
+type CreateAgentResponse struct {
+    AgentID uuid.UUID `json:"agent_id"`
+}
+
+type CreateConversationResponse struct {
+    ConversationID uuid.UUID   `json:"conversation_id"`
+    Members        []uuid.UUID `json:"members"`
+    CreatedAt      time.Time   `json:"created_at"`
+}
+
+type InviteRequest struct {
+    AgentID uuid.UUID `json:"agent_id"`
+}
+
+type SendMessageRequest struct {
+    Content string `json:"content"`
+}
+
+type HistoryResponse struct {
+    Messages []HistoryMessage `json:"messages"`
+    HasMore  bool             `json:"has_more"`
+}
+
+type HealthResponse struct {
+    Status string            `json:"status"`
+    Checks map[string]string `json:"checks"`
+}
+```
+
+**Shared handler helpers** (see `http-api-layer-plan.md` §3):
+- `decodeJSON[T]` — generic JSON parser with `DisallowUnknownFields()`, `MaxBytesReader`, granular error classification (syntax, type, unknown field, body too large, EOF)
+- `requireMembership` — parse conversation ID → check existence → check membership. Returns proper 400/404/403 errors.
+- `writeError` / `writeJSON` — consistent response writers with pre-allocated fallback for error serialization failures
+
+**Handler structure template** — every handler follows: validate params → parse body → check business rules → execute → respond. Early return on error. Domain errors (`ErrLastMember`) mapped to HTTP errors at the handler layer. Store layer never knows about HTTP.
+
+**Cross-cutting concerns** (see `http-api-layer-plan.md` §6):
+- CORS: not implemented (AI agents are HTTP clients, not browsers)
+- Rate limiting: not implemented (focus on core messaging per spec); documented production path with `golang.org/x/time/rate`
+- Idempotency: invite is idempotent via `ON CONFLICT DO NOTHING`; all others follow natural semantics
+- Graceful shutdown: SIGTERM → stop accepting → drain CRUD (30s) → close SSE → abort streaming writes → flush cursors → close pools → exit
+
+**Files** (see `http-api-layer-plan.md` §10):
+
+| File | Contents |
+|---|---|
+| `internal/api/router.go` | Chi router, route groups, NotFound/MethodNotAllowed handlers |
+| `internal/api/middleware.go` | Recovery, Request ID, Logger, Agent Auth, Timeout |
+| `internal/api/errors.go` | `APIError` type, `writeError`, `writeJSON`, fallback body |
+| `internal/api/helpers.go` | `decodeJSON[T]`, `parseConversationID`, `requireMembership`, `validateContentType` |
+| `internal/api/types.go` | All request/response Go structs |
+| `internal/store/agent_cache.go` | `sync.Map`-based agent existence cache, startup warming |
+
+---
+
 ## Phase 2: Assumption Interrogation & Radical Alternatives
 
 ### Assumptions in the Spec (Explicit and Implicit)
@@ -1368,18 +1504,24 @@ The result: a Go server with ~1500 lines of code that does exactly what the spec
 
 ### Files to Create
 
+**No service layer.** For this system's complexity, API handlers ARE the orchestration. The store handles data access, the S2 client handles stream operations, and handlers compose them. An intermediate service layer would add indirection for zero benefit. This is an explicit design decision, not a gap.
+
 ```text
 agentmail-take-home/
-├── cmd/server/main.go              # Entry point, config, startup
+├── cmd/server/main.go              # Entry point, config, startup, graceful shutdown
 ├── internal/
 │   ├── api/
-│   │   ├── router.go               # Chi router, middleware
-│   │   ├── agents.go               # POST /agents
-│   │   ├── conversations.go        # Conversation CRUD
-│   │   ├── messages.go             # Message send (complete POST + NDJSON streaming POST)
+│   │   ├── router.go               # Chi router, route groups, NotFound/MethodNotAllowed
+│   │   ├── middleware.go           # Recovery, Request ID, Logger, Agent Auth, Timeout
+│   │   ├── errors.go              # APIError type, writeError, writeJSON, fallback body
+│   │   ├── helpers.go             # decodeJSON[T], parseConversationID, requireMembership
+│   │   ├── types.go               # All request/response Go structs
+│   │   ├── agents.go               # POST /agents, GET /agents/resident
+│   │   ├── conversations.go        # Create, list, invite, leave handlers
+│   │   ├── messages.go             # Complete send + NDJSON streaming send
 │   │   ├── sse.go                  # SSE streaming read
 │   │   ├── history.go              # GET /messages (reconstructed)
-│   │   └── middleware.go           # Agent ID extraction/validation
+│   │   └── health.go               # GET /health
 │   ├── store/
 │   │   ├── schema/
 │   │   │   └── schema.sql          # Complete DDL
@@ -1394,6 +1536,7 @@ agentmail-take-home/
 │   │   │   ├── models.go
 │   │   │   └── *.sql.go
 │   │   ├── postgres.go             # Store implementation (composes sub-stores)
+│   │   ├── agent_cache.go          # sync.Map agent existence cache, startup warming
 │   │   ├── cursor_cache.go         # In-memory cursor hot tier
 │   │   ├── membership_cache.go     # In-memory membership LRU cache
 │   │   ├── conn_registry.go        # Active connection tracking
@@ -1402,12 +1545,12 @@ agentmail-take-home/
 │   ├── model/
 │   │   ├── events.go               # Event types, serialization
 │   │   └── types.go                # Agent, Conversation, Member
-│   ├── agent/
-│   │   ├── claude.go               # Claude API integration
-│   │   └── runner.go               # Agent lifecycle management
-│   └── service/
-│       ├── conversations.go        # Business logic layer
-│       └── messages.go             # Message orchestration
+│   └── agent/
+│       ├── agent.go                # Agent struct, Start()/Shutdown(), state map, semaphores
+│       ├── listener.go             # Per-conversation listener goroutine, event dispatch
+│       ├── respond.go              # triggerResponse(), callClaudeStreaming(), sendErrorMessage()
+│       ├── history.go              # seedHistory(), buildClaudeMessages(), sliding window
+│       └── discovery.go            # Invite channel consumer, startup reconciliation
 ├── tests/
 │   ├── integration_test.go         # Full lifecycle tests
 │   ├── streaming_test.go           # SSE + streaming write tests

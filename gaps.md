@@ -165,7 +165,8 @@ GAP 1 SUBSTEPS END
 
 
   ---
-  Gap 2: HTTP API Layer — router, middleware, error format, request/response contracts
+  Gap 2: HTTP API Layer — router, middleware, error format, request/response contracts ✅ RESOLVED
+  → See http-api-layer-plan.md (full design) and spec.md §1.9 (executive summary)
 
   The spec lists endpoints and shows example request/response pairs. But the API layer as a system component is not designed:
 
@@ -228,7 +229,8 @@ GAP 1 SUBSTEPS END
   specified.
 
   ---
-  Gap 5: Service/Orchestration Layer
+  Gap 5: Service/Orchestration Layer ✅ RESOLVED
+  → Decision: No service layer. API handlers ARE the orchestration. See spec.md "Files to Create" section.
 
   The file tree shows internal/service/conversations.go and internal/service/messages.go. But spec.md has API handlers calling the
   store directly (e.g., the StreamMessage handler in §1.3 directly calls h.s2.OpenAppendSession and h.store.InProgress().Insert).
@@ -236,8 +238,9 @@ GAP 1 SUBSTEPS END
   The question: Is there a service layer or not? If yes, what goes there vs. the API handlers vs. the store? If no, remove it from the
    file tree. This ambiguity will bite you during implementation.
 
-  My read: for this system's complexity, a service layer is unnecessary overhead. The API handlers ARE the orchestration. The store
-  handles data access. No need for an intermediate layer. But this needs to be an explicit decision, not a gap.
+  Decision: No service layer. The API handlers ARE the orchestration. The store handles data access, the S2 client handles stream
+  operations, and handlers compose them. An intermediate service layer would add indirection for zero benefit. File tree updated
+  in spec.md to remove internal/service/. This is an explicit design decision, not a gap.
 
   ---
   Gap 6: Deployment Configuration
