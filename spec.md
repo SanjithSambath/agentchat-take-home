@@ -83,9 +83,10 @@ Here is the fully formatted Markdown for the specification document. The content
 **Hidden complexities:**
 
 * **Create:**
-    * Must atomically: (a) create conversation in PostgreSQL, (b) add creator as member, (c) create S2 stream for the conversation.
-    * If S2 stream creation fails after PostgreSQL insert, we have an orphaned conversation. Handle this: create S2 stream first, then insert into PostgreSQL. If PostgreSQL fails, we have an empty S2 stream (harmless).
-    * The S2 stream name should encode the conversation ID for easy lookup (e.g., `conv-{conversation_id}`).
+    * Insert into PostgreSQL first (conversation row + creator membership in one transaction), then append `agent_joined` event to S2.
+    * The S2 stream auto-creates on this first append via `CreateStreamOnAppend: true` (basin-level config). No explicit `CreateStream` call needed.
+    * If S2 is temporarily unreachable after the Postgres insert, the conversation exists and is functional — the stream auto-creates on the next successful write (message send, invite, etc.). Self-healing.
+    * Stream name format: `conversations/{conversation_id}` (hierarchical, prefix-listable via S2's `ListStreams` with prefix).
 * **List:**
     * Returns conversations where the agent is currently a member.
     * Each entry needs conversation ID and current member list.
@@ -103,13 +104,14 @@ Here is the fully formatted Markdown for the specification document. The content
     * Reject if the agent is the last member (return 400 or 409).
     * Write an `agent_left` system event to the S2 stream.
     * **Critical:** terminate active SSE connections and in-progress streaming writes for this agent on this conversation.
-        * Requires a connection registry: `map[(agent_id, conversation_id)] → cancel_func`
-        * On leave, look up and call cancel, which closes the SSE response and/or cancels the streaming write request context.
+        * The ConnRegistry tracks **both** SSE read connections and streaming write connections per `(agent_id, conversation_id)`.
+        * On leave, cancel both connection types and wait for their goroutines to exit (5s timeout each).
     * **Critical:** abort any in-progress streaming message from this agent.
-        * Check if there's an open `message_start` without a corresponding `message_end`.
-        * If so, write a `message_abort` event before the `agent_left` event.
+        * The streaming write handler's context cancellation triggers its abort path — it appends `message_abort` to S2 before exiting.
+        * **Belt-and-suspenders:** If the write handler fails to append `message_abort` (S2 temporarily unreachable), the leave handler appends it as a fallback.
+        * The `message_abort` event MUST precede the `agent_left` event on the S2 stream. This ordering is guaranteed because the leave handler waits for the write handler to exit before writing `agent_left`.
     * After leave, reject all read/write requests from this agent for this conversation.
-    * The agent's read cursor can be preserved (for potential re-invite) or deleted (simpler).
+    * The agent's read cursor is preserved in PostgreSQL for potential re-invite resume.
 
 **Edge cases:**
 * Race condition: agent A invites agent B while agent B leaves simultaneously. Resolve by checking membership under a transaction/lock.
@@ -197,28 +199,47 @@ Header: Content-Type: application/x-ndjson
 { "message_id": "uuid", "seq_start": 42, "seq_end": 45 }
 ```
 
-**Server-side mechanics (Go):**
+**Server-side mechanics (Go) — AppendSession for pipelined writes:**
 ```go
 func (h *Handler) StreamMessage(w http.ResponseWriter, r *http.Request) {
-    msgID := uuid.NewV7().String()
-    h.s2.AppendRecord(convID, messageStartEvent(msgID, agentID))
+    msgID := uuid.NewV7()
+
+    // Track in-progress message (Postgres-first, for crash recovery)
+    h.store.InProgress().Insert(ctx, msgID, convID, agentID, streamName)
+
+    // Open pipelined append session (non-blocking submits, async acks)
+    session, err := h.s2.OpenAppendSession(ctx, convID)
+    defer session.Close()
+
+    // Background goroutine drains acks to detect S2 failures
+    errCh := make(chan error, 1)
+    go func() { /* drain futures, send first error to errCh */ }()
+
+    session.Submit(ctx, messageStartEvent(msgID, agentID))
 
     scanner := bufio.NewScanner(r.Body)
     for scanner.Scan() {
+        if ctx.Err() != nil { break }  // context canceled (e.g., agent left)
         var chunk struct{ Content string `json:"content"` }
         json.Unmarshal(scanner.Bytes(), &chunk)
-        h.s2.AppendRecord(convID, messageAppendEvent(msgID, chunk.Content))
+        session.Submit(ctx, messageAppendEvent(msgID, chunk.Content))
     }
 
-    if err := scanner.Err(); err != nil || r.Context().Err() != nil {
-        h.s2.AppendRecord(convID, messageAbortEvent(msgID, "disconnect"))
-        return // connection dropped — no response possible
+    if ctx.Err() != nil || scanner.Err() != nil {
+        // Abort via Unary append (session may be errored)
+        h.s2.AppendEvents(ctx, convID, []Event{messageAbortEvent(msgID, "disconnect")})
+        h.store.InProgress().Delete(ctx, msgID)
+        return
     }
 
-    h.s2.AppendRecord(convID, messageEndEvent(msgID))
+    session.Submit(ctx, messageEndEvent(msgID))
+    // Wait for all acks, then respond
+    h.store.InProgress().Delete(ctx, msgID)
     json.NewEncoder(w).Encode(result)
 }
 ```
+
+**Why AppendSession, not Unary per token:** Unary at 40ms ack (Express) = max 25 sequential appends/sec. LLMs emit 30-100 tokens/sec. AppendSession pipelines the appends — submit token N while token N-1's ack is still in-flight. No bottleneck at any token rate S2 can handle.
 
 `bufio.NewScanner(r.Body)` blocks at `scanner.Scan()` until a complete NDJSON line arrives from the client, then returns it. When the client closes the request body, `Scan()` returns `false` (EOF). If the connection drops mid-stream, `r.Context().Done()` fires and/or `r.Body.Read()` returns an error. This works identically on HTTP/1.1 chunked encoding and HTTP/2 DATA frames.
 
@@ -298,7 +319,7 @@ This keeps the client protocol dead simple — the agent's scaffolding only need
     * With NDJSON streaming POST, the connection lifecycle IS the message lifecycle. If the agent crashes or disconnects, the server detects it immediately via `r.Context().Done()` or EOF on `r.Body.Read()`.
     * On detection: write `message_abort` event to the S2 stream. The HTTP handler returns (no response sent, since the connection is dead). Clean, deterministic — no background goroutine needed for timeout-based orphan detection.
     * On conversation leave: cancel the request context for any in-progress streaming write from this agent, triggering the abort path above.
-    * **Edge case — server crash mid-stream:** The S2 stream has `message_start` + some `message_append` records but no `message_end` or `message_abort`. On server restart, a recovery sweep checks for unterminated messages (a `message_start` with no corresponding `message_end`/`message_abort`) and writes `message_abort` events for them.
+    * **Edge case — server crash mid-stream:** The S2 stream has `message_start` + some `message_append` records but no `message_end` or `message_abort`. On server restart, a recovery sweep reads from the `in_progress_messages` PostgreSQL table (which tracks all active streaming writes), appends `message_abort` events to S2 for each row, and deletes the rows. No S2 stream scanning needed — the Postgres table is the index of unterminated messages.
 * **Validation on write:**
     * Agent must be a member of the conversation (checked once when the streaming POST request arrives, before reading the body).
     * Content must be plaintext (spec says "purely plaintext communication").
@@ -400,7 +421,7 @@ Response: 200 OK
 * Agent connects to nonexistent conversation: 404.
 * Agent connects while another SSE connection for the same (agent, conversation) is active: close the old connection, use the new one. Only one active reader per agent per conversation.
 * `from` seq_num is beyond the stream's current tail: start tailing immediately, wait for new events.
-* `from` seq_num is before the stream's trim point (if trimming is implemented): return error or start from earliest available.
+* `from` seq_num is before the stream's trim point (28-day retention on free tier): silently start from the stream's earliest available record (head). Log a warning server-side for observability. The agent catches up on whatever history remains.
 * Slow reader: S2 handles backpressure. If the client can't keep up, the HTTP response buffer fills, Go's `http.Flusher` blocks, and the S2 read session slows down. No unbounded memory growth.
 
 **Files:** `internal/api/sse.go`, `internal/api/history.go`
@@ -409,7 +430,9 @@ Response: 200 OK
 
 ### 1.5 S2 Stream Storage Layer
 
-**Stream topology:** One S2 stream per conversation. Stream name: `conv-{conversation_id}`.
+**Full design details:** See `s2-architecture-plan.md` for the complete S2 architecture — basin configuration, append strategy analysis, read session management, error handling, recovery sweep, scaling roadmap, and Go interface design.
+
+**Stream topology:** One S2 stream per conversation. Stream name: `conversations/{conversation_id}` (hierarchical, prefix-listable).
 
 **Why one stream per conversation:**
 * S2 provides total ordering within a stream → total ordering within a conversation (exactly what chat needs).
@@ -423,31 +446,72 @@ Response: 200 OK
 * Cross-stream ordering is undefined — can't guarantee message A appears before message B across different agent streams.
 * More storage, more writes, more complexity, worse ordering guarantees. Strictly inferior for this use case.
 
+**Basin configuration:**
+```go
+s2.CreateBasinArgs{
+    Basin: "agentmail",
+    Scope: s2.Ptr(s2.BasinScopeAwsUsEast1),
+    Config: &s2.BasinConfig{
+        CreateStreamOnAppend: s2.Bool(true),   // auto-create streams on first append
+        CreateStreamOnRead:   s2.Bool(false),  // no phantom streams on read
+        DefaultStreamConfig: &s2.StreamConfig{
+            StorageClass: s2.Ptr(s2.StorageClassExpress),  // 40ms ack (vs 400ms Standard)
+            RetentionPolicy: &s2.RetentionPolicy{
+                Age: s2.Int64(28 * 24 * 3600),  // 28 days (free tier max)
+            },
+            Timestamping: &s2.TimestampingConfig{
+                Mode: s2.Ptr(s2.TimestampingModeArrival),  // S2 stamps on receipt
+            },
+        },
+    },
+}
+```
+
+**Account:** Free tier with $10 welcome credits. Express storage class — 40ms append ack is non-negotiable for real-time token streaming (Standard's 400ms makes readers lag ~12 tokens behind at 30 tokens/sec). Cost delta: $0.125/million messages. Negligible.
+
 **S2 operations used:**
 
-| Operation | When | S2 API |
-| :--- | :--- | :--- |
-| **Create stream** | On conversation create | `POST /streams` |
-| **Append records** | On message send/chunk | `POST /streams/{id}/records` with batch of records |
-| **Read records** | On SSE connect (catchup) | `GET /streams/{id}/records?seq_num=N` |
-| **Tail stream** | On SSE connect (real-time) | `GET /streams/{id}/records` (no count → auto-tail) |
-| **Check tail** | Health checks, cursor validation | `GET /streams/{id}/records/tail` |
+| Operation | When | S2 SDK Method | Pattern |
+| :--- | :--- | :--- | :--- |
+| **Append events (unary)** | System events, complete messages | `stream.Append()` | Single batch, atomic |
+| **Append session (pipelined)** | Streaming token writes | `stream.AppendSession()` | Per streaming POST, non-blocking submits |
+| **Read session (tailing)** | SSE handlers | `stream.ReadSession()` | Catch-up → real-time, indefinite tailing |
+| **Read range (bounded)** | History endpoint, recovery | `stream.Read()` | Bounded batch, no tailing |
+| **Check tail** | Health checks, cursor validation | `stream.CheckTail()` | Point query |
 
 **S2 client wrapper (`internal/store/s2.go`):**
-* Initialize with S2 auth token (from env var)
-* Basin handle (one basin for the whole service)
-* Methods: `CreateStream(convID)`, `AppendEvents(convID, []Event)`, `ReadFrom(convID, seqNum) → channel`, `TailStream(convID) → channel`
-* `ReadFrom` returns a Go channel that emits records. The caller ranges over the channel. When the stream transitions to tailing, the channel keeps emitting as new records arrive. When the caller cancels the context, the channel closes and the S2 session ends.
+```go
+type S2Store interface {
+    AppendEvents(ctx context.Context, convID uuid.UUID, events []Event) (AppendResult, error)
+    OpenAppendSession(ctx context.Context, convID uuid.UUID) (*AppendSessionWrapper, error)
+    OpenReadSession(ctx context.Context, convID uuid.UUID, fromSeq uint64) (*ReadSessionWrapper, error)
+    ReadRange(ctx context.Context, convID uuid.UUID, fromSeq uint64, limit int) ([]SequencedEvent, error)
+    CheckTail(ctx context.Context, convID uuid.UUID) (uint64, error)
+}
+```
+* Initialize with S2 auth token (from `S2_ACCESS_TOKEN` env var)
+* Basin handle: single basin `agentmail` for the whole service
+* `OpenReadSession` returns an iterator — the caller calls `Next()` in a loop. When the stream transitions from catch-up to real-time tailing, the iterator keeps yielding records seamlessly. When the caller cancels the context, the session closes.
+
+**Append strategy (why two patterns):**
+* **Unary** for system events + complete messages: Rare, simple, one atomic batch. Single round-trip.
+* **AppendSession** for streaming tokens: Unary at 40ms ack = max 25 appends/sec. LLMs emit 30-100 tokens/sec. AppendSession pipelines appends — submit token N while token N-1's ack is still in-flight. No throughput bottleneck.
+* **Producer (auto-batching) was evaluated and rejected:** 5ms linger delay before records flush adds latency for no benefit — tokens arrive serially from one NDJSON body, so there's nothing to batch.
 
 **Record encoding:**
-* S2 record headers: `type` → event type string (for filtering without parsing body)
+* S2 record headers: `type` → event type string (enables dispatch without JSON-parsing the body)
 * S2 record body: JSON-encoded event payload
+* Timestamps: S2-assigned (arrival mode) — included in `SequencedEvent` on the read path
 * Why JSON over protobuf: the entire API is JSON. Protobuf adds a compilation step, client codegen dependency, and cognitive overhead for AI agents reading the code. JSON is self-describing, debuggable, and curl-friendly. The record bodies are small (message chunks), so serialization performance is irrelevant.
 
 **Concurrency control:**
 * No fencing tokens needed. Multiple agents write concurrently — this is desired behavior.
 * No optimistic sequence numbers needed. We don't care about write ordering between agents; S2's sequencing IS the ordering.
-* S2 atomic batch append for complete messages (3 records in one call). Streaming chunks are individual record appends, driven by the server reading NDJSON lines from the request body — one S2 append per line.
+* S2 atomic batch append for complete messages (3 records in one Unary call). Streaming tokens are pipelined via AppendSession — one submit per NDJSON line from the request body.
+
+**Concurrent message interleaving:** When two agents stream simultaneously, their records interleave on the S2 stream in whatever order S2 receives them. This is correct — the interleaving IS the total order. Readers demultiplex by `message_id` to reconstruct each agent's message independently. The history endpoint assembles complete messages and orders them by `message_start` sequence number (who spoke first).
+
+**Error handling and retry:** S2 SDK retry config with `AppendRetryPolicyAll` (3 attempts, exponential backoff). Duplicate records from retries are harmless — `message_id` on every record serves as a natural deduplication key. ReadSession failures cause SSE disconnection; client reconnects with `Last-Event-ID` for seamless resume.
 
 ---
 
@@ -598,15 +662,26 @@ CREATE TABLE cursors (
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (agent_id, conversation_id)
 );
+
+-- In-progress streaming writes: tracks active streaming messages for crash recovery.
+-- On server crash, recovery sweep writes message_abort for each row, then deletes.
+-- Postgres-first insert (before S2 message_start) ensures crash safety.
+CREATE TABLE in_progress_messages (
+    message_id       UUID PRIMARY KEY,
+    conversation_id  UUID NOT NULL,
+    agent_id         UUID NOT NULL,
+    s2_stream_name   TEXT NOT NULL,
+    started_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ```
 
 **Table rationale:**
 * **`agents`:** No indexes beyond PK. No metadata columns (spec says "no metadata"). Agents are permanent (no soft-delete).
-* **`conversations`:** `s2_stream_name` decouples conversation ID from S2 stream name (format: `conv-{conversation_id}`). UNIQUE index prevents two conversations pointing to the same stream.
+* **`conversations`:** `s2_stream_name` decouples conversation ID from S2 stream name (format: `conversations/{conversation_id}`). UNIQUE index prevents two conversations pointing to the same stream.
 * **`members`:** PK order `(conversation_id, agent_id)` optimized for the hottest queries: membership check (`WHERE conversation_id = $1 AND agent_id = $2`) and member list (`WHERE conversation_id = $1`). Separate index on `(agent_id)` for "list conversations for agent." Foreign keys with no CASCADE — agents and conversations are permanent. **Hard delete on leave:** simpler queries (no `AND left_at IS NULL`), S2 stream has full membership event history, re-invite is a fresh INSERT.
 * **`cursors`:** No foreign keys (validated at API layer, cursors may outlive membership). **Cursors survive leave** — on re-invite, agent resumes from where they left off, catching up on missed messages. `BIGINT` for `seq_num` (S2 sequence numbers are 64-bit). PK order `(agent_id, conversation_id)` optimized for disconnect cleanup.
 
-**Why exactly four tables:** No `messages` table (messages live in S2). No `sessions`/`connections` table (tracked in-memory). No `events`/`audit` table (S2 streams ARE the audit log).
+**Why exactly five tables:** No `messages` table (messages live in S2). No `sessions`/`connections` table (tracked in-memory). No `events`/`audit` table (S2 streams ARE the audit log). The fifth table (`in_progress_messages`) is the minimal addition needed for crash recovery — it tracks active streaming writes so the server can emit `message_abort` events for unterminated messages on restart. Rows exist only for the duration of active streaming POST requests (seconds to minutes), so the table is tiny.
 
 #### 1.6.6 Connection Pooling
 
@@ -684,10 +759,18 @@ No race. UUIDv7s are unique. Independent rows. No locking needed.
 
 The spec requires: "Active streaming connections are terminated on leave."
 
+The ConnRegistry tracks **both** SSE read connections and streaming write connections per `(agent_id, conversation_id)`:
+
 ```go
 type ConnRegistry struct {
     mu    sync.Mutex
     conns map[connKey]*connEntry
+}
+
+type connKey struct {
+    AgentID        uuid.UUID
+    ConversationID uuid.UUID
+    ConnType       string  // "sse" or "write"
 }
 
 type connEntry struct {
@@ -699,26 +782,43 @@ type connEntry struct {
 **Leave handler flow:**
 1. Begin Postgres transaction → `SELECT ... FOR UPDATE` → check count > 1 → DELETE → commit
 2. Invalidate membership cache
-3. Look up `(agent_id, conversation_id)` in ConnRegistry
-4. If found: call `entry.Cancel()`, then `<-entry.Done` (wait for goroutine exit, 5s timeout)
-5. Write `agent_left` event to S2 stream
-6. Return 200
+3. Look up `(agent_id, conversation_id, "write")` in ConnRegistry
+4. If found:
+   a. Call `entry.Cancel()` → write handler detects context cancellation
+   b. `<-entry.Done` (5s timeout) → wait for write handler to exit
+   c. If write handler failed to append `message_abort` → leave handler appends it as fallback (belt-and-suspenders)
+5. Look up `(agent_id, conversation_id, "sse")` in ConnRegistry
+6. If found: call `entry.Cancel()`, then `<-entry.Done` (5s timeout)
+7. Write `agent_left` event to S2 stream (AFTER all connection goroutines have exited, ensuring abort precedes leave on the stream)
+8. Return 200
 
-**Timeout on wait:** Add a 5-second timeout on `<-entry.Done` to prevent a stuck goroutine from blocking the leave response indefinitely. If timeout fires, log a warning and proceed.
+**Timeout on wait:** 5-second timeout on each `<-entry.Done` to prevent a stuck goroutine from blocking the leave response indefinitely. If timeout fires, log a warning and proceed.
 
 **SSE handler registration flow:**
 ```
 1. Create context with cancel: ctx, cancel := context.WithCancel(r.Context())
 2. Create done channel: done := make(chan struct{})
-3. Register: registry.Register(agentID, convID, cancel, done)
+3. Register: registry.Register(agentID, convID, "sse", cancel, done)
 4. defer:
    a. close(done)                   -- signals that goroutine has exited
-   b. registry.Deregister(agentID, convID)
+   b. registry.Deregister(agentID, convID, "sse")
    c. cursor.FlushOne(agentID, convID)  -- flush final cursor position
 5. Run SSE loop until ctx.Done()
 ```
 
-**One SSE connection per (agent, conversation):** If agent opens a second connection, cancel the old one first. Prevents resource leaks.
+**Streaming write handler registration flow:**
+```
+1. Create context with cancel: ctx, cancel := context.WithCancel(r.Context())
+2. Create done channel: done := make(chan struct{})
+3. Register: registry.Register(agentID, convID, "write", cancel, done)
+4. defer:
+   a. close(done)                   -- signals that goroutine has exited
+   b. registry.Deregister(agentID, convID, "write")
+5. Run streaming write loop until ctx.Done() or EOF
+```
+
+**One SSE connection per (agent, conversation):** If agent opens a second SSE connection, cancel the old one first. Prevents resource leaks.
+**One streaming write per (agent, conversation):** If agent starts a second streaming write to the same conversation while one is in progress, reject with 409 Conflict.
 
 #### 1.6.10 Store Interface: Go Design
 
@@ -822,6 +922,17 @@ SELECT seq_num FROM cursors WHERE agent_id = $1 AND conversation_id = $2;
 INSERT INTO cursors (agent_id, conversation_id, seq_num, updated_at) VALUES ($1, $2, $3, now())
 ON CONFLICT (agent_id, conversation_id) DO UPDATE SET seq_num = $3, updated_at = now()
 WHERE cursors.seq_num < $3;
+```
+
+**in_progress.sql:**
+```sql
+-- name: InsertInProgress :exec
+INSERT INTO in_progress_messages (message_id, conversation_id, agent_id, s2_stream_name, started_at)
+VALUES ($1, $2, $3, $4, now());
+-- name: DeleteInProgress :exec
+DELETE FROM in_progress_messages WHERE message_id = $1;
+-- name: ListInProgress :many
+SELECT message_id, conversation_id, agent_id, s2_stream_name, started_at FROM in_progress_messages;
 ```
 
 Batch cursor flush uses raw pgx with `unnest()` arrays (not sqlc).
@@ -1195,8 +1306,9 @@ The result: a Go server with ~1500 lines of code that does exactly what the spec
     * Health endpoint
     * Makefile with build/run/test targets
 * **Step 2: S2 client wrapper (1 hr)**
-    * Provision S2 account, get auth token
-    * Implement `CreateStream`, `AppendRecords`, `ReadFrom`, `CheckTail`
+    * Provision S2 account (free tier, $10 credits), get auth token
+    * Create basin `agentmail` with Express storage class, `CreateStreamOnAppend: true`, arrival timestamping, 28-day retention
+    * Implement `AppendEvents` (unary), `OpenAppendSession` (pipelined), `OpenReadSession` (tailing), `ReadRange` (bounded), `CheckTail`
     * Test against real S2 (integration test)
 * **Step 3: Agent registry (30 min)**
     * `POST /agents` endpoint
@@ -1205,7 +1317,7 @@ The result: a Go server with ~1500 lines of code that does exactly what the spec
 * **Step 4: Conversation management (1.5 hr)**
     * Create, list, invite, leave endpoints
     * Membership checks
-    * S2 stream creation on conversation create
+    * S2 auto-creates stream on first `agent_joined` append via `CreateStreamOnAppend: true`
     * System events (`agent_joined`, `agent_left`) written to S2
 * **Step 5: Complete message send (1 hr)**
     * `POST /conversations/:cid/messages`
@@ -1263,7 +1375,8 @@ agentmail-take-home/
 │   │   │   ├── agents.sql          # sqlc queries for agents
 │   │   │   ├── conversations.sql   # sqlc queries for conversations
 │   │   │   ├── members.sql         # sqlc queries for members
-│   │   │   └── cursors.sql         # sqlc queries for cursors
+│   │   │   ├── cursors.sql         # sqlc queries for cursors
+│   │   │   └── in_progress.sql     # sqlc queries for in-progress message tracking
 │   │   ├── db/                     # sqlc generated code (git-committed)
 │   │   │   ├── db.go
 │   │   │   ├── models.go
