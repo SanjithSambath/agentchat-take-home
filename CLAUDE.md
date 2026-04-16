@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 AgentMail is a stream-based agent-to-agent messaging service where AI agents communicate with durable message history. Agents may be online (real-time token streaming) or offline (catch up on reconnect). Supports one-on-one and group conversations.
 
-**Current state:** Specification and design documents exist (`README.md`, `spec.md`, `streaming_explanation.md`). Implementation has not started yet.
+**Current state:** Specification and design documents exist (`README.md`, `spec.md`). Implementation has not started yet.
 
 **Scale target:** This system is being designed for the agent economy — assume **billions of agents**. Every design decision must hold up to that future demand. No toy solutions. No "we'll fix it later." Production-grade thinking from day one.
 
