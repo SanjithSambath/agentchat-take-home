@@ -15,12 +15,12 @@ This document specifies the complete design for AgentMail's Claude-powered **res
 - **Discoverability:** Dedicated `GET /agents/resident` endpoint — unauthenticated, programmatic, AI-agent-friendly
 - **Conversation discovery:** Go channel for real-time invite notifications. One-time startup reconciliation for catch-up. No periodic polling.
 - **Conversation listening:** On startup, listen to ALL conversations the agent is a member of. On invite, immediately start listening to the new conversation.
-- **Response triggering:** Non-deterministic — Claude decides whether to respond via `[NO_RESPONSE]` protocol. Self-messages hardcode-skipped (never sent to Claude). Sequential queuing per conversation.
+- **Response triggering:** Always respond to every `message_end` from another agent. Self-messages hardcode-skipped (never sent to Claude). Sequential queuing per conversation via channel semaphore. `[NO_RESPONSE]` protocol dropped — unnecessary complexity for a resident agent.
 - **History seeding:** Lazy — history is empty on connect, seeded from S2 on first `message_end` from another agent. Bounded sliding window (last 50 messages).
-- **Claude API integration:** Streaming responses via Anthropic Go SDK, piped directly to S2 AppendSession (no HTTP self-call for writes)
-- **Context management:** Sliding window over message history, system prompt + last N messages fitting within context limit
-- **Multi-conversation:** One listener goroutine per conversation, shared Claude API client with concurrency semaphore
-- **Error handling:** Graceful degradation — Claude API failures produce an error message in the conversation, not silent failure
+- **Claude API integration:** Streaming responses via Anthropic Go SDK (`client.Messages.NewStreaming`), piped directly to S2 AppendSession (no HTTP self-call for writes). Response goroutine is a child of the listener goroutine, tracked via per-conversation WaitGroup.
+- **Context management:** Sliding window over message history, system prompt + last N messages. Consecutive same-role messages merged with sender attribution for Anthropic API compliance.
+- **Multi-conversation:** One listener goroutine per conversation, shared Claude API client with global concurrency semaphore (capacity 5). Per-conversation sequential queuing via channel semaphore.
+- **Error handling:** Graceful degradation — Claude API failures produce a visible error message in the conversation. Mid-stream failures write `message_abort`. In-progress tracking via Postgres for crash recovery. 429 rate limits handled with exponential backoff and `Retry-After` respect.
 
 ### The Agent's Role in the System
 
@@ -821,8 +821,8 @@ func (a *Agent) onEvent(convID uuid.UUID, event SequencedEvent) {
             return
         }
 
-        // Trigger response (releases lock, runs async — see Section 6)
-        a.triggerResponse(convID, state)
+        // Trigger response (copies history under lock, spawns async goroutine — see Section 6)
+        a.triggerResponse(ctx, convID, state)
 
     case "message_abort":
         delete(state.pending, event.MessageID)
@@ -837,7 +837,7 @@ func (a *Agent) onEvent(convID uuid.UUID, event SequencedEvent) {
 
 **Key design decisions in `onEvent()`:**
 
-**Self-message skip is hardcoded, not sent to Claude.** The agent's own responses appear on the same S2 stream. Without this check, every response triggers another Claude API call that returns `[NO_RESPONSE]` — wasting money and latency. "Should I respond to myself?" is never a judgment call. Hardcode it.
+**Self-message skip is hardcoded, not sent to Claude.** The agent's own responses appear on the same S2 stream. Without this check, every response triggers another Claude API call — wasting money and latency, and risking infinite echo loops. "Should I respond to myself?" is never a judgment call. Hardcode it.
 
 **`message_append` with no matching `message_start`:** Silently dropped. This happens when the agent's cursor resumes mid-message after a crash. The partial message is unrecoverable — wait for the next complete message. Not an error.
 
@@ -850,15 +850,23 @@ func (a *Agent) onEvent(convID uuid.UUID, event SequencedEvent) {
 History is seeded on the first `message_end` from another agent, not on connect. This avoids paying the ReadRange cost for dormant conversations that never receive new messages.
 
 ```go
-func (a *Agent) triggerResponse(convID uuid.UUID, state *convState) {
+func (a *Agent) triggerResponse(ctx context.Context, convID uuid.UUID, state *convState) {
     // Lazy seed: first time we need to respond, load history
     if !state.seeded {
         a.seedHistory(convID, state)
         state.seeded = true
     }
 
-    // Queue response for Claude (Section 6 designs the full response pipeline)
-    // ... response queuing logic ...
+    // Copy history under lock (state.mu is held by caller via onEvent's defer)
+    snapshot := make([]Message, len(state.history))
+    copy(snapshot, state.history)
+
+    // Spawn response goroutine — see Section 6 for full respond() implementation
+    state.responseWg.Add(1)
+    go func() {
+        defer state.responseWg.Done()
+        a.respond(ctx, convID, snapshot)
+    }()
 }
 ```
 
@@ -946,45 +954,24 @@ func (s *convState) cleanStalePending() {
 
 ### Response Triggering Strategy
 
-**Non-deterministic: Claude decides whether to respond.**
+**Always respond: the resident agent responds to every `message_end` from another agent.**
 
-After a complete message arrives from another agent, the agent sends the conversation history to Claude with a system prompt that includes:
+Self-messages are hardcode-skipped in `onEvent()` (`if msg.Sender == a.id { return }`). Every message from a different agent triggers `triggerResponse()`, which spawns an async response goroutine (see Section 6). Sequential queuing via channel semaphore ensures at most one Claude call per conversation at a time.
 
-```
-You are participating in a conversation. Based on the context, decide whether to respond.
-If you determine that no response is needed, reply with exactly: [NO_RESPONSE]
-Otherwise, respond naturally.
-```
+**Why always-respond, not [NO_RESPONSE] protocol:**
 
-Claude sees the full conversation context and makes the judgment call. This handles:
-- Group conversations where the message is directed at someone else
-- Messages that are acknowledgments ("ok", "thanks") that don't need a reply
-- Situations where the agent already responded and the other party is continuing a thought
-
-**Why non-deterministic over rules-based:**
+The `[NO_RESPONSE]` protocol (Claude decides whether to respond via sentinel text) was evaluated and rejected for the resident agent:
 
 | Approach | Problem |
 |---|---|
-| Respond to every `message_end` | Infinite loops in group conversations with 2+ AI agents |
-| "Don't respond if last message is yours" | Breaks multi-message sequences ("I have a question..." / "Actually two questions...") |
-| "Only respond if mentioned" | Requires @mention convention that doesn't exist in the spec |
-| Claude decides | Handles all cases — context-aware, no edge case rules to maintain |
+| `[NO_RESPONSE]` sentinel + buffer detection | Adds complexity to the streaming pipeline (must buffer initial tokens, string-match). Fragile. |
+| Tool-call-based decision | Incompatible with streaming — tool call arguments arrive as JSON fragments, not streamable text. |
+| Two-phase (decide, then stream) | Doubles API latency and cost for every incoming message. |
+| **Always respond** | **Zero overhead. The resident agent's job IS to respond.** Self-echo skip prevents infinite loops. |
 
-**The `[NO_RESPONSE]` check:**
+The resident agent has no reason to stay silent. It exists to demonstrate the platform by conversing. The self-echo hardcode skip is the only guard needed — it's trivially deterministic and prevents infinite loops.
 
-```go
-// After Claude API call completes (Section 6):
-response := claude.GetResponse()
-if strings.TrimSpace(response) == "[NO_RESPONSE]" {
-    // Claude decided not to respond. No S2 write. No events emitted.
-    return
-}
-// Otherwise: stream response to S2 via AppendSession
-```
-
-**Cost consideration:** Every `message_end` from another agent triggers a Claude API call, even if Claude decides not to respond. At take-home scale (handful of conversations, evaluator testing), this is negligible. At production scale, a lightweight pre-filter (local LLM, heuristic scorer) could gate which messages reach Claude. Not needed now.
-
-**Self-messages are NOT sent to Claude.** The hardcoded `if msg.Sender == a.id { return }` in `onEvent()` prevents self-echo loops before the Claude API is ever called. The `[NO_RESPONSE]` protocol handles the genuinely ambiguous cases — messages from OTHER agents that may or may not warrant a response.
+**Production enhancement (FUTURE.md):** For production agent frameworks with multiple AI agents in group conversations, intelligent response gating (mode-toggle, tool-based decisions, lightweight pre-filters) belongs in the client-side agent architecture. The AgentMail API supports this via the natural patterns of SSE connect/disconnect and NDJSON POST start/stop. Document in CLIENT.md as guidance for external agent developers.
 
 ---
 
@@ -1048,5 +1035,636 @@ internal/agent/
 ├── notifier.go    # AgentNotifier interface, agentNotifier, noopNotifier
 └── discovery.go   # discoveryLoop(), reconcileConversations()
 ```
+
+---
+
+## 6. Claude API Integration & Token Piping
+
+### The Problem
+
+The agent has accumulated a conversation history (Section 5), decided to respond (every `message_end` from another agent), and needs to:
+1. Call the Claude API with the conversation context
+2. Stream Claude's response tokens in real-time to the S2 conversation stream
+3. Handle failures at every stage — Claude API errors, S2 write failures, context cancellation from leave/shutdown
+4. Ensure clean event ordering on the S2 stream (`message_abort` before `agent_left`)
+
+This is the mechanical core: the bridge between Claude's streaming output and S2's AppendSession.
+
+---
+
+### Decision: Direct S2 AppendSession (Not HTTP Self-Call)
+
+The agent writes directly to S2 via `s2Store.OpenAppendSession()` — the same SDK call the HTTP streaming write handler uses internally. Consistent with the read path decision (Section 4 chose direct S2 ReadSession over HTTP SSE to self).
+
+**Why not HTTP self-call:** The original `spec.md` §1.8 sketch proposed piping Claude tokens through an NDJSON POST to the agent's own `/messages/stream` endpoint via `io.Pipe`. This was replaced because:
+- HTTP serialization + loopback + middleware adds latency for zero benefit
+- The agent is an internal component — going through HTTP to talk to yourself is a round-trip to nowhere
+- Bootstrap ordering: the agent starts before the HTTP server, so the endpoint may not be serving yet
+- The `in_progress_messages` tracking and abort handling are straightforward to add directly
+
+---
+
+### Decision: Always Respond (No [NO_RESPONSE] Protocol)
+
+The resident agent responds to every `message_end` from another agent. The `[NO_RESPONSE]` protocol designed in Section 5 is **dropped** for the resident agent.
+
+**Why dropped:**
+- The resident agent is a demonstration bot. Its job is to respond to messages. There is no scenario where silence is the correct behavior.
+- `[NO_RESPONSE]` was designed for group conversations with multiple AI agents where some messages aren't directed at you. At take-home scale (evaluator testing), this edge case doesn't justify the complexity.
+- `[NO_RESPONSE]` detection with streaming requires either: (a) buffering initial tokens and string-matching a sentinel (fragile, adds latency), (b) tool-call-based decision (incompatible with streaming — tool call arguments arrive as JSON fragments, not streamable text), or (c) two-phase API calls (doubles latency and cost). All three are worse than not doing it.
+- Self-messages are already hardcode-skipped in `onEvent()` (Section 5). Infinite echo loops are impossible.
+
+**Production enhancement (FUTURE.md):** For a production agent framework supporting external agents with human-in-the-loop workflows, intelligent response gating belongs in the client-side agent architecture (mode-toggle between communication and reasoning), not in the server-side resident agent. Document this as a CLIENT.md guidance pattern.
+
+---
+
+### Response Goroutine Lifecycle
+
+The response goroutine is a **child of the listener goroutine**, tracked via a per-conversation `sync.WaitGroup`. This ensures:
+- The listener goroutine doesn't block waiting for Claude (continues reading events)
+- The deferred cleanup in `startListening()` waits for in-progress responses before signaling `close(done)`
+- The leave handler's event ordering guarantee (`message_abort` → `agent_left`) is maintained
+
+**`convState` additions:**
+
+```go
+type convState struct {
+    mu          sync.Mutex
+    pending     map[string]*pendingMessage
+    history     []Message
+    seeded      bool
+    lastSeededSeq uint64
+
+    responseSem chan struct{}   // capacity 1 — at most one in-flight Claude call
+    responseWg  sync.WaitGroup // tracks in-progress response goroutine
+}
+```
+
+**Initialization (in `getOrCreateConvState()`):**
+
+```go
+state = &convState{
+    pending:     make(map[string]*pendingMessage),
+    responseSem: make(chan struct{}, 1),
+}
+```
+
+**Updated deferred cleanup in `startListening()`:**
+
+```go
+defer func() {
+    // 0. Wait for any in-progress response to finish
+    //    (writes message_abort if needed before exiting)
+    state := a.getOrCreateConvState(convID)
+    state.responseWg.Wait()
+
+    // 1. Flush cursor
+    a.store.Cursors().FlushOne(context.Background(), a.id, convID)
+    // 2. Signal completion — unblocks leave handler
+    close(done)
+    // 3-4. ConnRegistry deregister, listeners map cleanup (unchanged)
+}()
+```
+
+**Why `responseWg.Wait()` before cursor flush:** The response goroutine may write events to S2 (message_abort). The cursor should reflect the latest state after those writes. Ordering: wait for response → flush cursor → signal done.
+
+---
+
+### Sequential Queuing — Channel Semaphore
+
+At most one Claude response is in-flight per conversation at any time. This prevents:
+- Two concurrent Claude calls with overlapping history (incoherent, wasteful)
+- Two concurrent AppendSessions writing interleaved response tokens from the same agent
+
+**Mechanism:** `responseSem chan struct{}` with capacity 1. The response goroutine acquires the semaphore before starting, releases when done. The second response waits (context-aware) for the first to complete.
+
+```go
+select {
+case state.responseSem <- struct{}{}:
+    // acquired — proceed with Claude call
+    defer func() { <-state.responseSem }()
+case <-ctx.Done():
+    // leave or shutdown — don't wait, exit immediately
+    return
+}
+```
+
+**Why channel semaphore, not `sync.Mutex`:** Context cancellation doesn't interrupt `sync.Mutex.Lock()`. A goroutine blocked on mutex acquisition during a leave would hang until the first response finishes. The channel `select` respects `ctx.Done()` — the blocked goroutine exits immediately on leave/shutdown.
+
+**Coalescing (FUTURE.md):** If multiple messages arrive while a response is in-flight, they all queue independently. Each triggers a separate Claude call when it acquires the semaphore. At production scale, a "latest wins" flag could coalesce rapid-fire messages into fewer Claude calls. Not needed at take-home scale.
+
+---
+
+### The `triggerResponse()` Function — Complete Implementation
+
+`triggerResponse()` is called from `onEvent()` under `state.mu`. It copies the history snapshot under the lock, then spawns an async goroutine for the Claude call.
+
+```go
+func (a *Agent) triggerResponse(ctx context.Context, convID uuid.UUID, state *convState) {
+    // Lazy seed: first time we need to respond, load history
+    if !state.seeded {
+        a.seedHistory(convID, state)
+        state.seeded = true
+    }
+
+    // Copy history under lock (state.mu is held by caller)
+    snapshot := make([]Message, len(state.history))
+    copy(snapshot, state.history)
+
+    // Spawn response goroutine (child of listener)
+    state.responseWg.Add(1)
+    go func() {
+        defer state.responseWg.Done()
+        a.respond(ctx, convID, snapshot)
+    }()
+}
+```
+
+**Why copy history under lock:** After `triggerResponse()` returns, `state.mu` is released. The listener goroutine continues processing events, modifying `state.history` via `appendMessage()`. The response goroutine must work with a stable snapshot — not a slice that's being mutated concurrently.
+
+**Why pass `ctx` (the `listenerCtx`):** The response goroutine must respect the same cancellation as the listener. On leave/shutdown, `listenerCtx` cancellation propagates to both the Claude API call and the S2 AppendSession.
+
+---
+
+### The `respond()` Function — The Token Pipeline
+
+```go
+func (a *Agent) respond(ctx context.Context, convID uuid.UUID, history []Message) {
+    // 1. Acquire per-conversation semaphore (context-aware)
+    select {
+    case a.getOrCreateConvState(convID).responseSem <- struct{}{}:
+        defer func() { <-a.getOrCreateConvState(convID).responseSem }()
+    case <-ctx.Done():
+        return
+    }
+
+    // 2. Build Claude messages array
+    claudeMsgs := a.buildClaudeMessages(history)
+
+    // 3. Call Claude streaming API (with one retry on transient failure)
+    var stream *anthropic.MessageStream
+    var err error
+    for attempt := 0; attempt < 2; attempt++ {
+        stream = a.claude.Messages.NewStreaming(ctx, anthropic.MessageNewParams{
+            Model:     anthropic.ModelClaudeSonnet4_20250514,
+            MaxTokens: 4096,
+            System:    []anthropic.TextBlockParam{
+                anthropic.NewTextBlockParam("You are a helpful AI assistant on the AgentMail platform. You are participating in a conversation with one or more AI agents. Respond naturally and concisely."),
+            },
+            Messages: claudeMsgs,
+        })
+        if stream != nil {
+            break
+        }
+        if attempt == 0 && ctx.Err() == nil {
+            time.Sleep(500 * time.Millisecond)
+        }
+    }
+    if stream == nil || ctx.Err() != nil {
+        a.sendErrorMessage(ctx, convID, "I encountered an error connecting to my language model. Please try again.")
+        return
+    }
+    defer stream.Close()
+
+    // 4. Track in-progress message (Postgres-first, for crash recovery)
+    msgID := uuid.NewV7()
+    a.store.InProgress().Insert(ctx, msgID, convID, a.id, fmt.Sprintf("conversations/%s", convID))
+    defer a.store.InProgress().Delete(context.Background(), msgID)
+
+    // 5. Open S2 AppendSession
+    session, err := a.s2.OpenAppendSession(ctx, convID)
+    if err != nil {
+        a.sendErrorMessage(ctx, convID, "I encountered an error preparing my response. Please try again.")
+        return
+    }
+    defer session.Close()
+
+    // 6. Write message_start
+    session.Submit(ctx, Event{Type: "message_start", Body: MessageStartPayload{
+        MessageID: msgID, SenderID: a.id,
+    }})
+
+    // 7. Stream tokens: Claude → S2
+    aborted := false
+    for stream.Next() {
+        if ctx.Err() != nil {
+            aborted = true
+            break
+        }
+
+        event := stream.Current()
+        switch delta := event.AsAny().(type) {
+        case anthropic.ContentBlockDeltaEvent:
+            switch textDelta := delta.Delta.AsAny().(type) {
+            case anthropic.TextDelta:
+                if textDelta.Text != "" {
+                    session.Submit(ctx, Event{Type: "message_append", Body: MessageAppendPayload{
+                        MessageID: msgID, Content: textDelta.Text,
+                    }})
+                }
+            }
+        }
+    }
+
+    // 8. Check for errors
+    if err := stream.Err(); err != nil || aborted || ctx.Err() != nil {
+        // Abort via unary append (session may be in error state)
+        reason := "claude_error"
+        if ctx.Err() != nil {
+            reason = "agent_left"
+        }
+        a.s2.AppendEvents(context.Background(), convID, []Event{{
+            Type: "message_abort",
+            Body: MessageAbortPayload{MessageID: msgID, Reason: reason},
+        }})
+        return
+    }
+
+    // 9. Write message_end
+    session.Submit(ctx, Event{Type: "message_end", Body: MessageEndPayload{
+        MessageID: msgID,
+    }})
+}
+```
+
+### Token Flow Diagram
+
+```text
+┌─────────────┐     stream.Next()      ┌─────────────────┐    Submit()     ┌─────────┐
+│  Claude API  │ ─────────────────────→ │  respond()       │ ─────────────→ │   S2    │
+│  (streaming) │  ContentBlockDelta     │  goroutine       │  AppendSession │ (stream │
+│              │  TextDelta.Text        │                  │                │per conv)│
+└─────────────┘                         └─────────────────┘                └─────────┘
+                                               │
+                                               │ on error / ctx cancel
+                                               ▼
+                                        message_abort
+                                        (unary append)
+```
+
+**Properties of the token pipeline:**
+- **Zero buffering.** Each `TextDelta` goes directly to `session.Submit()`. The reader sees tokens in real-time (~40ms S2 ack latency after each submit).
+- **Context-aware at every step.** `ctx.Err()` check inside the loop catches leave/shutdown between tokens. The Claude API call itself respects `ctx` cancellation.
+- **Abort via unary, not session.** If the AppendSession is in an error state (S2 failure), `message_abort` goes through a fresh unary `AppendEvents()` call with `context.Background()` (best-effort — must try even if the listener's context is canceled).
+- **In-progress tracking wraps the lifecycle.** Postgres insert before `message_start`, delete after `message_end` or `message_abort`. If the server crashes mid-response, the recovery sweep on startup cleans up.
+
+---
+
+### Message History Formatting for Claude API
+
+The Anthropic API requires messages to alternate between `user` and `assistant` roles, starting with `user`. In a group conversation, multiple agents' messages all map to `user` from the resident agent's perspective, creating consecutive same-role messages that the API rejects.
+
+**Solution:** Merge consecutive same-role messages with sender attribution.
+
+```go
+func (a *Agent) buildClaudeMessages(history []Message) []anthropic.MessageParam {
+    if len(history) == 0 {
+        return nil
+    }
+
+    var msgs []anthropic.MessageParam
+    var currentRole anthropic.MessageParamRole
+    var currentContent strings.Builder
+
+    for _, msg := range history {
+        role := anthropic.MessageParamRoleUser
+        if msg.Sender == a.id {
+            role = anthropic.MessageParamRoleAssistant
+        }
+
+        if role == currentRole && currentContent.Len() > 0 {
+            // Same role as previous — merge with sender attribution
+            currentContent.WriteString("\n\n")
+            if role == anthropic.MessageParamRoleUser {
+                currentContent.WriteString(fmt.Sprintf("[%s]: ", msg.Sender))
+            }
+            currentContent.WriteString(msg.Content)
+        } else {
+            // Role changed — flush previous message
+            if currentContent.Len() > 0 {
+                msgs = append(msgs, anthropic.MessageParam{
+                    Role:    currentRole,
+                    Content: []anthropic.ContentBlockParam{anthropic.NewTextBlock(currentContent.String())},
+                })
+            }
+            currentRole = role
+            currentContent.Reset()
+            if role == anthropic.MessageParamRoleUser && len(history) > 1 {
+                currentContent.WriteString(fmt.Sprintf("[%s]: ", msg.Sender))
+            }
+            currentContent.WriteString(msg.Content)
+        }
+    }
+
+    // Flush last message
+    if currentContent.Len() > 0 {
+        msgs = append(msgs, anthropic.MessageParam{
+            Role:    currentRole,
+            Content: []anthropic.ContentBlockParam{anthropic.NewTextBlock(currentContent.String())},
+        })
+    }
+
+    // Anthropic API requires first message to be "user"
+    // If history starts with our own message (assistant), prepend a synthetic user message
+    if len(msgs) > 0 && msgs[0].Role == anthropic.MessageParamRoleAssistant {
+        msgs = append([]anthropic.MessageParam{{
+            Role:    anthropic.MessageParamRoleUser,
+            Content: []anthropic.ContentBlockParam{anthropic.NewTextBlock("[conversation history begins with your previous response]")},
+        }}, msgs...)
+    }
+
+    return msgs
+}
+```
+
+**Why sender attribution (`[agent-id]: content`):** In a group conversation with agents B and C, the resident agent sees both as "user." Without attribution, Claude can't distinguish who said what. The `[agent-id]` prefix gives Claude enough context to respond coherently to multi-party conversations.
+
+**Why only attribute user messages, not assistant messages:** The assistant messages are always from the resident agent itself. There's only one assistant. No ambiguity.
+
+---
+
+### Error Message Helper
+
+When Claude API or S2 fails before any streaming has started, the agent sends a visible error message to the conversation so the evaluator knows the agent is alive but encountered an issue.
+
+```go
+func (a *Agent) sendErrorMessage(ctx context.Context, convID uuid.UUID, content string) {
+    msgID := uuid.NewV7()
+    a.s2.AppendEvents(ctx, convID, []Event{
+        {Type: "message_start", Body: MessageStartPayload{MessageID: msgID, SenderID: a.id}},
+        {Type: "message_append", Body: MessageAppendPayload{MessageID: msgID, Content: content}},
+        {Type: "message_end", Body: MessageEndPayload{MessageID: msgID}},
+    })
+}
+```
+
+**Unary append (atomic batch):** The error message is a complete message — three records in one batch. Either all three land or none do. No in-progress tracking needed (no streaming, no crash window).
+
+**Best-effort:** If S2 is also down, the error message fails silently. The evaluator sees no response. This is acceptable — if both Claude and S2 are unreachable simultaneously, there's nothing the agent can do. The next message from the evaluator will trigger another attempt.
+
+---
+
+### Claude API Parameters
+
+| Parameter | Value | Rationale |
+|---|---|---|
+| **Model** | `claude-sonnet-4-20250514` | Fast time-to-first-token (~500ms), good quality for conversation, cost-effective |
+| **max_tokens** | 4096 | Generous for conversational responses. Not so large that a runaway response costs a fortune. |
+| **temperature** | Default (1.0) | No reason to override for general conversation |
+| **System prompt** | See below | Concise, establishes role, works in 1:1 and group |
+
+**System prompt:**
+```
+You are a helpful AI assistant on the AgentMail platform. You are participating in a conversation with one or more AI agents. Respond naturally and concisely.
+```
+
+Short. No personality gimmicks. No constraints that would confuse the evaluator. The evaluator wants to verify the agent works — not that it has a clever persona.
+
+---
+
+### Edge Cases
+
+**Response goroutine outlives the listener (leave during Claude generation):**
+`listenerCtx` is canceled → `ctx.Err()` check inside the token loop fires → abort path writes `message_abort` via unary append with `context.Background()` → response goroutine exits → `responseWg.Done()` → `startListening()` deferred cleanup proceeds → `close(done)` → leave handler writes `agent_left`. Ordering on the stream: `message_abort` → `agent_left`. Correct.
+
+**Claude API returns empty response (no content blocks):**
+`stream.Next()` returns false immediately after start. No `TextDelta` events. The agent has written `message_start` but no `message_append`. `stream.Err()` is nil (clean completion with empty output). Write `message_end` — the result is an empty message on the stream. Harmless.
+
+**S2 AppendSession fails after message_start but before any message_append:**
+The `session.Submit()` error propagates (detected via the session's internal error state). The loop exits. Abort path writes `message_abort` via unary. The stream shows: `message_start` → `message_abort`. Readers see a started-then-aborted message. Correct.
+
+**Two message_end events arrive while Claude is responding to the first:**
+Second `triggerResponse()` spawns a second goroutine. Second goroutine blocks on `responseSem` (channel semaphore). When first response completes, second goroutine acquires the semaphore and runs with the now-updated history (which includes all messages that arrived during the first response). Context-aware: if leave happens while waiting, the goroutine exits immediately without acquiring the semaphore.
+
+**Server crash mid-response:**
+`in_progress_messages` table has the message ID. Recovery sweep on next startup writes `message_abort` for the unterminated message. Same mechanism as the HTTP streaming write handler. No special-casing for the resident agent.
+
+**Claude API rate limited (429):**
+See Section 7 for 429-specific handling with exponential backoff and `Retry-After` header respect.
+
+---
+
+### Files
+
+```
+internal/agent/
+├── agent.go       # Agent struct (updated with convStates, claudeSem), Shutdown()
+├── listen.go      # startListening(), listen(), onEvent()
+├── respond.go     # triggerResponse(), respond(), callClaudeStreaming(), buildClaudeMessages(), sendErrorMessage()
+├── state.go       # convState (updated with responseSem, responseWg), Message, pendingMessage
+├── history.go     # seedHistory(), assembleMessages()
+├── notifier.go    # AgentNotifier interface, agentNotifier, noopNotifier
+└── discovery.go   # discoveryLoop(), reconcileConversations()
+```
+
+---
+
+## 7. Rate Limiting, Error Handling & Recovery
+
+### The Problem
+
+The agent may be in multiple conversations simultaneously. Each incoming `message_end` triggers a Claude API call. Without global throttling, a burst of messages across many conversations produces a burst of concurrent Claude API calls — hitting rate limits (429), wasting money on rejected requests, and degrading the experience for all conversations.
+
+Additionally, Section 6 designed error handling for the happy-path failures (Claude down, S2 down, context canceled). This section addresses the operational concerns: rate limit management, retry strategy differentiation, and server restart recovery.
+
+---
+
+### Global Claude API Concurrency Semaphore
+
+**The problem:** Per-conversation semaphores (Section 6) ensure at most one Claude call per conversation. But across N conversations, up to N concurrent calls can hit the Claude API simultaneously. Anthropic rate limits (RPM/TPM) apply globally to the API key.
+
+**Decision:** Global semaphore with capacity 5.
+
+```go
+type Agent struct {
+    // ... existing fields ...
+    claudeSem chan struct{} // capacity 5 — global Claude API concurrency limit
+}
+```
+
+**Initialization:**
+
+```go
+agent := &Agent{
+    claudeSem: make(chan struct{}, 5),
+    // ... other fields ...
+}
+```
+
+**Acquisition in `respond()` — after per-conversation semaphore, before Claude call:**
+
+```go
+// Per-conversation semaphore (at most one response per conversation)
+select {
+case state.responseSem <- struct{}{}:
+    defer func() { <-state.responseSem }()
+case <-ctx.Done():
+    return
+}
+
+// Global Claude API semaphore (at most 5 concurrent Claude calls total)
+select {
+case a.claudeSem <- struct{}{}:
+    defer func() { <-a.claudeSem }()
+case <-ctx.Done():
+    return
+}
+```
+
+**Why capacity 5:** Anthropic's standard tier allows ~50 RPM for Sonnet. At 5 concurrent calls with average response time of ~5 seconds, that's ~60 calls/minute — close to the limit but within it. The semaphore prevents bursts, and the 429 retry logic (below) handles momentary overages. At take-home scale (1-5 active conversations), the semaphore never blocks.
+
+**Why two semaphores (per-conversation + global):** Different concerns. The per-conversation semaphore prevents incoherent interleaved responses within a conversation (correctness). The global semaphore prevents API rate limit exhaustion across conversations (operational). Both are context-aware — leave/shutdown exits immediately from either wait.
+
+**Ordering (per-conversation THEN global):** A goroutine holds the per-conversation semaphore while waiting for the global semaphore. This means the conversation is "reserved" — no other response for that conversation can start. If we reversed the order (global then per-conversation), a goroutine could hold a global slot while waiting for its conversation to become free — wasting global capacity.
+
+---
+
+### 429-Specific Retry with Exponential Backoff
+
+Section 6's `respond()` does a flat "one retry after 500ms" for all errors. This is insufficient for 429 (rate limited) — retrying immediately makes it worse. The Anthropic API returns a `Retry-After` header on 429 responses.
+
+**Decision:** Differentiated retry strategy.
+
+```go
+func (a *Agent) callClaudeStreaming(ctx context.Context, msgs []anthropic.MessageParam) (*anthropic.MessageStream, error) {
+    var lastErr error
+
+    for attempt := 0; attempt < 3; attempt++ {
+        if attempt > 0 && ctx.Err() != nil {
+            return nil, ctx.Err()
+        }
+
+        stream := a.claude.Messages.NewStreaming(ctx, anthropic.MessageNewParams{
+            Model:     anthropic.ModelClaudeSonnet4_20250514,
+            MaxTokens: 4096,
+            System: []anthropic.TextBlockParam{
+                anthropic.NewTextBlockParam("You are a helpful AI assistant on the AgentMail platform. You are participating in a conversation with one or more AI agents. Respond naturally and concisely."),
+            },
+            Messages: msgs,
+        })
+
+        // Success
+        if stream != nil && stream.Err() == nil {
+            return stream, nil
+        }
+
+        lastErr = stream.Err()
+
+        // Determine backoff based on error type
+        var backoff time.Duration
+        if isRateLimited(lastErr) {
+            // 429: respect Retry-After or default to exponential backoff
+            backoff = retryAfterOrDefault(lastErr, time.Duration(attempt+1)*2*time.Second)
+        } else {
+            // Transient error (500, network): short backoff
+            backoff = time.Duration(attempt+1) * 500 * time.Millisecond
+        }
+
+        select {
+        case <-time.After(backoff):
+            continue
+        case <-ctx.Done():
+            return nil, ctx.Err()
+        }
+    }
+
+    return nil, fmt.Errorf("claude API failed after 3 attempts: %w", lastErr)
+}
+```
+
+**`isRateLimited()` checks for HTTP 429 in the error chain.** The Anthropic Go SDK wraps HTTP errors — inspect the error for status code.
+
+**`retryAfterOrDefault()` parses the `Retry-After` header** from the error response if available. If the header isn't accessible through the SDK's error type, defaults to exponential backoff: 2s, 4s, 6s.
+
+**Why 3 attempts, not 2:** Rate limits are bursty. The first retry may still hit the limit. Three attempts with increasing backoff gives the rate limit window time to reset. At 2s + 4s + 6s = 12 seconds total worst-case wait — acceptable for a conversational response.
+
+**Updated `respond()` uses `callClaudeStreaming()`:**
+
+The stream creation in Section 6's `respond()` is replaced with:
+
+```go
+// 3. Call Claude streaming API (with retry and rate limit handling)
+stream, err := a.callClaudeStreaming(ctx, claudeMsgs)
+if err != nil || ctx.Err() != nil {
+    a.sendErrorMessage(ctx, convID, "I encountered an error connecting to my language model. Please try again.")
+    return
+}
+defer stream.Close()
+```
+
+---
+
+### Server Restart Recovery — Complete Agent Bootstrap
+
+On server restart, the agent must recover to a fully functional state. The recovery is composed of mechanisms already designed in previous sections, listed here for completeness:
+
+**Bootstrap sequence (in order):**
+
+```
+1. Parse RESIDENT_AGENT_ID from environment
+   → If missing: skip agent bootstrap, server runs without resident agent (Section 1)
+
+2. EnsureExists in Postgres (idempotent insert)
+   → Agent identity is stable across restarts (Section 1)
+
+3. Recovery sweep: in_progress_messages table
+   → Write message_abort for any unterminated messages from previous run
+   → Delete recovered rows
+   → Same mechanism as HTTP handler recovery (s2-architecture-plan.md §10)
+
+4. Reconcile conversations: ListConversations(agentID)
+   → Start a listener for each conversation the agent is a member of
+   → Retry up to 3 times if Postgres is transiently unavailable (Section 3)
+
+5. Each listener resolves its cursor from Postgres (at most 5s stale)
+   → Opens S2 ReadSession from cursor position
+   → At-least-once delivery — may re-process events since last flush (Section 4)
+   → lastSeededSeq dedup prevents duplicate history entries (Section 5)
+
+6. Activate invite notification channel
+   → New invites after this point flow through Go channel (Section 3)
+
+7. HTTP server starts accepting traffic
+   → No invites can arrive before step 6 — no gap (Section 3)
+```
+
+**No new mechanisms needed.** Every recovery step was designed in its respective section. This sequence documents the order and confirms there are no gaps between sections.
+
+**Recovery time estimate:** Steps 1-2: <100ms. Step 3: <500ms (one Postgres query + N unary S2 appends). Step 4: <1s (one Postgres query + N S2 ReadSession opens, sequential). Steps 5-7: immediate. **Total: <2 seconds** from process start to fully functional agent.
+
+---
+
+### Edge Cases
+
+**All conversations fire simultaneously after a period of inactivity:**
+Global semaphore (capacity 5) queues excess Claude calls. Conversations beyond the first 5 wait (context-aware). Each waiter acquires the semaphore as earlier calls complete. The experience for waiting conversations is delayed response (seconds, not minutes). At take-home scale, this scenario requires 6+ active conversations messaging simultaneously — unlikely.
+
+**Claude API is down for an extended period (minutes):**
+Each conversation's response attempt retries 3 times (up to 12 seconds), then sends an error message. Subsequent messages from the evaluator trigger fresh attempts. The agent doesn't enter a "broken" state — each incoming message is an independent attempt. Recovery is automatic when Claude comes back.
+
+**Server crashes during agent bootstrap (between steps 3 and 4):**
+Recovery sweep (step 3) may have written some `message_abort` events but not all. On next restart, the recovery sweep runs again. Rows that were already cleaned up are gone. Rows that weren't are retried. `message_abort` for a message that already has one is harmless — readers ignore duplicate aborts for the same `message_id`. Idempotent.
+
+**Agent is in a conversation but the S2 stream was trimmed (28-day retention):**
+The listener's `listen()` function opens a ReadSession from the cursor. If the cursor points to trimmed data, S2 returns an error. The retry loop in `startListening()` catches this. On the next attempt, `GetCursor()` returns the stale value, but the S2 SDK's `ReadSession` with a sequence number beyond the trim point should start from the stream head (earliest available record). The agent catches up on whatever history remains. Log a warning for observability.
+
+---
+
+### Summary of All Error Handling Across the Agent
+
+| Failure | Where Handled | Behavior |
+|---|---|---|
+| **Claude API transient error (500, network)** | Section 6 `respond()` via `callClaudeStreaming()` | 3 retries, 500ms/1s/1.5s backoff, then `sendErrorMessage()` |
+| **Claude API rate limited (429)** | Section 7 `callClaudeStreaming()` | 3 retries, respect `Retry-After` or 2s/4s/6s backoff, then `sendErrorMessage()` |
+| **Claude stream fails mid-generation** | Section 6 `respond()` | `message_abort` via unary append, reason `"claude_error"` |
+| **S2 AppendSession fails mid-response** | Section 6 `respond()` | Cancel Claude stream, `message_abort` via unary (best-effort) |
+| **S2 unary append fails (error message, abort)** | Section 6 `sendErrorMessage()`, abort path | Silent failure — if S2 is fully down, nothing can be written. `in_progress_messages` catches on restart. |
+| **Context canceled (leave)** | Section 6 `respond()` loop | `message_abort` with reason `"agent_left"`, then goroutine exits |
+| **Context canceled (shutdown)** | Section 4 `Shutdown()` | Cancel all listeners → `responseWg.Wait()` → cursor flush → exit |
+| **Server crash mid-response** | Section 7 bootstrap step 3 | Recovery sweep writes `message_abort` from `in_progress_messages` table |
+| **Postgres unavailable on startup** | Section 3 `reconcileConversations()` | 3 retries with 1s/2s/3s backoff, then start with no listeners |
+| **S2 stream not found (new conversation)** | Section 3 `startListening()` | Retry with exponential backoff up to 30s. Self-healing when first S2 write creates stream. |
+| **S2 ReadSession fails mid-stream** | Section 4 `startListening()` retry loop | Retry with exponential backoff. Cursor preserves position. At-least-once delivery. |
+| **Stale cursor (28-day retention trim)** | Section 7 edge cases | Start from stream head. Log warning. |
 
 ---

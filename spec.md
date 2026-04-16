@@ -1032,53 +1032,65 @@ The `WHERE cursors.seq_num < EXCLUDED.seq_num` clause prevents stale flushes fro
 
 **The spec requires:** "at least one Claude-powered agent running on it that we can converse with."
 
-**Implementation:** A standalone goroutine (or separate process) that:
-1.  Registers itself as an agent on startup.
-2.  Creates a "lobby" conversation (or joins existing ones when invited).
-3.  Listens to all its conversations via SSE.
-4.  When a complete message arrives (`message_end` event), sends the accumulated conversation history to Claude API.
-5.  Streams Claude's response tokens back to the conversation via the streaming write API.
-6.  Maintains conversation context (message history) in memory.
+> **Full design:** [`claude-agent-plan.md`](claude-agent-plan.md) — exhaustive design document covering identity, discoverability, conversation lifecycle, message handling, Claude API integration, rate limiting, error handling, and recovery. What follows is the executive summary.
 
-**Architecture:**
+**Architecture:** Internal goroutine within the Go server process, calling store/S2 layers directly — not via HTTP self-calls. The resident agent is a first-class client of the same interfaces the API handlers use, demonstrating the system working end-to-end.
+
 ```text
-┌──────────────────────────────────────────────┐
-│ Claude Agent Process                         │
-│                                              │
-│  ┌──────────┐    SSE      ┌──────────────┐   │
-│  │ Listener │ ←────────── │  Our Server  │   │
-│  └────┬─────┘             └──────┬───────┘   │
-│       │ message received         ↑           │
-│       ▼                          │           │
-│  ┌──────────┐            NDJSON POST stream  │
-│  │ Claude   │  tokens    ┌───────┴────────┐  │
-│  │ API      │ ─────────→ │ Responder:     │  │
-│  │ (stream) │            │ pipes tokens   │  │
-│  └──────────┘            │ to single POST │  │
-│                          └────────────────┘  │
-└──────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│ Go Server Process                                       │
+│                                                         │
+│  ┌─────────────┐  invite channel  ┌──────────────────┐  │
+│  │ API Handlers │ ──────────────→ │ Resident Agent   │  │
+│  │ (HTTP)       │                 │                  │  │
+│  └──────┬───────┘                 │  ┌────────────┐  │  │
+│         │                         │  │ Listener   │  │  │
+│         │ same store interfaces   │  │ goroutine  │  │  │
+│         ▼                         │  │ (per conv) │  │  │
+│  ┌──────────────┐                 │  └─────┬──────┘  │  │
+│  │ Store Layer  │ ←───────────────│────────┘         │  │
+│  │ (Postgres)   │                 │                  │  │
+│  └──────────────┘                 │  ┌────────────┐  │  │
+│  ┌──────────────┐   direct R/W   │  │ Response   │  │  │
+│  │ S2 Client    │ ←──────────────│──│ goroutine  │  │  │
+│  │ (streams)    │                 │  └─────┬──────┘  │  │
+│  └──────────────┘                 │        │         │  │
+│                                   │        ▼         │  │
+│                                   │  ┌────────────┐  │  │
+│                                   │  │ Claude API │  │  │
+│                                   │  │ (stream)   │  │  │
+│                                   │  └────────────┘  │  │
+│                                   └──────────────────┘  │
+└─────────────────────────────────────────────────────────┘
 ```
 
-**Claude API integration:**
-* Use `github.com/anthropics/anthropic-sdk-go` for the Anthropic SDK.
-* Streaming mode: receive tokens from Claude API, pipe each token as an NDJSON line into a single streaming POST to `/conversations/:cid/messages/stream`. The Claude API stream and the AgentMail write stream are connected by an `io.Pipe` — tokens flow from Claude through to S2 with no buffering.
-* System prompt: "You are a helpful AI assistant participating in a group conversation. Be concise and direct."
-* Model: `claude-sonnet-4-20250514` (good balance of speed and quality for real-time chat).
+**Core decisions:**
 
-**Multi-conversation handling:**
-* One goroutine per active conversation SSE connection.
-* Shared Claude API client with rate limiting.
-* Message history stored per conversation in memory (`map[conversation_id] → []Message`).
-* Truncate history if it exceeds context window (keep system prompt + last N messages).
+| Decision | Choice | Rationale |
+|---|---|---|
+| Identity | Stable UUID via `RESIDENT_AGENT_ID` env var, idempotent `EnsureExists` on startup | Survives restarts without orphaning conversations |
+| Discoverability | `GET /agents/resident` — unauthenticated, returns array | AI-agent-friendly, no chicken-and-egg auth problem |
+| Conversation discovery | Go channel for real-time invites + one-time startup reconciliation | Event-driven, no polling; catches conversations from prior server lifetimes |
+| Reads | Direct S2 `ReadSession` per conversation (one listener goroutine each) | Same durable stream the API handlers read from; no HTTP overhead |
+| Writes | Direct S2 `AppendSession` for streaming responses | Token-by-token flow from Claude to S2 with no intermediate HTTP layer |
+| Response triggering | Always respond to every `message_end` from another agent | Resident agent is human-out-of-loop; `[NO_RESPONSE]` protocol rejected as unnecessary complexity |
+| History | Lazy seeding from S2 on first external message; bounded sliding window (last 50 messages) | No wasted I/O for conversations that never receive messages |
+| Claude integration | `anthropic-sdk-go` streaming → S2 `AppendSession` | `message_start` → N × `message_append` (token chunks) → `message_end` (or `message_abort` on failure) |
+| Concurrency | Per-conversation channel semaphore (capacity 1) + global Claude semaphore (capacity 5) | Sequential responses per conversation; bounded global API load |
+| Error handling | 429 → exponential backoff with `Retry-After`; transient errors → 1 retry; persistent failures → `sendErrorMessage()` visible in conversation | Graceful degradation, never silent failure |
+| Crash recovery | Sweep `in_progress_messages` on startup → write `message_abort` for orphaned messages | Clean state after unclean shutdown |
 
-**Edge cases:**
-* Claude API rate limit: queue responses, retry with backoff.
-* Claude API error: send an error message to the conversation ("Sorry, I encountered an error. Please try again.").
-* Very long conversations: sliding window over message history.
-* Multiple messages arrive before Claude finishes responding: queue them, respond sequentially.
-* Agent is invited to a new conversation: start listening via new SSE connection.
+**Key implementation files** (see `claude-agent-plan.md` § Files for full breakdown):
 
-**Files:** `internal/agent/claude.go`, `internal/agent/listener.go`
+| File | Responsibility |
+|---|---|
+| `internal/agent/agent.go` | `Agent` struct, `Start()`/`Shutdown()`, conversation state map, semaphores |
+| `internal/agent/listener.go` | Per-conversation listener goroutine, event dispatch, `onEvent()` |
+| `internal/agent/respond.go` | `triggerResponse()`, `respond()`, `callClaudeStreaming()`, `sendErrorMessage()` |
+| `internal/agent/history.go` | `seedHistory()`, `buildClaudeMessages()`, sliding window management |
+| `internal/agent/discovery.go` | Invite channel consumer, startup reconciliation loop |
+
+**Relationship to external agents:** The resident agent uses direct store/S2 access because it lives in-process. External agents (the primary users of the service) use the HTTP API: NDJSON streaming POST for writes, SSE for reads. These are distinct, appropriate mechanisms — no conflict. The `claude-agent-plan.md` documents patterns for external human-in-the-loop agents in its `CLIENT.md` / `FUTURE.md` recommendations.
 
 ---
 
