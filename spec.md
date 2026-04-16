@@ -41,11 +41,11 @@ Here is the fully formatted Markdown for the specification document. The content
 * **SQLite:** All metadata. Agent registry, conversation membership, read cursors. Embedded, zero-config, transactional.
 
 **Transport:**
-* **HTTP POST** for all writes (register, create, invite, leave, send messages, stream chunks)
+* **HTTP POST** for all writes — two tiers: complete messages (single request-response) and streaming messages (NDJSON streaming body over a single persistent HTTP connection)
 * **SSE** for streaming reads (tail a conversation in real-time, replay from cursor)
-* **WebSocket** as optional upgrade for bidirectional real-time sessions
+* **History GET** for catch-up reads (reconstructed complete messages, polling-friendly)
 
-**Language:** Go. First-class S2 SDK (v1 HTTP API). Goroutines handle thousands of concurrent SSE/WebSocket connections. Single binary deployment. The problem domain (concurrent streaming, connection management, protocol translation) is Go's sweet spot.
+**Language:** Go. First-class S2 SDK (v1 HTTP API). Goroutines handle thousands of concurrent SSE connections and streaming write requests. Single binary deployment. The problem domain (concurrent streaming, connection management, protocol translation) is Go's sweet spot.
 
 ---
 
@@ -101,9 +101,9 @@ Here is the fully formatted Markdown for the specification document. The content
 * **Leave:**
     * Reject if the agent is the last member (return 400 or 409).
     * Write an `agent_left` system event to the S2 stream.
-    * **Critical:** terminate active SSE/WebSocket connections for this agent on this conversation.
+    * **Critical:** terminate active SSE connections and in-progress streaming writes for this agent on this conversation.
         * Requires a connection registry: `map[(agent_id, conversation_id)] → cancel_func`
-        * On leave, look up and call cancel, which closes the SSE response.
+        * On leave, look up and call cancel, which closes the SSE response and/or cancels the streaming write request context.
     * **Critical:** abort any in-progress streaming message from this agent.
         * Check if there's an open `message_start` without a corresponding `message_end`.
         * If so, write a `message_abort` event before the `agent_left` event.
@@ -177,32 +177,113 @@ Response: 201 Created
 ```
 *(Server writes three records to S2 in one batch: message_start, message_append (full content), message_end. Atomic.)*
 
-**API for streaming message send:**
+**API for streaming message send (NDJSON streaming POST):**
+
+The agent opens a **single HTTP POST request** with a streaming NDJSON body. The server reads the body line-by-line as chunks arrive, appending each to S2 in real-time. The entire message lifecycle — start, all chunks, end — happens within one persistent HTTP connection. No per-token round-trips.
+
 ```http
-# Step 1: Start message
 POST /conversations/:cid/messages/stream
 Header: X-Agent-ID: <agent_id>
-Body: {}
+Header: Content-Type: application/x-ndjson
 
-Response: 201 Created
-{ "message_id": "uuid" }
+# Request body (streamed line by line as tokens are generated):
+{"content":"Hello, "}
+{"content":"how are "}
+{"content":"you?"}
 
-# Step 2: Append chunks (repeat)
-POST /conversations/:cid/messages/:mid/append
-Header: X-Agent-ID: <agent_id>
-Body: { "content": "Hello, " }
-
-Response: 200 OK
-{ "seq": 43 }
-
-# Step 3: End message
-POST /conversations/:cid/messages/:mid/end
-Header: X-Agent-ID: <agent_id>
-Body: {}
-
-Response: 200 OK
-{ "seq": 45 }
+# Response (sent after body completes):
+200 OK
+{ "message_id": "uuid", "seq_start": 42, "seq_end": 45 }
 ```
+
+**Server-side mechanics (Go):**
+```go
+func (h *Handler) StreamMessage(w http.ResponseWriter, r *http.Request) {
+    msgID := uuid.New().String()
+    h.s2.AppendRecord(convID, messageStartEvent(msgID, agentID))
+
+    scanner := bufio.NewScanner(r.Body)
+    for scanner.Scan() {
+        var chunk struct{ Content string `json:"content"` }
+        json.Unmarshal(scanner.Bytes(), &chunk)
+        h.s2.AppendRecord(convID, messageAppendEvent(msgID, chunk.Content))
+    }
+
+    if err := scanner.Err(); err != nil || r.Context().Err() != nil {
+        h.s2.AppendRecord(convID, messageAbortEvent(msgID, "disconnect"))
+        return // connection dropped — no response possible
+    }
+
+    h.s2.AppendRecord(convID, messageEndEvent(msgID))
+    json.NewEncoder(w).Encode(result)
+}
+```
+
+`bufio.NewScanner(r.Body)` blocks at `scanner.Scan()` until a complete NDJSON line arrives from the client, then returns it. When the client closes the request body, `Scan()` returns `false` (EOF). If the connection drops mid-stream, `r.Context().Done()` fires and/or `r.Body.Read()` returns an error. This works identically on HTTP/1.1 chunked encoding and HTTP/2 DATA frames.
+
+**Client-side scaffolding — the two-line pattern:**
+
+The streaming write is designed for the "scaffolding wraps the agent" model. The agent doesn't know about AgentMail. Scaffolding captures its output and pipes it through a single POST.
+
+*Python (12 lines, sync, stdlib-compatible):*
+```python
+import requests, json
+
+def stream_message(base_url, agent_id, conv_id, token_iterator):
+    def chunks():
+        for token in token_iterator:
+            yield json.dumps({"content": token}) + "\n"
+
+    resp = requests.post(
+        f"{base_url}/conversations/{conv_id}/messages/stream",
+        headers={"X-Agent-ID": agent_id, "Content-Type": "application/x-ndjson"},
+        data=chunks()
+    )
+    return resp.json()
+```
+
+*Shell (pipe agent output directly):*
+```bash
+agent_command | while IFS= read -r token; do
+  printf '{"content":"%s"}\n' "$token"
+done | curl -s -X POST \
+  -H "X-Agent-ID: $AGENT_ID" \
+  -H "Content-Type: application/x-ndjson" \
+  --data-binary @- \
+  "$BASE_URL/conversations/$CONV_ID/messages/stream"
+```
+
+**Why NDJSON streaming POST (not per-token HTTP POST, not WebSocket):**
+
+The previous design used a separate HTTP POST request for each token (`POST /append` per chunk). At 30–100 tokens/sec from an LLM, that's 30–100 full HTTP request-response cycles per second — each with headers, TCP overhead, and a round-trip. This pattern is not scalable, not robust, and not how agents work. The AgentMail founder explicitly rejected this approach: *"Certainly don't use tool calls [per-token API calls]. Set up scaffolding around the agent to stream its output."*
+
+The NDJSON streaming POST solves this with a single persistent connection:
+
+| Dimension | Per-token HTTP POST (rejected) | NDJSON Streaming POST (chosen) |
+| :--- | :--- | :--- |
+| **Connections per message** | N+2 requests (start + N chunks + end) | 1 single connection |
+| **Per-token overhead** | Full HTTP headers + round-trip (~5–50ms) | Zero — tokens flow as newline-delimited bytes on an open body |
+| **Failure mode** | Any single POST can fail, orphaning the message | Connection drops → server reads EOF → emits `message_abort` |
+| **Scaffolding complexity** | Agent must make API calls from inside generation loop | Scaffolding pipes stdout to a single curl command |
+| **Server complexity** | Track in-progress messages across requests, timeout goroutine | Sequential `for scanner.Scan()` loop, standard HTTP handler |
+
+WebSocket was also considered and rejected. See Challenge 3 (Phase 2) for the full comparative analysis.
+
+**Why the request body uses bare content objects (not typed envelopes):**
+
+The NDJSON lines are `{"content":"token"}`, not `{"type":"append","content":"token"}`. The message lifecycle is implicit in the HTTP request lifecycle:
+* **Message start** = server receives the POST request and generates the `message_id`
+* **Content chunks** = each NDJSON line in the body
+* **Message end** = client closes the request body (EOF)
+* **Message abort** = connection drops before body completes
+
+This keeps the client protocol dead simple — the agent's scaffolding only needs to emit `{"content":"..."}` lines. The server handles all lifecycle events internally.
+
+**Acknowledged tradeoffs:**
+
+* **No mid-stream server feedback.** If the agent is removed from the conversation while streaming, they won't know until the response (or via their SSE read connection). Mitigation: extremely rare edge case.
+* **Proxy buffering risk.** Some reverse proxies (nginx default config, Kubernetes ingress) buffer chunked POST request bodies. Mitigation: we control our deployment infrastructure (Fly.io supports streaming) and document the `proxy_request_buffering off` directive for self-hosted deployments. AI agents typically don't run behind buffering corporate proxies.
+* **Read-once body means no automatic retries.** If the connection drops at 90% completion, the client can't retry with the same stream. Mitigation: for LLM output, you regenerate anyway. The `message_id` serves as an idempotency key for the start event.
 
 **Hidden complexities:**
 
@@ -212,18 +293,16 @@ Response: 200 OK
 * **Concurrent writers:**
     * Two agents streaming simultaneously to the same conversation: their records interleave on the S2 stream. This is correct behavior. S2 assigns sequence numbers, guaranteeing total ordering. The interleaving is the ordering — it represents the temporal reality of concurrent composition.
     * Readers demultiplex by `message_id`. Each reader maintains a map of `message_id → accumulated_content` and assembles complete messages from interleaved chunks.
-* **Orphaned messages (crash during composition):**
-    * Server tracks in-progress messages: `map[message_id] → {agent_id, conversation_id, last_activity_time}`
-    * Background goroutine checks for stale in-progress messages (no append/end for >30 seconds).
-    * On detection: write `message_abort` event to the stream, clean up tracking state.
-    * On agent disconnect: immediately check for in-progress messages from that agent and abort them.
-    * On conversation leave: same — abort in-progress messages first.
+* **Orphaned messages (crash during streaming):**
+    * With NDJSON streaming POST, the connection lifecycle IS the message lifecycle. If the agent crashes or disconnects, the server detects it immediately via `r.Context().Done()` or EOF on `r.Body.Read()`.
+    * On detection: write `message_abort` event to the S2 stream. The HTTP handler returns (no response sent, since the connection is dead). Clean, deterministic — no background goroutine needed for timeout-based orphan detection.
+    * On conversation leave: cancel the request context for any in-progress streaming write from this agent, triggering the abort path above.
+    * **Edge case — server crash mid-stream:** The S2 stream has `message_start` + some `message_append` records but no `message_end` or `message_abort`. On server restart, a recovery sweep checks for unterminated messages (a `message_start` with no corresponding `message_end`/`message_abort`) and writes `message_abort` events for them.
 * **Validation on write:**
-    * Agent must be a member of the conversation (check SQLite).
-    * For append/end: the `message_id` must exist and belong to this agent (check in-memory tracker).
-    * For append/end: the message must not already be ended or aborted.
-    * Content must not be empty for append (or allow empty? Spec doesn't say — allow it, LLMs sometimes emit empty tokens).
+    * Agent must be a member of the conversation (checked once when the streaming POST request arrives, before reading the body).
     * Content must be plaintext (spec says "purely plaintext communication").
+    * Empty content lines are allowed (LLMs sometimes emit empty tokens).
+    * For complete message POST: content must not be empty (no point sending an empty message).
 
 **Files:** `internal/api/messages.go`, `internal/store/s2.go`, `internal/model/events.go`
 
@@ -299,23 +378,6 @@ data: {"agent_id":"a2","timestamp":"2026-04-14T10:01:00Z"}
 * On reconnect: resume from stored cursor.
 * Result: at-least-once delivery. Agent may re-receive a few events after crash. Events have sequence numbers and message IDs for client-side deduplication.
 
-**WebSocket (optional bidirectional transport):**
-```json
-GET /conversations/:cid/ws → WebSocket upgrade
-Header: X-Agent-ID: <agent_id>
-Query: ?from=<seq_num>
-
-# Server → Client: same events as SSE, as JSON messages
-{"seq":42,"event":"message_start","data":{"message_id":"m1","sender_id":"a1"}}
-
-# Client → Server: write commands
-{"action":"send","content":"Hello!"}
-{"action":"stream_start"}
-{"action":"stream_append","message_id":"m1","content":"tok"}
-{"action":"stream_end","message_id":"m1"}
-```
-*(WebSocket combines read and write on one connection. Useful for agents that want full-duplex real-time interaction without managing separate HTTP requests.)*
-
 **History endpoint (non-streaming):**
 ```http
 GET /conversations/:cid/messages
@@ -340,7 +402,7 @@ Response: 200 OK
 * `from` seq_num is before the stream's trim point (if trimming is implemented): return error or start from earliest available.
 * Slow reader: S2 handles backpressure. If the client can't keep up, the HTTP response buffer fills, Go's `http.Flusher` blocks, and the S2 read session slows down. No unbounded memory growth.
 
-**Files:** `internal/api/sse.go`, `internal/api/websocket.go`, `internal/api/history.go`
+**Files:** `internal/api/sse.go`, `internal/api/history.go`
 
 ---
 
@@ -384,7 +446,7 @@ Response: 200 OK
 **Concurrency control:**
 * No fencing tokens needed. Multiple agents write concurrently — this is desired behavior.
 * No optimistic sequence numbers needed. We don't care about write ordering between agents; S2's sequencing IS the ordering.
-* S2 atomic batch append for complete messages (3 records in one call). Individual chunks are single-record appends.
+* S2 atomic batch append for complete messages (3 records in one call). Streaming chunks are individual record appends, driven by the server reading NDJSON lines from the request body — one S2 append per line.
 
 ---
 
@@ -472,24 +534,26 @@ CREATE TABLE cursors (
 
 **Architecture:**
 ```text
-┌──────────────────────────────────────────┐
-│ Claude Agent Process                     │
-│                                          │
-│  ┌──────────┐    SSE     ┌────────────┐  │
-│  │ Listener │ ←───────── │ Our Server │  │
-│  └────┬─────┘            └──────┬─────┘  │
-│       │ message received        ↑        │
-│       ▼                         │        │
-│  ┌──────────┐             POST /append   │
-│  │ Claude   │  stream     ┌─────┴─────┐  │
-│  │ API      │ ──────────→ │ Responder │  │
-│  └──────────┘  tokens     └───────────┘  │
-└──────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│ Claude Agent Process                         │
+│                                              │
+│  ┌──────────┐    SSE      ┌──────────────┐   │
+│  │ Listener │ ←────────── │  Our Server  │   │
+│  └────┬─────┘             └──────┬───────┘   │
+│       │ message received         ↑           │
+│       ▼                          │           │
+│  ┌──────────┐            NDJSON POST stream  │
+│  │ Claude   │  tokens    ┌───────┴────────┐  │
+│  │ API      │ ─────────→ │ Responder:     │  │
+│  │ (stream) │            │ pipes tokens   │  │
+│  └──────────┘            │ to single POST │  │
+│                          └────────────────┘  │
+└──────────────────────────────────────────────┘
 ```
 
 **Claude API integration:**
 * Use `github.com/anthropics/anthropic-sdk-go` for the Anthropic SDK.
-* Streaming mode: receive tokens from Claude, forward each chunk via POST to `/messages/:mid/append`.
+* Streaming mode: receive tokens from Claude API, pipe each token as an NDJSON line into a single streaming POST to `/conversations/:cid/messages/stream`. The Claude API stream and the AgentMail write stream are connected by an `io.Pipe` — tokens flow from Claude through to S2 with no buffering.
 * System prompt: "You are a helpful AI assistant participating in a group conversation. Be concise and direct."
 * Model: `claude-sonnet-4-20250514` (good balance of speed and quality for real-time chat).
 
@@ -537,7 +601,7 @@ CREATE TABLE cursors (
 * **#: 6**
     * **Assumption:** AI coding agents are the primary clients
     * **Type:** Explicit
-    * **My Position:** This is the most important assumption. It means: prefer HTTP over WebSocket for writes. Prefer curl-friendly APIs. Prefer self-describing JSON. Avoid protocols that need client libraries.
+    * **My Position:** This is the most important assumption. It means: prefer HTTP-native transports. Prefer curl-friendly, pipeable APIs. Prefer self-describing JSON. Avoid protocols that require specialized client libraries or complex connection management (WebSocket, gRPC). The streaming write must be something an AI coding agent can build scaffolding for from documentation alone.
 * **#: 7**
     * **Assumption:** Real-time streaming matters
     * **Type:** Explicit
@@ -574,14 +638,49 @@ Per-agent streams (inbox model) would mean: when agent A sends a message to conv
     * Invitation: when agent D joins, you'd need to copy all historical messages to D's inbox. Or maintain a separate history stream anyway — which is just the per-conversation model.
 * **Verdict:** Per-conversation streams. Strictly superior for this use case.
 
-**Challenge 3: "HTTP POST for streaming writes" — is this the right transport?**
-Alternative: WebSocket for writes too. Agent opens a WebSocket, sends chunks as WebSocket messages.
-* **Tradeoffs:**
-    * WebSocket: lower per-chunk overhead (no HTTP headers per chunk), but requires WebSocket client library. Claude Code and curl both support WebSocket, but it's more complex.
-    * HTTP POST per chunk: higher overhead (full HTTP request per chunk), but trivially scriptable. Each chunk is an independent request. Failure of one chunk doesn't kill the whole message — the agent can retry just that chunk.
-    * Streaming HTTP POST (chunked transfer encoding): single HTTP request with streaming body. Efficient, but hard to implement correctly in most HTTP clients. If the connection drops mid-stream, you lose the whole request.
-* **Position:** Offer both HTTP POST (per-chunk) and WebSocket. HTTP POST is the default for simplicity. WebSocket is the upgrade path for performance. Most agents will use HTTP POST. The overhead of per-chunk HTTP requests is negligible for LLM token rates (~30-100 tokens/sec, so ~30-100 requests/sec, well within any server's capacity).
-* **What would change my mind:** If latency measurements show per-chunk HTTP adds >50ms overhead vs WebSocket, prioritize WebSocket. But for LLM token rates, this won't happen.
+**Challenge 3: "What transport for streaming writes?" — NDJSON streaming POST vs WebSocket vs per-token HTTP POST**
+
+Three candidates were evaluated for the streaming write path. One was chosen. The other two were rejected with clear rationale.
+
+**Candidate A: Per-token HTTP POST (REJECTED)**
+
+The original design: `POST /messages/stream` to start, `POST /messages/:mid/append` per chunk, `POST /messages/:mid/end` to close. A separate HTTP request-response cycle for every token.
+
+* At 30–100 tokens/sec, this is 30–100 full HTTP round-trips per second. Each carries headers, TCP overhead, and server-side request parsing.
+* The agent must make API calls from inside its generation loop — or the scaffolding must fire individual HTTP requests per token. Neither is practical.
+* The AgentMail founder explicitly rejected this pattern: *"Certainly don't use tool calls [per-token API calls]. Set up scaffolding around the agent to stream its output."*
+* Server-side: must track in-progress messages across requests in a `map[message_id]`, run a background goroutine for timeout-based orphan detection, and handle the race conditions of per-request validation.
+* **Verdict:** Rejected. Not scalable, not robust, not how agents work.
+
+**Candidate B: WebSocket (REJECTED)**
+
+WebSocket provides full-duplex communication on a persistent connection. Tokens flow as WebSocket messages, server can send acks/errors mid-stream.
+
+* **Stateful fragility.** WebSockets maintain a persistent TCP connection. Load balancers (AWS ALB, nginx) aggressively timeout idle connections. If an agent pauses token generation for 30 seconds, the load balancer may silently sever the connection. Mitigation requires custom ping/pong heartbeat logic in both server and client.
+* **Agent friction.** AI coding agents are the primary clients. Asking an LLM to write a Python script that makes an HTTP POST is trivial. Asking it to write an async Python script that manages a WebSocket connection, handles binary framing, manages heartbeat intervals, and reconnects on failure is asking for hallucination and brittle code. The `websockets` library requires `asyncio`; the sync alternatives are less maintained.
+* **Coupled failure domains.** If WebSocket carries both reads and writes on one connection, a network hiccup kills both simultaneously. With SSE (reads) + NDJSON POST (writes), each has an independent failure domain. One dropping doesn't affect the other.
+* **Server complexity.** WebSocket handlers require: upgrade negotiation, read goroutine + write goroutine + select loop, connection registry, heartbeat ticker, graceful shutdown, custom message framing protocol. Standard HTTP middleware (auth, logging, rate limiting) doesn't apply — you must reimplement it.
+* **Horizontal scaling burden.** WebSocket connections are stateful — load balancers need sticky sessions or connection-aware routing. NDJSON POST is stateless HTTP — any load balancer works out of the box.
+* **The bidirectionality advantage is hollow for this use case.** What would the server send mid-stream? "You're not a member anymore" (extremely rare, agent learns from response or SSE). "Per-chunk ack" (unnecessary — TCP guarantees delivery). "Backpressure" (HTTP handles natively via TCP flow control). None justify the complexity cost.
+* **Verdict:** Rejected. WebSocket solves a problem we don't have (bidirectional mid-stream communication) while introducing problems we don't want (statefulness, heartbeats, async client code, coupled failure domains, horizontal scaling friction).
+
+**Candidate C: NDJSON streaming POST (CHOSEN)**
+
+A single HTTP POST request with a streaming NDJSON body. The client writes content lines to the request body as tokens are generated. The server reads line-by-line using `bufio.NewScanner(r.Body)`, appending each to S2 in real-time. When the client closes the body, the server responds.
+
+* **HTTP-native.** `Transfer-Encoding: chunked` is built into HTTP/1.1. Every proxy, firewall, and load balancer on earth understands it. HTTP/2 streams it natively via DATA frames.
+* **Agent and developer ergonomics.** No specialized client library needed. Python: `requests.post(data=generator())`. Shell: `pipe | curl --data-binary @-`. An AI coding agent can build the scaffolding from documentation alone — 12 lines of sync Python.
+* **Separation of concerns.** SSE for reads, NDJSON POST for writes — decoupled network paths. If the write drops, the read continues. Retry is just a new POST.
+* **Server simplicity.** The handler is a sequential `for scanner.Scan()` loop. Standard HTTP middleware works unchanged. Disconnect detection is automatic via `r.Context().Done()`. No goroutines, no connection registry, no heartbeat logic.
+* **Stateless for horizontal scaling.** Each request is a standard HTTP request. No sticky sessions, no connection affinity. Resources are proportional to concurrent streaming messages (seconds to ~1 minute each), not total connected agents.
+* **Industry precedent.** Elasticsearch Bulk API, ClickHouse HTTP interface, OpenObserve — all use NDJSON over HTTP POST for streaming writes in production at scale.
+
+**Acknowledged tradeoffs:**
+* **Proxy buffering.** Some reverse proxies (nginx default, Kubernetes ingress-nginx) buffer chunked POST bodies. Mitigation: we control deployment infra (Fly.io supports streaming); document `proxy_request_buffering off` for self-hosted. AI agents typically don't run behind buffering corporate proxies. Note: WebSocket has a symmetric problem — many corporate firewalls block or interfere with WebSocket upgrade.
+* **No mid-stream server-to-client communication.** The response comes only after the body completes. Mitigation: the SSE read connection provides real-time feedback; mid-stream write errors are extremely rare edge cases.
+* **Read-once body breaks automatic retries.** If connection drops at 90%, the client can't resend the same stream. Mitigation: for LLM output, you regenerate. `message_id` serves as idempotency key for the start event.
+
+**What would change this decision:** If we needed true bidirectional mid-stream negotiation (e.g., server-side content moderation that halts generation, or collaborative editing where two agents interleave tokens on the same message), WebSocket would be necessary. For one-directional token streaming from agent to server, NDJSON POST is strictly superior on every dimension that matters for this system.
 
 **Challenge 4: "SSE for reads" — why not just polling?**
 Polling: `GET /conversations/:cid/messages?after=seq_num` every N seconds.
@@ -723,30 +822,26 @@ The result: a Go server with ~1500 lines of code that does exactly what the spec
     * Cursor lookup on connect, cursor update on delivery
     * Connection registry for leave termination
     * Auto-tail when caught up
-* **Step 7: Streaming write (1.5 hr)**
-    * `POST /stream` (start), `POST /append`, `POST /end`
-    * In-progress message tracking
-    * Orphan detection goroutine
-    * `message_abort` on timeout/disconnect
-* **Step 8: WebSocket transport (1.5 hr)**
-    * `GET /conversations/:cid/ws` → upgrade
-    * Bidirectional: read events + write commands on same connection
-    * Reuse SSE read logic and message write logic
-* **Step 9: Claude agent (2 hr)**
+* **Step 7: Streaming write — NDJSON POST (1.5 hr)**
+    * `POST /conversations/:cid/messages/stream` with streaming NDJSON body
+    * Server-side: `bufio.NewScanner(r.Body)` loop, per-line S2 append
+    * `message_abort` on disconnect (EOF / context cancellation)
+    * Recovery sweep on startup for unterminated messages
+* **Step 8: Claude agent (2 hr)**
     * Register agent on startup
     * SSE listener per conversation
     * Claude API streaming integration
     * Token forwarding via streaming write API
     * Multi-conversation support
-* **Step 10: Testing (2 hr)**
+* **Step 9: Testing (2 hr)**
     * Integration test suite covering all scenarios listed above
     * Concurrent writer test
     * Disconnect/reconnect test
-* **Step 11: Documentation (1.5 hr)**
+* **Step 10: Documentation (1.5 hr)**
     * `DESIGN.md`: every design decision with rationale
     * `FUTURE.md`: production-grade redesign
-    * `CLIENT.md`: self-contained agent onboarding doc
-* **Step 12: Deployment (1 hr)**
+    * `CLIENT.md`: self-contained agent onboarding doc (including scaffolding examples)
+* **Step 11: Deployment (1 hr)**
     * Dockerfile (multi-stage build)
     * `fly.toml` configuration
     * Deploy to Fly.io
@@ -762,9 +857,8 @@ agentmail-take-home/
 │   │   ├── router.go               # Chi router, middleware
 │   │   ├── agents.go               # POST /agents
 │   │   ├── conversations.go        # Conversation CRUD
-│   │   ├── messages.go             # Message send (complete + streaming)
+│   │   ├── messages.go             # Message send (complete POST + NDJSON streaming POST)
 │   │   ├── sse.go                  # SSE streaming read
-│   │   ├── websocket.go            # WebSocket bidirectional
 │   │   ├── history.go              # GET /messages (reconstructed)
 │   │   └── middleware.go           # Agent ID extraction/validation
 │   ├── store/
@@ -802,7 +896,6 @@ agentmail-take-home/
 * `github.com/s2-streamstore/s2-sdk-go` — S2 client
 * `github.com/anthropics/anthropic-sdk-go` — Claude API
 * `github.com/google/uuid` — UUID generation
-* `nhooyr.io/websocket` — WebSocket
 * `modernc.org/sqlite` — Pure-Go SQLite (no CGO)
 * `github.com/rs/zerolog` — Structured logging
 
@@ -815,8 +908,8 @@ agentmail-take-home/
 | **Go as language** | Slower to prototype than Python | Low — full rewrite. But Go is the right call for this domain. |
 | **S2 as stream storage** | S2 has an outage or API breaking change | Medium — swap S2 client for direct S3 + custom sequencing. The S2 wrapper (`internal/store/s2.go`) isolates the blast radius. |
 | **SQLite for metadata** | Concurrent write contention under load | High — swap to PostgreSQL. Same SQL, same schema, different driver. |
-| **SSE for reads** | Client doesn't support SSE | High — WebSocket and polling endpoints exist as alternatives. |
-| **HTTP POST per chunk for writes** | Too much overhead per token | High — WebSocket write path already built as alternative. |
+| **SSE for reads** | Client doesn't support SSE | High — history polling endpoint exists as alternative. |
+| **NDJSON streaming POST for writes** | Proxy buffers the body, losing real-time streaming | High — complete message POST works universally as fallback. Proxy config (`proxy_request_buffering off`) resolves for self-hosted. |
 | **One stream per conversation** | Hot conversation with many writers | Low — but S2 handles 100 MiBps per stream. LLM token rates won't come close. |
 | **Event-based record model** | Complexity in demultiplexing | Medium — could simplify to complete-message-only model, but lose streaming. The event model is the correct design. |
 
