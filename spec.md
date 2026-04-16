@@ -704,6 +704,20 @@ type connEntry struct {
 5. Write `agent_left` event to S2 stream
 6. Return 200
 
+**Timeout on wait:** Add a 5-second timeout on `<-entry.Done` to prevent a stuck goroutine from blocking the leave response indefinitely. If timeout fires, log a warning and proceed.
+
+**SSE handler registration flow:**
+```
+1. Create context with cancel: ctx, cancel := context.WithCancel(r.Context())
+2. Create done channel: done := make(chan struct{})
+3. Register: registry.Register(agentID, convID, cancel, done)
+4. defer:
+   a. close(done)                   -- signals that goroutine has exited
+   b. registry.Deregister(agentID, convID)
+   c. cursor.FlushOne(agentID, convID)  -- flush final cursor position
+5. Run SSE loop until ctx.Done()
+```
+
 **One SSE connection per (agent, conversation):** If agent opens a second connection, cancel the old one first. Prevents resource leaks.
 
 #### 1.6.10 Store Interface: Go Design
@@ -747,6 +761,21 @@ type CursorStore interface {
 }
 ```
 
+**Domain types:**
+```go
+type Conversation struct {
+    ID            uuid.UUID
+    S2StreamName  string
+    CreatedAt     time.Time
+}
+
+type ConversationWithMembers struct {
+    ID        uuid.UUID
+    Members   []uuid.UUID
+    CreatedAt time.Time
+}
+```
+
 #### 1.6.11 SQL Queries (sqlc Source)
 
 **agents.sql:**
@@ -763,6 +792,8 @@ SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1);
 INSERT INTO conversations (id, s2_stream_name, created_at) VALUES ($1, $2, now());
 -- name: GetConversation :one
 SELECT id, s2_stream_name, created_at FROM conversations WHERE id = $1;
+-- name: ConversationExists :one
+SELECT EXISTS(SELECT 1 FROM conversations WHERE id = $1);
 ```
 
 **members.sql:**
@@ -779,6 +810,8 @@ SELECT agent_id FROM members WHERE conversation_id = $1 FOR UPDATE;
 -- name: ListConversationsForAgent :many
 SELECT m.conversation_id, c.created_at FROM members m
 JOIN conversations c ON c.id = m.conversation_id WHERE m.agent_id = $1 ORDER BY c.created_at DESC;
+-- name: ListMembersForConversation :many
+SELECT agent_id FROM members WHERE conversation_id = $1;
 ```
 
 **cursors.sql:**
