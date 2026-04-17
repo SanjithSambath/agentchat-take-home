@@ -107,7 +107,7 @@
         * **Belt-and-suspenders:** If the write handler fails to append `message_abort` (S2 temporarily unreachable), the leave handler appends it as a fallback.
         * The `message_abort` event MUST precede the `agent_left` event on the S2 stream. This ordering is guaranteed because the leave handler waits for the write handler to exit before writing `agent_left`.
     * After leave, reject all read/write requests from this agent for this conversation.
-    * The agent's read cursor is preserved in PostgreSQL for potential re-invite resume.
+    * Both of the agent's cursors (`delivery_seq` + `ack_seq`) are preserved in PostgreSQL for potential re-invite resume. See §1.7.
 
 **Edge cases:**
 * Race condition: agent A invites agent B while agent B leaves simultaneously. Resolve by checking membership under a transaction/lock.
@@ -236,6 +236,8 @@ func (h *Handler) StreamMessage(w http.ResponseWriter, r *http.Request) {
 ```
 
 **Why AppendSession, not Unary per token:** Unary at 40ms ack (Express) = max 25 sequential appends/sec. LLMs emit 30-100 tokens/sec. AppendSession pipelines the appends — submit token N while token N-1's ack is still in-flight. No bottleneck at any token rate S2 can handle.
+
+**`head_seq` update.** On every successful S2 append, the S2 store wrapper (`internal/store/s2.go`) calls `UpdateConversationHeadSeq(convID, LastSeqNum)` against Postgres — a regression-guarded `UPDATE conversations SET head_seq = $2 WHERE id = $1 AND head_seq < $2`. This keeps the cached tail-position in Postgres in lockstep with S2 (drift ≤ a few ms) and makes `GET /agents/me/unread` a single indexed join with no S2 round-trip. The handler above does not invoke this directly — it is a side-effect of the store wrapper's append primitives, applied uniformly to both Unary `AppendEvents` and streaming `AppendSession` paths. See `sql-metadata-plan.md` §5 and §12 for the schema and query.
 
 `bufio.NewScanner(r.Body)` blocks at `scanner.Scan()` until a complete NDJSON line arrives from the client, then returns it. When the client closes the request body, `Scan()` returns `false` (EOF). If the connection drops mid-stream, `r.Context().Done()` fires and/or `r.Body.Read()` returns an error. This works identically on HTTP/1.1 chunked encoding and HTTP/2 DATA frames.
 
@@ -391,7 +393,7 @@ data: {"agent_id":"a2","timestamp":"2026-04-14T10:01:00Z"}
 6.  Server translates each S2 record to an SSE event and writes to the HTTP response.
 7.  When S2 reaches the end of the stream, it transitions to real-time tailing.
 8.  New records appended to the S2 stream are immediately forwarded as SSE events.
-9.  Server periodically flushes the agent's read cursor from in-memory cache to PostgreSQL (batched every 5 seconds).
+9.  Server periodically flushes the agent's `delivery_seq` from in-memory cache to PostgreSQL (batched every 5 seconds). `ack_seq` is not involved here — it is only advanced by explicit `POST /conversations/:cid/ack`.
 
 **Connection lifecycle:**
 * Register connection in the connection registry: `activeConnections[(agent_id, cid)] = cancelFunc`
@@ -974,6 +976,7 @@ type UnreadEntry struct {
 type Conversation struct {
     ID            uuid.UUID
     S2StreamName  string
+    HeadSeq       uint64    // cached S2 tail; updated inline on every successful append
     CreatedAt     time.Time
 }
 

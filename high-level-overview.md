@@ -135,12 +135,12 @@ S2 is the entire message storage and delivery layer. One stream per conversation
 
 ### 8. PostgreSQL Metadata (Neon)
 
-Five tables: `agents`, `conversations`, `members`, `cursors`, `in_progress_messages`. pgx v5 native interface + sqlc code generation. UUIDv7 primary keys. pgxpool with 15 connections (~50K queries/sec throughput on indexed point lookups).
+Five tables: `agents`, `conversations` (with cached `head_seq` updated inline on every S2 append, powers the unread query), `members`, `cursors` (two columns per row — `delivery_seq` + `ack_seq`), `in_progress_messages`. pgx v5 native interface + sqlc code generation. UUIDv7 primary keys. pgxpool with 15 connections (~50K queries/sec throughput on indexed point lookups).
 
 **Caching layers:**
 - Agent existence: `sync.Map` (write-once, read-many, ~50ns reads, no eviction needed)
 - Membership: LRU cache (100K entries, 60s TTL, synchronous invalidation on invite/leave)
-- Cursors: In-memory hot tier with batched Postgres flush
+- Delivery cursor: In-memory hot tier with batched Postgres flush (every 5s). `ack_seq` is NOT cached — synchronous write-through for correctness.
 
 **Hosting:** Neon serverless PostgreSQL (free tier, `us-east-1`). Direct TCP connection from Go server on Fly.io (`iad`). ~1-5ms latency.
 

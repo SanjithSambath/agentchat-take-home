@@ -877,6 +877,7 @@ type UnreadEntry struct {
 type Conversation struct {
     ID            uuid.UUID
     S2StreamName  string
+    HeadSeq       uint64    // cached S2 tail; updated inline on every successful append
     CreatedAt     time.Time
 }
 
