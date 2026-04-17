@@ -64,7 +64,7 @@ Create, list, invite, leave — all metadata operations in PostgreSQL. S2 stream
 **Key behaviors:**
 - Creator is auto-member. Same agent set can have multiple conversations.
 - Invite is idempotent for existing members (`ON CONFLICT DO NOTHING`), error for nonexistent agents.
-- Leave rejects if last member (409). Hard-deletes membership row, preserves cursor for re-invite resume.
+- Leave rejects if last member (409). Hard-deletes membership row, preserves both cursors (`delivery_seq` + `ack_seq`) for re-invite resume.
 - Leave terminates active SSE and streaming write connections for the departing agent, writes `message_abort` for any in-progress message before writing `agent_left`.
 
 **Concurrency:** `SELECT ... FOR UPDATE` serializes concurrent leave operations per conversation. Five race conditions analyzed and resolved.
@@ -99,9 +99,11 @@ Two write patterns, both writing to the same S2 stream:
 
 ### 5. Read Path
 
-**SSE (real-time)** (`GET /conversations/{cid}/stream`): S2 read session → SSE event translation. Catch-up from cursor, then seamless transition to real-time tailing. SSE `id` = S2 sequence number (auto-resume via `Last-Event-ID` on reconnect). One active SSE connection per (agent, conversation) — new connection replaces old.
+**Consumption model (active / passive / wake-up).** Agents consume a conversation in one of three modes, determined entirely by the transport they open — the server holds no per-agent mode state. Active = open SSE tail. Passive = member with no tail (messages accumulate on S2, agent is not interrupted). Wake-Up = client-initiated pull via `GET /agents/me/unread` to learn which conversations have unread material, followed by `GET /conversations/{cid}/messages?from=<ack_seq>` to catch up on assembled messages and `POST /conversations/{cid}/ack` to advance the ack cursor. See [`spec.md`](spec.md) §1.4.
 
-**History (polling-friendly)** (`GET /conversations/{cid}/messages`): Reconstructs complete messages from the raw event stream. Groups events by `message_id`, assembles content, returns structured messages with `status` (complete / in_progress / aborted). Paginated with `limit` and `before` parameters.
+**SSE (real-time)** (`GET /conversations/{cid}/stream`): S2 read session → SSE event translation. Catch-up from `delivery_seq`, then seamless transition to real-time tailing. SSE `id` = S2 sequence number (auto-resume via `Last-Event-ID` on reconnect). One active SSE connection per (agent, conversation) — new connection replaces old.
+
+**History (canonical passive catch-up)** (`GET /conversations/{cid}/messages`): Reconstructs complete messages from the raw event stream. Groups events by `message_id`, assembles content, returns structured messages with `status` (complete / in_progress / aborted). Two cursor modes: `before` (DESC pagination) and `from` (ASC, ack-aligned catch-up) — mutually exclusive. Assembled messages only — no raw-events alternative.
 
 **Concurrent message interleaving:** When two agents stream simultaneously, their records interleave on the S2 stream. Readers demultiplex by `message_id`. The interleaving IS the total order — it represents the temporal reality of concurrent composition.
 
@@ -111,9 +113,9 @@ Two write patterns, both writing to the same S2 stream:
 
 ### 6. Read Cursor Management
 
-Server-managed, two-tier architecture: in-memory hot tier (`sync.RWMutex` map) updated on every SSE event delivery (zero I/O), batched flush to PostgreSQL every 5 seconds via `unnest()` batch upsert. Immediate flush on disconnect, leave, and shutdown.
+**Two cursors per (agent, conversation):** `delivery_seq` (server-advanced, two-tier — in-memory hot tier updated on every SSE event delivery, batched flush to PostgreSQL every 5 seconds via `unnest()` batch upsert, immediate flush on disconnect/leave/shutdown) and `ack_seq` (client-advanced only by `POST /conversations/{cid}/ack`, single-tier synchronous write-through — no hot tier, no batching). Both cursors live in one `cursors` row.
 
-**Delivery semantics:** At-least-once. On crash, agent may re-receive up to ~5 seconds of events. Events carry sequence numbers for client-side deduplication. Cursors survive leave — on re-invite, agent resumes from where it left off.
+**Delivery semantics:** Tail delivery is at-least-once — on crash, agent may re-receive up to ~5 seconds of events, deduplicated client-side by sequence number. `ack_seq` is exactly-what-you-acked (synchronous, regression-guarded). Both cursors survive leave — on re-invite, agent resumes tailing from `delivery_seq` and gets an accurate unread count from `ack_seq`.
 
 → Cursor architecture & flush mechanics: [`sql-metadata-plan.md`](sql-metadata-plan.md) §7
 
@@ -163,6 +165,8 @@ Standard JSON error envelope on every error. Machine-readable `code` for AI agen
 | POST | `/conversations/{cid}/leave` | Yes | 30s | — | JSON |
 | POST | `/conversations/{cid}/messages` | Yes | 30s | JSON | JSON |
 | GET | `/conversations/{cid}/messages` | Yes | 30s | — | JSON |
+| POST | `/conversations/{cid}/ack` | Yes | 30s | JSON | — |
+| GET | `/agents/me/unread` | Yes | 30s | — | JSON |
 | POST | `/conversations/{cid}/messages/stream` | Yes | — | NDJSON | JSON |
 | GET | `/conversations/{cid}/stream` | Yes | — | — | SSE |
 

@@ -15,7 +15,7 @@ This document specifies the complete design for AgentMail's Claude-powered **res
 - **Discoverability:** Dedicated `GET /agents/resident` endpoint — unauthenticated, programmatic, AI-agent-friendly
 - **Conversation discovery:** Go channel for real-time invite notifications. One-time startup reconciliation for catch-up. No periodic polling.
 - **Conversation listening:** On startup, listen to ALL conversations the agent is a member of. On invite, immediately start listening to the new conversation.
-- **Response triggering:** Always respond to every `message_end` from another agent. Self-messages hardcode-skipped (never sent to Claude). Sequential queuing per conversation via channel semaphore. `[NO_RESPONSE]` protocol dropped — unnecessary complexity for a resident agent.
+- **Response triggering:** Always respond to every `message_end` from another agent. Self-messages hardcode-skipped (never sent to Claude). Sequential queuing per conversation via channel semaphore. `[NO_RESPONSE]` protocol dropped — unnecessary complexity for a resident agent. **This "always respond" policy is resident-only**; external agents adopt their own consumption policy within the active/passive/wake-up model defined in [`spec.md`](../spec.md) §1.4, and the service never forces an LLM invocation on any agent.
 - **History seeding:** Lazy — history is empty on connect, seeded from S2 on first `message_end` from another agent. Bounded sliding window (last 50 messages).
 - **Claude API integration:** Streaming responses via Anthropic Go SDK (`client.Messages.NewStreaming`), piped directly to S2 AppendSession (no HTTP self-call for writes). Response goroutine is a child of the listener goroutine, tracked via per-conversation WaitGroup.
 - **Context management:** Sliding window over message history, system prompt + last N messages. Consecutive same-role messages merged with sender attribution for Anthropic API compliance.
@@ -447,7 +447,7 @@ The agent calls `s2Store.OpenReadSession(ctx, convID, fromSeq)` directly — the
 | **Code reuse** | ~20 lines for the ReadSession loop | Zero new code, but couples agent to HTTP layer |
 | **Failure isolation** | Agent fails independently of HTTP stack | HTTP stack failure kills agent reads |
 
-**The cursor management concern is a non-issue.** The agent calls `cursors.GetCursor()` and `cursors.UpdateCursor()` — the same store interface the SSE handler uses. It's not reimplementation. The only "duplicated" logic is the `for readSession.Next()` loop and cursor update call — ~20 lines of straightforward code.
+**The cursor management concern is a non-issue.** The agent calls `cursors.GetDeliveryCursor()` and `cursors.UpdateDeliveryCursor()` — the same store interface the SSE handler uses. It's not reimplementation. The only "duplicated" logic is the `for readSession.Next()` loop and cursor update call — ~20 lines of straightforward code. (The resident agent never acks via the client-facing `Ack(...)` path — it's an in-process server component, not an external client.)
 
 **The "doesn't exercise the SSE code path" concern is a non-issue.** Integration tests exercise the SSE path. The agent's job is to be reliable, not to be a test harness.
 
@@ -518,7 +518,7 @@ The implementation is in Section 3's updated `startListening()`.
 ```go
 func (a *Agent) listen(ctx context.Context, convID uuid.UUID) error {
     // 1. Resolve starting position
-    startSeq, err := a.store.Cursors().GetCursor(ctx, a.id, convID)
+    startSeq, err := a.store.Cursors().GetDeliveryCursor(ctx, a.id, convID)
     if err != nil {
         // No cursor exists — start from beginning of conversation
         startSeq = 0
@@ -538,8 +538,8 @@ func (a *Agent) listen(ctx context.Context, convID uuid.UUID) error {
     for readSession.Next() {
         event := readSession.Event()
 
-        // Update cursor in memory (batched flush to Postgres every 5s by CursorStore)
-        a.store.Cursors().UpdateCursor(a.id, convID, event.SeqNum)
+        // Update delivery_seq in memory (batched flush to Postgres every 5s by CursorStore)
+        a.store.Cursors().UpdateDeliveryCursor(a.id, convID, event.SeqNum)
 
         // Dispatch to message accumulation and response system (Section 5)
         a.onEvent(convID, event)
@@ -552,7 +552,7 @@ func (a *Agent) listen(ctx context.Context, convID uuid.UUID) error {
 
 **Properties of `listen()`:**
 - **~20 lines.** No lifecycle management, no retry logic, no registration. Just the pure read loop.
-- **Cursor tracking uses the existing CursorStore.** `GetCursor()` reads from in-memory cache (falling back to Postgres). `UpdateCursor()` writes to in-memory cache only (batched flush handles durability). Same code path as external SSE clients.
+- **Cursor tracking uses the existing CursorStore delivery path.** `GetDeliveryCursor()` reads from in-memory cache (falling back to Postgres). `UpdateDeliveryCursor()` writes to in-memory cache only (batched flush handles durability). Same code path as external SSE clients. The resident agent does not touch `ack_seq` — that cursor is reserved for external clients that explicitly call `POST /conversations/:cid/ack`.
 - **`onEvent()` is the bridge to Section 5 (D).** C reads events and hands them off. What happens with them — message demultiplexing, response triggering, echo filtering — is D's concern.
 - **Return value drives the retry loop.** `nil` error with canceled context = normal exit. Stream-not-found error = retry with backoff. Other S2 error = retry with backoff.
 
@@ -644,7 +644,7 @@ Context cancellation propagates to both the ReadSession and the response gorouti
 `readSession.Next()` returns false with a non-nil error. `listen()` returns the error. `startListening()`'s retry loop checks `listenerCtx.Err()` → nil (not canceled, just S2 failure) → retries with backoff. On retry, `listen()` re-reads the cursor (updated in memory up to the last successfully processed event) and opens a fresh ReadSession. At-least-once delivery — the agent may re-process a few events. Events carry sequence numbers for deduplication in Section 5.
 
 **Cursor is stale after server crash:**
-The in-memory cursor was updated on every event delivery but may not have been flushed to Postgres. On restart, `GetCursor()` falls back to Postgres — at most 5 seconds stale. The agent re-processes up to ~150 events (5 sec × ~30 events/sec). Idempotent event processing in Section 5 handles this.
+The in-memory `delivery_seq` was updated on every event delivery but may not have been flushed to Postgres. On restart, `GetDeliveryCursor()` falls back to Postgres — at most 5 seconds stale. The agent re-processes up to ~150 events (5 sec × ~30 events/sec). Idempotent event processing in Section 5 handles this.
 
 **Two listeners for the same conversation (race between invite notification and reconciliation):**
 Impossible. `startListening()` is idempotent — mutex-guarded map check prevents duplicate goroutines. Both code paths call `startListening()`, which returns immediately if a listener already exists.
@@ -971,13 +971,15 @@ The `[NO_RESPONSE]` protocol (Claude decides whether to respond via sentinel tex
 
 The resident agent has no reason to stay silent. It exists to demonstrate the platform by conversing. The self-echo hardcode skip is the only guard needed — it's trivially deterministic and prevents infinite loops.
 
+**This "always respond" policy is resident-only.** External agents are first-class clients of the consumption model in [`spec.md`](../spec.md) §1.4 — active (open SSE tail and process every event), passive (member with no tail, messages accumulate on S2 without interrupting the agent's work), or wake-up (periodic `GET /agents/me/unread` + explicit `POST /conversations/{cid}/ack`). The service never invokes an LLM on an external agent's behalf and never forces an agent out of passive mode.
+
 **Production enhancement (FUTURE.md):** For production agent frameworks with multiple AI agents in group conversations, intelligent response gating (mode-toggle, tool-based decisions, lightweight pre-filters) belongs in the client-side agent architecture. The AgentMail API supports this via the natural patterns of SSE connect/disconnect and NDJSON POST start/stop. Document in CLIENT.md as guidance for external agent developers.
 
 ---
 
 ### At-Least-Once Delivery — Dedup After Crash Recovery
 
-When the agent restarts and `listen()` resumes from the Postgres cursor, it may re-process events that were already handled before the crash. The cursor is at most 5 seconds stale (batched flush interval).
+When the agent restarts and `listen()` resumes from the Postgres `delivery_seq`, it may re-process events that were already handled before the crash. The cursor is at most 5 seconds stale (batched flush interval).
 
 **Lazy seeding provides natural dedup.** When `seedHistory()` reads the last 500 events and assembles messages, it covers the full range of potentially re-delivered events. The `seeded` flag prevents re-processing: once history is seeded, subsequent events from the stream are new (they have sequence numbers beyond the seeded range).
 
@@ -1646,7 +1648,7 @@ Each conversation's response attempt retries 3 times (up to 12 seconds), then se
 Recovery sweep (step 3) may have written some `message_abort` events but not all. On next restart, the recovery sweep runs again. Rows that were already cleaned up are gone. Rows that weren't are retried. `message_abort` for a message that already has one is harmless — readers ignore duplicate aborts for the same `message_id`. Idempotent.
 
 **Agent is in a conversation but the S2 stream was trimmed (28-day retention):**
-The listener's `listen()` function opens a ReadSession from the cursor. If the cursor points to trimmed data, S2 returns an error. The retry loop in `startListening()` catches this. On the next attempt, `GetCursor()` returns the stale value, but the S2 SDK's `ReadSession` with a sequence number beyond the trim point should start from the stream head (earliest available record). The agent catches up on whatever history remains. Log a warning for observability.
+The listener's `listen()` function opens a ReadSession from `delivery_seq`. If the cursor points to trimmed data, S2 returns an error. The retry loop in `startListening()` catches this. On the next attempt, `GetDeliveryCursor()` returns the stale value, but the S2 SDK's `ReadSession` with a sequence number beyond the trim point should start from the stream head (earliest available record). The agent catches up on whatever history remains. Log a warning for observability.
 
 ---
 

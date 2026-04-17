@@ -328,6 +328,16 @@ This keeps the client protocol dead simple — the agent's scaffolding only need
 
 ### 1.4 Message Streaming — Read Path
 
+**Consumption Model: Active, Passive, Wake-Up.**
+
+External agents consume a conversation in one of three modes. The mode is never declared to the server — the transport the client is using *is* the mode. No server-side per-agent consumption-mode state exists.
+
+* **Active.** The agent holds an open SSE tail on `GET /conversations/:cid/stream`. Events flow live. The `delivery_seq` cursor auto-advances as events are shipped. The agent's own framework decides what to do with each event (feed its LLM, dispatch a tool call, ignore). The service never invokes anything on the agent's behalf.
+* **Passive.** The agent remains a member of the conversation but holds no tail. Messages continue to be appended to the S2 stream by other members. The agent consumes nothing in real time and is not interrupted. Leave is destructive and is NOT the way to tune out — staying a member with no open tail IS passive mode.
+* **Wake-Up.** A passive agent learns that it has unread material by calling `GET /agents/me/unread` on its own schedule (client-initiated pull, not server push). The response enumerates every conversation where `head_seq > ack_seq`. The agent then decides whether to engage (open a tail, or pull assembled messages via `GET /conversations/:cid/messages`) or continue ignoring.
+
+The "always respond on `message_end`" policy used by the Claude-powered resident agent (§1.8) is a **resident-specific** choice. External agents adopt any consumption policy they want within this model.
+
 **SSE (primary read transport):**
 
 ```http
@@ -389,18 +399,20 @@ data: {"agent_id":"a2","timestamp":"2026-04-14T10:01:00Z"}
 * On leave: server calls `cancelFunc`, which closes the response, client sees connection close.
 * On server shutdown: graceful drain — send final event, close all connections.
 
-**Cursor management:**
-* Store in PostgreSQL (warm tier): `cursors(agent_id UUID, conversation_id UUID, seq_num BIGINT, updated_at TIMESTAMPTZ)`. Hot tier: in-memory `sync.RWMutex` map updated on every event delivery.
-* Update strategy: batch updates — every 10 events or every 5 seconds, whichever comes first.
-* On disconnect: flush final cursor position.
-* On reconnect: resume from stored cursor.
-* Result: at-least-once delivery. Agent may re-receive a few events after crash. Events have sequence numbers and message IDs for client-side deduplication.
+**Cursor management — two cursors per (agent, conversation):**
 
-**History endpoint (non-streaming):**
+* **`delivery_seq`** — server-advanced. Tracks the highest sequence number delivered to the agent over an active tail (SSE). Stored in PostgreSQL (warm tier) under `cursors(agent_id, conversation_id, delivery_seq, ack_seq, updated_at)`. Hot tier: in-memory `sync.RWMutex` map updated on every event delivery. Flushed in batches every 5 seconds (or 10 events, whichever comes first); immediately on disconnect, leave, or shutdown. Used to resume a reconnecting tail so the agent does not redundantly re-stream what the wire already delivered.
+* **`ack_seq`** — client-advanced. Advanced only by an explicit `POST /conversations/:cid/ack` from the agent. Synchronous write-through upsert — no hot tier, no batching. Represents what the agent has actually *processed* (as opposed to what was merely delivered to the wire). `ack_seq` powers the unread computation on `GET /agents/me/unread`. Independent of `delivery_seq` — `ack_seq` can be ahead of `delivery_seq` (passive-catch-up reader that pulled assembled messages via the history endpoint) or behind (active tailer that has received events but not yet finished processing them).
+* **Invariants.** `0 ≤ ack_seq ≤ head_seq` and `0 ≤ delivery_seq ≤ head_seq`. No invariant is enforced between `ack_seq` and `delivery_seq`.
+* **Both cursors survive leave.** On re-invite, the agent resumes from its prior `delivery_seq` for tails and its prior `ack_seq` for unread computation. See §1.7.
+* **Delivery semantics.** At-least-once for tails (agent may re-receive up to ~5 seconds of events after a crash, deduplicated client-side by sequence number). Exactly-what-you-acked for `ack_seq` (synchronous, regression-guarded).
+
+**History endpoint (canonical passive catch-up):**
 ```http
 GET /conversations/:cid/messages
 Header: X-Agent-ID: <agent_id>
-Query: ?limit=50&before=<seq_num>
+Query: ?limit=50&before=<seq_num>   (pagination, newest-first)
+       ?limit=50&from=<seq_num>     (catch-up, ack-cursor-aligned, oldest-first)
 
 Response: 200 OK
 {
@@ -411,7 +423,9 @@ Response: 200 OK
   "has_more": false
 }
 ```
-*(This reconstructs complete messages from the raw event stream. Reads from S2, groups events by message_id, assembles content, returns structured messages. Useful for agents that want to see conversation history without processing raw events.)*
+*(This reconstructs complete messages from the raw event stream. Reads from S2, groups events by `message_id`, assembles content, returns structured messages.)*
+
+**This endpoint is the canonical passive-catch-up primitive.** It returns **assembled messages only** — there is intentionally no raw-events alternative, no granularity knob. Passive consumers (polymarket-style agents that tuned out and want to re-engage) call this with `?from=<their ack_seq>` to receive every complete message that landed after what they last acknowledged. `?from` and `?before` are mutually exclusive. Active tailers that want raw events use SSE above.
 
 **`status` field:** Three-valued string enum replacing the original `complete` boolean, because aborted messages are neither complete nor in-progress:
 
@@ -431,7 +445,70 @@ Response: 200 OK
 * `from` seq_num is before the stream's trim point (28-day retention on free tier): silently start from the stream's earliest available record (head). Log a warning server-side for observability. The agent catches up on whatever history remains.
 * Slow reader: S2 handles backpressure. If the client can't keep up, the HTTP response buffer fills, Go's `http.Flusher` blocks, and the S2 read session slows down. No unbounded memory growth.
 
-**Files:** `internal/api/sse.go`, `internal/api/history.go`
+**Ack endpoint (advance the ack cursor):**
+```http
+POST /conversations/:cid/ack
+Header: X-Agent-ID: <agent_id>
+Content-Type: application/json
+
+{"seq": 127}
+
+Response: 204 No Content
+```
+*(Idempotent. Advances `ack_seq` for `(agent, conversation)` to `max(current_ack_seq, seq)`. Synchronous write-through to Postgres — no hot tier, no batching. The client has durability on return.)*
+
+**Semantics and errors:**
+* `seq` MUST satisfy `0 ≤ seq ≤ conversations.head_seq`. `seq > head_seq` is rejected with 400 `ack_beyond_head`. `seq < 0` or non-integer is rejected with 400 `ack_invalid_seq`.
+* **Regression is silently ignored.** If the caller sends `seq < current_ack_seq`, the row is unchanged and 204 is returned. The upsert uses `WHERE cursors.ack_seq < EXCLUDED.ack_seq`. This prevents out-of-order retries from un-acking material.
+* Membership is required. Non-member: 403. Unknown conversation: 404.
+* **No body on success** — 204 No Content. The cursor state is queryable via `GET /agents/me/unread`.
+
+**Unread endpoint (list all conversations with unacked events):**
+```http
+GET /agents/me/unread?limit=100
+Header: X-Agent-ID: <agent_id>
+
+Response: 200 OK
+{
+  "conversations": [
+    {"conversation_id":"01906e5c-...","head_seq":302,"ack_seq":247,"event_delta":55},
+    {"conversation_id":"01906e60-...","head_seq":19,"ack_seq":0,"event_delta":19}
+  ]
+}
+```
+*(One indexed SQL join. Returns only conversations where `head_seq > ack_seq`, ordered by `head_seq` descending. Default `limit` 100, max 500.)*
+
+**Why on-demand, not push:**
+
+The service does NOT maintain denormalized per-agent unread counters, does NOT maintain per-agent activity streams, and does NOT run any server-side cron on the agent's behalf. The unread view is computed from two already-present facts — `conversations.head_seq` (cached inline on every successful S2 append) and `cursors.ack_seq` (advanced by the agent's own acks). A single SQL join answers the query:
+
+```sql
+SELECT c.id AS conversation_id,
+       c.head_seq,
+       COALESCE(k.ack_seq, 0) AS ack_seq,
+       c.head_seq - COALESCE(k.ack_seq, 0) AS event_delta
+FROM members m
+JOIN conversations c ON c.id = m.conversation_id
+LEFT JOIN cursors k
+       ON k.agent_id = m.agent_id
+      AND k.conversation_id = m.conversation_id
+WHERE m.agent_id = $1
+  AND c.head_seq > COALESCE(k.ack_seq, 0)
+ORDER BY c.head_seq DESC
+LIMIT $2;
+```
+
+**`event_delta` is in events, not messages.** Converting to a message count would require scanning the range. The delta is a size signal (zero / some / a lot) — it tells the agent *whether* to engage, not *what* the unread content is. To see the content, the agent calls `GET /conversations/:cid/messages?from=<ack_seq>` (assembled messages).
+
+**Semantics and errors:**
+* Passive agents that never call this endpoint cost the server zero. There is no background work per agent.
+* Agents with no memberships: `conversations: []`.
+* Agents with memberships but everything acked: `conversations: []`.
+* Race with concurrent writes: `head_seq` is cached inline with S2 appends; a call landing mid-write may report `head_seq` lagging the true S2 tail by up to a few milliseconds. Acceptable — the agent sees it on the next call.
+
+See `sql-metadata-plan.md` §5 for the schema and §7 for the cursor store interface. See `http-api-layer-plan.md` §3 for Go request/response types.
+
+**Files:** `internal/api/sse.go`, `internal/api/history.go`, `internal/api/ack.go`, `internal/api/unread.go`
 
 ---
 
@@ -637,10 +714,13 @@ CREATE TABLE agents (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Conversations: each row maps to one S2 stream
+-- Conversations: each row maps to one S2 stream.
+-- head_seq caches the latest S2 sequence number for the conversation; updated
+-- inline with every successful S2 append. Powers GET /agents/me/unread.
 CREATE TABLE conversations (
     id              UUID PRIMARY KEY,
     s2_stream_name  TEXT NOT NULL,
+    head_seq        BIGINT NOT NULL DEFAULT 0,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -659,15 +739,23 @@ CREATE TABLE members (
 -- For "list conversations for agent" queries
 CREATE INDEX idx_members_agent_id ON members(agent_id);
 
--- Cursors: server-managed read positions for at-least-once delivery
+-- Cursors: server-managed read positions.
+-- Two cursors per (agent, conversation):
+--   delivery_seq — server-advanced as events are shipped over a tail (SSE).
+--                  Batched flush every 5s from an in-memory hot tier. Powers tail resume.
+--   ack_seq      — client-advanced only by POST /conversations/:cid/ack.
+--                  Synchronous write-through (no hot tier). Powers GET /agents/me/unread.
 -- No foreign keys — validated at API layer, and cursors may outlive membership
--- (preserved on leave for potential re-invite resume)
+-- (both preserved on leave for potential re-invite resume).
 CREATE TABLE cursors (
     agent_id         UUID NOT NULL,
     conversation_id  UUID NOT NULL,
-    seq_num          BIGINT NOT NULL DEFAULT 0,
+    delivery_seq     BIGINT NOT NULL DEFAULT 0,
+    ack_seq          BIGINT NOT NULL DEFAULT 0,
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (agent_id, conversation_id)
+    PRIMARY KEY (agent_id, conversation_id),
+    CHECK (delivery_seq >= 0),
+    CHECK (ack_seq >= 0)
 );
 
 -- In-progress streaming writes: tracks active streaming messages for crash recovery.
@@ -684,9 +772,9 @@ CREATE TABLE in_progress_messages (
 
 **Table rationale:**
 * **`agents`:** No indexes beyond PK. No metadata columns (spec says "no metadata"). Agents are permanent (no soft-delete).
-* **`conversations`:** `s2_stream_name` decouples conversation ID from S2 stream name (format: `conversations/{conversation_id}`). UNIQUE index prevents two conversations pointing to the same stream.
+* **`conversations`:** `s2_stream_name` decouples conversation ID from S2 stream name (format: `conversations/{conversation_id}`). UNIQUE index prevents two conversations pointing to the same stream. `head_seq` is the cached latest S2 sequence number, updated inline on every successful S2 append from `AppendResult.LastSeqNum()`; it powers `GET /agents/me/unread` without paying an S2 round-trip per unread query.
 * **`members`:** PK order `(conversation_id, agent_id)` optimized for the hottest queries: membership check (`WHERE conversation_id = $1 AND agent_id = $2`) and member list (`WHERE conversation_id = $1`). Separate index on `(agent_id)` for "list conversations for agent." Foreign keys with no CASCADE — agents and conversations are permanent. **Hard delete on leave:** simpler queries (no `AND left_at IS NULL`), S2 stream has full membership event history, re-invite is a fresh INSERT.
-* **`cursors`:** No foreign keys (validated at API layer, cursors may outlive membership). **Cursors survive leave** — on re-invite, agent resumes from where they left off, catching up on missed messages. `BIGINT` for `seq_num` (S2 sequence numbers are 64-bit). PK order `(agent_id, conversation_id)` optimized for disconnect cleanup.
+* **`cursors`:** No foreign keys (validated at API layer, cursors may outlive membership). **Two independent cursors in one row.** `delivery_seq` is written by the batched-flush hot tier on tail delivery; `ack_seq` is written synchronously by the `POST /conversations/:cid/ack` handler. Both are regression-guarded (out-of-order writes are silent no-ops). **Both cursors survive leave** — on re-invite, agent resumes tailing from `delivery_seq` and gets an accurate unread count from `ack_seq`. `BIGINT` on both columns (S2 sequence numbers are 64-bit). PK order `(agent_id, conversation_id)` optimized for disconnect cleanup and for the `GET /agents/me/unread` join.
 
 **Why exactly five tables:** No `messages` table (messages live in S2). No `sessions`/`connections` table (tracked in-memory). No `events`/`audit` table (S2 streams ARE the audit log). The fifth table (`in_progress_messages`) is the minimal addition needed for crash recovery — it tracks active streaming writes so the server can emit `message_abort` events for unterminated messages on restart. Rows exist only for the duration of active streaming POST requests (seconds to minutes), so the table is tiny.
 
@@ -860,11 +948,24 @@ type MembershipService interface {
 }
 
 type CursorStore interface {
-    GetCursor(ctx context.Context, agentID, convID uuid.UUID) (uint64, error)
-    UpdateCursor(agentID, convID uuid.UUID, seqNum uint64)  // memory-only, no error
+    // Delivery cursor (two-tier, batched). See §1.7 / sql-metadata-plan.md §7.
+    GetDeliveryCursor(ctx context.Context, agentID, convID uuid.UUID) (uint64, error)
+    UpdateDeliveryCursor(agentID, convID uuid.UUID, seqNum uint64)  // memory-only, no error
     FlushOne(ctx context.Context, agentID, convID uuid.UUID) error
     FlushAll(ctx context.Context) error
     Start(ctx context.Context)
+
+    // Ack cursor (single-tier, synchronous). See §1.7 / sql-metadata-plan.md §7.
+    Ack(ctx context.Context, agentID, convID uuid.UUID, seq uint64) error
+    GetAckCursor(ctx context.Context, agentID, convID uuid.UUID) (uint64, error)
+    ListUnreadForAgent(ctx context.Context, agentID uuid.UUID, limit int32) ([]UnreadEntry, error)
+}
+
+type UnreadEntry struct {
+    ConversationID uuid.UUID
+    HeadSeq        uint64
+    AckSeq         uint64
+    EventDelta     uint64
 }
 ```
 
@@ -896,11 +997,16 @@ SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1);
 **conversations.sql:**
 ```sql
 -- name: CreateConversation :exec
-INSERT INTO conversations (id, s2_stream_name, created_at) VALUES ($1, $2, now());
+INSERT INTO conversations (id, s2_stream_name, head_seq, created_at) VALUES ($1, $2, 0, now());
 -- name: GetConversation :one
-SELECT id, s2_stream_name, created_at FROM conversations WHERE id = $1;
+SELECT id, s2_stream_name, head_seq, created_at FROM conversations WHERE id = $1;
 -- name: ConversationExists :one
 SELECT EXISTS(SELECT 1 FROM conversations WHERE id = $1);
+-- name: GetConversationHeadSeq :one
+SELECT head_seq FROM conversations WHERE id = $1;
+-- name: UpdateConversationHeadSeq :exec
+-- Called inline with every successful S2 append. Regression-guarded.
+UPDATE conversations SET head_seq = $2 WHERE id = $1 AND head_seq < $2;
 ```
 
 **members.sql:**
@@ -923,12 +1029,29 @@ SELECT agent_id FROM members WHERE conversation_id = $1;
 
 **cursors.sql:**
 ```sql
--- name: GetCursor :one
-SELECT seq_num FROM cursors WHERE agent_id = $1 AND conversation_id = $2;
--- name: UpsertCursor :exec
-INSERT INTO cursors (agent_id, conversation_id, seq_num, updated_at) VALUES ($1, $2, $3, now())
-ON CONFLICT (agent_id, conversation_id) DO UPDATE SET seq_num = $3, updated_at = now()
-WHERE cursors.seq_num < $3;
+-- name: GetDeliveryCursor :one
+SELECT delivery_seq FROM cursors WHERE agent_id = $1 AND conversation_id = $2;
+-- name: GetAckCursor :one
+SELECT ack_seq FROM cursors WHERE agent_id = $1 AND conversation_id = $2;
+-- name: UpsertDeliveryCursor :exec
+-- Single-row delivery_seq UPSERT for disconnect/leave/shutdown. Does NOT touch ack_seq.
+INSERT INTO cursors (agent_id, conversation_id, delivery_seq, updated_at) VALUES ($1, $2, $3, now())
+ON CONFLICT (agent_id, conversation_id) DO UPDATE SET delivery_seq = EXCLUDED.delivery_seq, updated_at = EXCLUDED.updated_at
+WHERE cursors.delivery_seq < EXCLUDED.delivery_seq;
+-- name: AckCursor :exec
+-- Synchronous write-through for POST /conversations/:cid/ack. Regression-guarded.
+INSERT INTO cursors (agent_id, conversation_id, ack_seq, updated_at) VALUES ($1, $2, $3, now())
+ON CONFLICT (agent_id, conversation_id) DO UPDATE SET ack_seq = EXCLUDED.ack_seq, updated_at = EXCLUDED.updated_at
+WHERE cursors.ack_seq < EXCLUDED.ack_seq;
+-- name: ListUnreadForAgent :many
+SELECT c.id AS conversation_id, c.head_seq,
+       COALESCE(k.ack_seq, 0) AS ack_seq,
+       c.head_seq - COALESCE(k.ack_seq, 0) AS event_delta
+FROM members m
+JOIN conversations c ON c.id = m.conversation_id
+LEFT JOIN cursors k ON k.agent_id = m.agent_id AND k.conversation_id = m.conversation_id
+WHERE m.agent_id = $1 AND c.head_seq > COALESCE(k.ack_seq, 0)
+ORDER BY c.head_seq DESC LIMIT $2;
 ```
 
 **in_progress.sql:**
@@ -973,7 +1096,7 @@ Batch cursor flush uses raw pgx with `unnest()` arrays (not sqlc).
 
 ### 1.7 Read Cursor Management — Two-Tier Architecture
 
-**Design:** Server-managed cursors with a two-tier architecture: in-memory hot tier for zero-cost updates, batched PostgreSQL warm tier for durability.
+**Design:** Two independent server-managed cursors per `(agent, conversation)` — `delivery_seq` (auto-advanced on tail delivery, two-tier: in-memory hot tier for zero-cost updates, batched PostgreSQL warm tier for durability) and `ack_seq` (advanced only by explicit client `POST /conversations/:cid/ack`, single-tier: synchronous write-through to Postgres, no hot tier).
 
 **Why server-managed (not client-managed):**
 * The spec recommends it: "We recommend that the server track each agent's read position."
@@ -987,55 +1110,74 @@ Batch cursor flush uses raw pgx with `unnest()` arrays (not sqlc).
 SSE event delivered
         │
         ▼
-┌─────────────────────┐                              ┌──────────────────────────┐
-│   CursorCache       │     every 5 seconds          │   cursors table          │
-│   sync.RWMutex      │  ─────────────────────────→  │   (agent_id, conv_id,    │
-│   map[key]entry     │     batch UPSERT via         │    seq_num, updated_at)  │
-│   dirty set         │     unnest() arrays          │                          │
-└─────────────────────┘                              └──────────────────────────┘
-        │                                                       ↑
-        │  on disconnect / leave                                │
-        └───────────────────────────────────────────────────────┘
-                    immediate single flush
+┌─────────────────────┐                              ┌──────────────────────────────┐
+│   CursorCache       │    every 5 seconds           │   cursors table              │
+│   sync.RWMutex      │ ───────────────────────────→ │   (agent_id, conv_id,        │
+│   map[key]entry     │    batch UPSERT delivery_seq │    delivery_seq, ack_seq,    │
+│   dirty set         │    via unnest() arrays       │    updated_at)               │
+└─────────────────────┘                              │                              │
+        │                                            │                              │
+        │  on disconnect / leave                     │                              │
+        │  immediate single delivery_seq flush       │                              │
+        └───────────────────────────────────────────▶│                              │
+                                                     │                              │
+POST /conversations/:cid/ack                         │                              │
+        │  synchronous write-through,                │                              │
+        │  bypasses hot tier                         │                              │
+        └───────────────────────────────────────────▶│   (ack_seq UPSERT)           │
+                                                     └──────────────────────────────┘
 ```
 
 **Hot tier (in-memory):** `sync.RWMutex` + `map[cursorKey]cursorEntry` + dirty set. Updated on every event delivery. Zero I/O cost. Why `sync.RWMutex`, not `sync.Map`: cursor updates are write-heavy from many goroutines on overlapping keys — neither `sync.Map` optimization pattern applies. At extreme scale (>100K concurrent SSE connections): shard into 64 buckets by `hash(agent_id) % 64`.
 
-**Warm tier (PostgreSQL):** Background goroutine flushes all dirty cursors every 5 seconds via `unnest()` batch upsert:
+**Warm tier (PostgreSQL):** Background goroutine flushes all dirty `delivery_seq` values every 5 seconds via `unnest()` batch upsert (does NOT touch `ack_seq`):
 ```sql
-INSERT INTO cursors (agent_id, conversation_id, seq_num, updated_at)
+INSERT INTO cursors (agent_id, conversation_id, delivery_seq, updated_at)
 SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::bigint[], $4::timestamptz[])
 ON CONFLICT (agent_id, conversation_id)
-DO UPDATE SET seq_num = EXCLUDED.seq_num, updated_at = EXCLUDED.updated_at
-WHERE cursors.seq_num < EXCLUDED.seq_num;
+DO UPDATE SET delivery_seq = EXCLUDED.delivery_seq, updated_at = EXCLUDED.updated_at
+WHERE cursors.delivery_seq < EXCLUDED.delivery_seq;
 ```
-The `WHERE cursors.seq_num < EXCLUDED.seq_num` clause prevents stale flushes from regressing a cursor.
+The `WHERE cursors.delivery_seq < EXCLUDED.delivery_seq` clause prevents stale flushes from regressing the cursor.
 
-**Flush triggers:**
+**Flush triggers (`delivery_seq` only — `ack_seq` is synchronous, never batched):**
 
 | Trigger | What happens | Why |
 |---|---|---|
-| **Periodic (every 5 sec)** | Background goroutine flushes ALL dirty cursors | Bounds data loss on crash to 5 seconds |
-| **Clean disconnect** | SSE handler flushes THIS agent's cursor immediately | Zero data loss on graceful close |
-| **Server shutdown** | Graceful shutdown flushes ALL dirty cursors before exit | Zero data loss on planned restart |
-| **Agent leave** | Flush this agent's cursor for this conversation | Preserve accurate position for potential re-invite |
+| **Periodic (every 5 sec)** | Background goroutine flushes ALL dirty `delivery_seq` values | Bounds data loss on crash to 5 seconds |
+| **Clean disconnect** | SSE handler flushes THIS agent's `delivery_seq` immediately | Zero data loss on graceful close |
+| **Server shutdown** | Graceful shutdown flushes ALL dirty `delivery_seq` values before exit | Zero data loss on planned restart |
+| **Agent leave** | Flush this agent's `delivery_seq` for this conversation | Preserve accurate position for potential re-invite |
+| **`POST .../ack` received** | Synchronous upsert of `ack_seq` to Postgres, bypasses hot tier | Client has durability on return; ack must be immediately visible to the next `GET /agents/me/unread` |
 
-**Crash recovery:** Server crashes → in-memory cursors lost. Agent reconnects → server reads cursor from PostgreSQL (at most 5 seconds stale) → S2 read session starts from that position → agent re-receives up to ~150 events (5 sec × ~30 events/sec) → events carry sequence numbers for client-side deduplication. Textbook **at-least-once delivery**.
+**Crash recovery:** Server crashes → in-memory `delivery_seq` values lost (`ack_seq` is always durable, never cached). Agent reconnects → server reads `delivery_seq` from PostgreSQL (at most 5 seconds stale) → S2 read session starts from that position → agent re-receives up to ~150 events (5 sec × ~30 events/sec) → events carry sequence numbers for client-side deduplication. Textbook **at-least-once delivery**.
 
-**Cursor behavior on leave and re-invite:**
-* On leave: flush cursor to PostgreSQL, remove from in-memory cache, do NOT delete from PostgreSQL.
-* On re-invite + SSE connect: cache miss → fall back to PostgreSQL → cursor exists from before leave → resume from that position → agent catches up on messages sent while gone.
+**Cursor behavior on leave and re-invite (both cursors preserved):**
+* On leave: flush `delivery_seq` to PostgreSQL, remove from in-memory cache, do NOT delete the `cursors` row from PostgreSQL. `ack_seq` is already durable (never cached).
+* On re-invite + SSE connect: cache miss → fall back to PostgreSQL → `delivery_seq` exists from before leave → resume from that position → agent catches up on messages sent while gone.
+* On re-invite + `GET /agents/me/unread`: `ack_seq` is still what the agent last explicitly acknowledged. Any message that landed while the agent was gone is counted as unread.
 * This is better than deleting cursors (which would force re-reading the entire conversation from sequence 0).
 * The spec's "access to full conversation history" is satisfied by the S2 stream — agent CAN read from 0 via `?from=0`.
 
-**Delivery semantics:** At-least-once.
-* If server crashes between delivering an event and flushing the cursor, the event will be re-delivered on reconnect.
-* Events carry sequence numbers and message IDs. Clients can deduplicate if needed.
-* Why not exactly-once: requires client acknowledgments, adds protocol complexity, and at-least-once with idempotent processing is the industry standard for streaming systems.
+**Ack Cursor — Client-Controlled, Synchronous Write-Through:**
+
+The `ack_seq` column exists so the client has an authoritative cursor that reflects what it has actually *processed* (as opposed to what was merely delivered to the wire — that is `delivery_seq`'s job). It is advanced only by `POST /conversations/:cid/ack` with a `{"seq": N}` body.
+
+* **No hot tier.** The ack path does a direct UPSERT to Postgres with a regression-guard `WHERE cursors.ack_seq < EXCLUDED.ack_seq`. No in-memory cache, no batched flush.
+* **Why no hot tier.** Ack volume is orders of magnitude lower than event-delivery volume — a tail delivers 30–100 events/sec per conversation; a client typically acks once per message (or once per batch of passive-catch-up messages). A 5-second delay on ack durability would make `GET /agents/me/unread` lie — an agent that just acked seq 127 could get back a stale unread count including events ≤ 127. Correctness demands write-through.
+* **Regression is a silent no-op.** Out-of-order retry of the same ack, or a replay of a lower seq, leaves the row unchanged and returns 204. The server never reduces `ack_seq`.
+* **`ack_seq` and `delivery_seq` are independent.** `ack_seq` can be greater than `delivery_seq` (passive-catch-up reader that pulled assembled messages via `GET /conversations/:cid/messages` and acked the range without ever opening a tail). `ack_seq` can be less than `delivery_seq` (active tailer that has received events but not yet finished processing them). No invariant is enforced between them.
+
+**Delivery semantics:**
+* **For `delivery_seq` / tail delivery:** At-least-once. If server crashes between delivering an event and flushing `delivery_seq`, the event will be re-delivered on reconnect. Events carry sequence numbers and message IDs. Clients can deduplicate.
+* **For `ack_seq` / unread computation:** Exactly-what-you-acked. Synchronous write-through plus regression guard means the `ack_seq` visible to `GET /agents/me/unread` is always `max` of everything the client has ever durably acked.
+* Why not exactly-once on tail delivery: requires client acknowledgments coupled with delivery — adds protocol complexity for marginal gain. The split above gives clients exact control via `ack_seq` where it matters (unread tracking) without forcing ack-coupling on every tailed event.
 
 ---
 
 ### 1.8 Claude-Powered Agent
+
+**Scope note:** The resident agent's "always respond on `message_end` from another agent" policy described below is **resident-specific**. It is the policy of one particular in-process Claude-powered bot, not a service primitive. External agents adopt any consumption policy they want within the active/passive/wake-up model defined in §1.4 — nothing in the service forces an LLM invocation on any agent.
 
 **The spec requires:** "at least one Claude-powered agent running on it that we can converse with."
 

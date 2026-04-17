@@ -1456,7 +1456,7 @@ When running multiple instances behind a load balancer:
 **What needs changes:**
 - **Recovery sweep:** Multiple instances racing to abort the same in-progress messages. Harmless (duplicate `message_abort` is ignored by readers), but wasteful. Fix: add a distributed lock (Postgres advisory lock) or a "claimed_by" column on `in_progress_messages`.
 - **Resident agent:** Multiple instances each run their own agent, all listening to the same conversations, all responding to every message. The evaluator sees double/triple responses. Fix: leader election for agent ownership. Document in FUTURE.md.
-- **Cursor flush ticker:** Multiple instances flushing cursors for different SSE connections. No conflict — cursors are per-(agent, conversation), and each SSE connection is on one instance. The `WHERE cursors.seq_num < EXCLUDED.seq_num` clause prevents regression.
+- **Cursor flush ticker:** Multiple instances flushing `delivery_seq` for different SSE connections. No conflict — cursors are per-(agent, conversation), and each SSE connection is on one instance. The `WHERE cursors.delivery_seq < EXCLUDED.delivery_seq` regression guard on the batched upsert prevents out-of-order flushes from rewinding the cursor.
 - **ConnRegistry:** Instance-local. A leave request hitting Instance A can only cancel connections on Instance A. If the agent's SSE connection is on Instance B, Instance A's leave handler can't reach it. Fix: broadcast leave events via Postgres `LISTEN/NOTIFY` or Redis pub/sub.
 
 ### Billions of Agents

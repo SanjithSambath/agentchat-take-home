@@ -223,6 +223,7 @@ CREATE TABLE agents (
 CREATE TABLE conversations (
     id              UUID PRIMARY KEY,
     s2_stream_name  TEXT NOT NULL,
+    head_seq        BIGINT NOT NULL DEFAULT 0,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -241,15 +242,23 @@ CREATE TABLE members (
 -- For "list conversations for agent" queries
 CREATE INDEX idx_members_agent_id ON members(agent_id);
 
--- Cursors: server-managed read positions for at-least-once delivery
+-- Cursors: server-managed read positions for at-least-once delivery.
+-- Two cursors per (agent, conversation):
+--   delivery_seq  — advanced by the server as events are shipped over a tail (SSE).
+--                   Batched flush every 5s from an in-memory hot tier. Powers tail resume.
+--   ack_seq       — advanced only by explicit client POST /conversations/:cid/ack.
+--                   Synchronous write-through (no hot tier). Powers GET /agents/me/unread.
 -- No foreign keys — validated at API layer, and cursors may outlive membership
--- (preserved on leave for potential re-invite resume)
+-- (both preserved on leave for potential re-invite resume).
 CREATE TABLE cursors (
     agent_id         UUID NOT NULL,
     conversation_id  UUID NOT NULL,
-    seq_num          BIGINT NOT NULL DEFAULT 0,
+    delivery_seq     BIGINT NOT NULL DEFAULT 0,
+    ack_seq          BIGINT NOT NULL DEFAULT 0,
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (agent_id, conversation_id)
+    PRIMARY KEY (agent_id, conversation_id),
+    CHECK (delivery_seq >= 0),
+    CHECK (ack_seq >= 0)
 );
 ```
 
@@ -265,6 +274,7 @@ CREATE TABLE cursors (
 
 - **`s2_stream_name TEXT NOT NULL`:** Decouples conversation ID from S2 stream name. Format: `conv-{conversation_id}`. If we need to remap streams (migration, disaster recovery), we change this column without changing conversation IDs.
 - **`UNIQUE` index on `s2_stream_name`:** Prevents bugs where two conversations accidentally point to the same S2 stream. A constraint violation here means a code bug, not a user error.
+- **`head_seq BIGINT NOT NULL DEFAULT 0`:** Cached latest S2 sequence number for the conversation. Updated inline on every successful S2 append from the value returned by `AppendResult.LastSeqNum()`. This is the server-side source of truth for "what is the current tail of this conversation" — queried by `GET /agents/me/unread` and by the `ack_seq ≤ head_seq` validation in `POST /conversations/:cid/ack`. The alternative (querying S2 for every unread computation) would do an S2 round-trip per conversation per unread request; caching in Postgres collapses the unread query to one indexed SQL join. Drift window: a few milliseconds between S2 ack and the inline UPDATE — acceptable.
 
 #### `members`
 
@@ -283,9 +293,14 @@ CREATE TABLE cursors (
 #### `cursors`
 
 - **No foreign keys.** Cursor writes are on the performance-critical path. FK checks on every UPSERT add overhead (Postgres must verify agent and conversation exist). We validate at the API layer before any cursor operation.
-- **Cursors survive leave.** When an agent leaves, their cursor is preserved. On re-invite, they resume from where they left off — catching up on messages sent while they were gone. This is better UX than starting from sequence 0 (re-reading the entire conversation).
-- **`BIGINT` for `seq_num`.** S2 sequence numbers are 64-bit. `INTEGER` (32-bit, max ~2.1B) would overflow for a conversation with 30 tokens/sec sustained for ~2.3 years. `BIGINT` handles 64-bit values safely.
-- **PK order `(agent_id, conversation_id)`:** Optimized for disconnect cleanup — "flush all cursors for agent X" is a range scan on physically adjacent rows.
+- **Two independent cursors in one row.** `delivery_seq` and `ack_seq` are independent semantics colocated in a single row so that an unread query needs one indexed lookup, not a join between two tables. They never share a write path:
+  - `delivery_seq` — written by the tail delivery loop via the batched-flush hot tier (`unnest()` upsert every 5s). Carries an `WHERE delivery_seq < EXCLUDED.delivery_seq` regression guard. Updated at event-delivery rate (tens to hundreds per second per tail).
+  - `ack_seq` — written synchronously by the `POST /conversations/:cid/ack` handler. No hot tier. Carries an `WHERE ack_seq < EXCLUDED.ack_seq` regression guard. Updated only when the client explicitly acks (low volume, correctness-critical).
+- **No invariant between `delivery_seq` and `ack_seq`.** `ack_seq` can exceed `delivery_seq` (passive reader that caught up via `GET /conversations/:cid/messages` and acked without ever opening a tail) or trail it (active tailer that received events but has not yet processed/acked). Both cursors are individually bounded by `conversations.head_seq`.
+- **Both cursors survive leave.** When an agent leaves, neither `delivery_seq` nor `ack_seq` is deleted. On re-invite, the agent resumes tails from `delivery_seq` and gets an accurate unread count from `ack_seq`. This is better UX than resetting to 0 (which would force re-reading the entire conversation).
+- **`BIGINT` for both seq columns.** S2 sequence numbers are 64-bit. `INTEGER` (32-bit, max ~2.1B) would overflow for a conversation with 30 tokens/sec sustained for ~2.3 years. `BIGINT` handles 64-bit values safely.
+- **`CHECK (delivery_seq >= 0)` and `CHECK (ack_seq >= 0)`.** Defense-in-depth against negative sequence bugs. S2 sequences start at 0.
+- **PK order `(agent_id, conversation_id)`:** Optimized for disconnect cleanup — "flush all cursors for agent X" is a range scan on physically adjacent rows. Also the ideal layout for the `GET /agents/me/unread` join, which starts from `members` (agent_id-indexed) and probes this table by `(agent_id, conversation_id)`.
 
 ### Why No Additional Tables
 
@@ -346,22 +361,31 @@ The SSE handler touches the database exactly twice (connect + disconnect), and b
 
 ### Architecture Diagram
 
+Two cursors per `(agent, conversation)` — `delivery_seq` (two-tier, batched) and `ack_seq` (single-tier, synchronous). Only `delivery_seq` is cached in memory; `ack_seq` writes go straight to Postgres.
+
 ```text
                     In-Memory (Hot Tier)                     PostgreSQL (Warm Tier)
-                    ────────────────────                     ──────────────────────
+                    ────────────────────                     ──────────────────────────
 SSE event delivered
         │
         ▼
-┌─────────────────────┐                              ┌──────────────────────────┐
-│   CursorCache       │     every 5 seconds          │   cursors table          │
-│   sync.RWMutex      │  ─────────────────────────→  │   (agent_id, conv_id,    │
-│   map[key]entry     │     batch UPSERT via         │    seq_num, updated_at)  │
-│   dirty set         │     unnest() arrays          │                          │
-└─────────────────────┘                              └──────────────────────────┘
-        │                                                       ↑
-        │  on disconnect / leave                                │
-        └───────────────────────────────────────────────────────┘
-                    immediate single flush
+┌─────────────────────┐                              ┌──────────────────────────────┐
+│   CursorCache       │    every 5 seconds           │   cursors table              │
+│   sync.RWMutex      │ ───────────────────────────→ │   (agent_id, conv_id,        │
+│   map[key]entry     │    batch UPSERT delivery_seq │    delivery_seq, ack_seq,    │
+│   (delivery_seq)    │    via unnest() arrays       │    updated_at)               │
+│   dirty set         │                              │                              │
+└─────────────────────┘                              │                              │
+        │                                            │                              │
+        │  on disconnect / leave                     │                              │
+        │  immediate single delivery_seq flush       │                              │
+        └───────────────────────────────────────────▶│                              │
+                                                     │                              │
+POST /conversations/:cid/ack                         │                              │
+        │  synchronous write-through,                │                              │
+        │  bypasses hot tier                         │                              │
+        └───────────────────────────────────────────▶│   (ack_seq UPSERT)           │
+                                                     └──────────────────────────────┘
 ```
 
 ### Hot Tier: In-Memory Map
@@ -373,8 +397,8 @@ type cursorKey struct {
 }
 
 type cursorEntry struct {
-    SeqNum    uint64
-    UpdatedAt time.Time
+    DeliverySeq uint64    // written on every tail event delivery; batched-flushed
+    UpdatedAt   time.Time
 }
 
 type CursorCache struct {
@@ -384,85 +408,140 @@ type CursorCache struct {
 }
 ```
 
+**Scope of the hot tier:** only `delivery_seq` is cached. `ack_seq` is not tracked in memory — every `POST /conversations/:cid/ack` writes directly to Postgres (see §7 "Ack Path" below). Mixing them would force the ack handler to coordinate with the flush goroutine; keeping them separate keeps each path simple and correct.
+
 **Why `sync.RWMutex` + regular map, not `sync.Map`:**
 
 `sync.Map` is optimized for two patterns: (1) write-once-read-many, or (2) disjoint key sets per goroutine. Cursor updates are write-heavy from many goroutines on overlapping keys — neither pattern applies. A `sync.RWMutex` gives predictable performance.
 
 **At extreme scale (>100K concurrent SSE connections):** Shard the map into 64 buckets keyed by `hash(agent_id) % 64`. Each bucket has its own `sync.RWMutex`. This reduces lock contention to 1/64th. Not implemented now — document as scaling optimization.
 
-### Warm Tier: Batched PostgreSQL Flush
+### Warm Tier: Batched PostgreSQL Flush (`delivery_seq` only)
 
 **Flush SQL (unnest batch upsert):**
 ```sql
-INSERT INTO cursors (agent_id, conversation_id, seq_num, updated_at)
+INSERT INTO cursors (agent_id, conversation_id, delivery_seq, updated_at)
 SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::bigint[], $4::timestamptz[])
 ON CONFLICT (agent_id, conversation_id)
-DO UPDATE SET seq_num = EXCLUDED.seq_num, updated_at = EXCLUDED.updated_at
-WHERE cursors.seq_num < EXCLUDED.seq_num;
+DO UPDATE SET delivery_seq = EXCLUDED.delivery_seq, updated_at = EXCLUDED.updated_at
+WHERE cursors.delivery_seq < EXCLUDED.delivery_seq;
 ```
 
-**The `WHERE cursors.seq_num < EXCLUDED.seq_num` clause is critical.** It prevents a stale flush from regressing a cursor. Scenario: server A flushes cursor at seq 100. Server B (after failover) flushes stale cursor at seq 80. Without the WHERE clause, cursor regresses to 80 and the agent re-receives 20 events unnecessarily. With it, the stale flush is a no-op.
+**The `WHERE cursors.delivery_seq < EXCLUDED.delivery_seq` clause is critical.** It prevents a stale flush from regressing the cursor. Scenario: server A flushes cursor at seq 100. Server B (after failover) flushes stale cursor at seq 80. Without the WHERE clause, cursor regresses to 80 and the agent re-receives 20 events unnecessarily. With it, the stale flush is a no-op.
+
+**The upsert does NOT touch `ack_seq`.** `DO UPDATE SET` lists only `delivery_seq` and `updated_at`. If the row does not yet exist, it is inserted with `ack_seq = 0` (schema default). If it exists, `ack_seq` is left alone — the ack handler owns that column.
 
 **Performance:** A single `unnest()` upsert of 10,000 rows completes in ~5-20ms. Even at 100K active cursors, a single flush takes <100ms — well within the 5-second interval.
+
+### Ack Path: Synchronous Write-Through
+
+`POST /conversations/:cid/ack` with `{"seq": N}` performs an immediate single-row upsert — no cache, no batching:
+
+```sql
+INSERT INTO cursors (agent_id, conversation_id, ack_seq, updated_at)
+VALUES ($1, $2, $3, now())
+ON CONFLICT (agent_id, conversation_id)
+DO UPDATE SET ack_seq = EXCLUDED.ack_seq, updated_at = EXCLUDED.updated_at
+WHERE cursors.ack_seq < EXCLUDED.ack_seq;
+```
+
+**Why no hot tier for `ack_seq`:**
+- **Volume.** Ack volume is orders of magnitude lower than event-delivery volume. A batched-flush design is unjustified at this scale.
+- **Correctness.** `GET /agents/me/unread` consults `ack_seq` directly from Postgres. A 5-second flush delay would make the unread view lie — an agent that just acked seq 127 could get back a count including events ≤ 127 on the very next call.
+- **Simplicity.** Separating the two write paths removes all coordination between the ack handler and the flush goroutine. No lock-order concerns, no dirty-bit contention.
+
+**Regression guard.** Same `WHERE cursors.ack_seq < EXCLUDED.ack_seq` pattern — replayed or out-of-order acks are silent no-ops, never un-acks.
+
+**Validation.** `seq > head_seq` is rejected with 400 before the UPSERT runs (checked in the handler against `conversations.head_seq`). `seq < 0` is rejected at JSON deserialization time by schema validation.
 
 ### Flush Triggers
 
 | Trigger | What happens | Why |
 |---|---|---|
-| **Periodic (every 5 sec)** | Background goroutine flushes ALL dirty cursors | Bounds data loss on crash to 5 seconds |
-| **Clean disconnect** | SSE handler flushes THIS agent's cursor immediately | Zero data loss on graceful close |
-| **Server shutdown** | Graceful shutdown flushes ALL dirty cursors before exit | Zero data loss on planned restart |
-| **Agent leave** | Flush this agent's cursor for this conversation | Preserve accurate position for potential re-invite |
+| **Periodic (every 5 sec)** | Background goroutine flushes ALL dirty `delivery_seq` values | Bounds data loss on crash to 5 seconds |
+| **Clean disconnect** | SSE handler flushes THIS agent's `delivery_seq` immediately | Zero data loss on graceful close |
+| **Server shutdown** | Graceful shutdown flushes ALL dirty `delivery_seq` values before exit | Zero data loss on planned restart |
+| **Agent leave** | Flush this agent's `delivery_seq` for this conversation | Preserve accurate position for potential re-invite |
+| **`POST .../ack` received** | Synchronous single-row `ack_seq` UPSERT, bypasses hot tier | Client has durability on return; next `/unread` reflects the ack |
 
 ### Crash Recovery
 
-Server crashes → in-memory cursors lost. Recovery:
+Server crashes → in-memory `delivery_seq` values lost (`ack_seq` is always durable, never cached). Recovery:
 1. Agent reconnects via SSE
-2. Server reads cursor from Postgres: last flushed value (at most 5 seconds stale)
-3. S2 read session starts from that cursor position
+2. Server reads `delivery_seq` from Postgres: last flushed value (at most 5 seconds stale)
+3. S2 read session starts from that position
 4. Agent re-receives up to ~150 events (5 sec × ~30 events/sec)
 5. Events carry sequence numbers → client deduplicates trivially
 
 This is textbook **at-least-once delivery** — the industry standard for streaming systems.
 
-### Cursor Behavior on Leave and Re-Invite
+### Cursor Behavior on Leave and Re-Invite (both cursors preserved)
 
 **On leave:**
-1. Flush cursor to Postgres (preserve last known position)
-2. Remove from in-memory cache
-3. Do NOT delete from Postgres
+1. Flush `delivery_seq` to Postgres (preserve last known position). `ack_seq` is already durable — nothing to flush.
+2. Remove from in-memory cache.
+3. Do NOT delete the `cursors` row from Postgres.
 
 **On re-invite + SSE connect:**
-1. Check in-memory cache (miss — agent wasn't connected)
-2. Fall back to Postgres — cursor exists from before leave
-3. Resume from that position
-4. Agent catches up on all messages sent while they were gone
+1. Check in-memory cache (miss — agent wasn't connected).
+2. Fall back to Postgres — row exists from before leave with both `delivery_seq` and `ack_seq` intact.
+3. Resume tailing from `delivery_seq`.
+4. Agent catches up on all messages sent while they were gone.
+
+**On re-invite + `GET /agents/me/unread`:**
+1. The join reads `ack_seq` directly from Postgres (same value as before leave).
+2. Any message that landed on the conversation while the agent was gone shows up as unread (`head_seq - ack_seq > 0`).
+3. The agent can then catch up via `GET /conversations/:cid/messages?from=<ack_seq>` and ack.
 
 **Why this is better than deleting cursors on leave:**
 
-If we deleted cursors, a re-invited agent starts from sequence 0 — re-reading the ENTIRE conversation history. For a long conversation with 100K events, that's a massive unnecessary replay. Preserving the cursor means they only replay what they missed while gone.
+If we deleted cursors, a re-invited agent starts from sequence 0 — re-reading the ENTIRE conversation history, AND losing its ack state so the unread count is inflated to "everything." For a long conversation with 100K events, that's a massive unnecessary replay and a broken unread view. Preserving both cursors means they only replay/count what they missed while gone.
 
-The spec says "when an agent is added, it has access to the full conversation history." This is satisfied by the S2 stream containing all events — the agent CAN read from 0 by passing `?from=0` on the SSE endpoint. But the default (resume from cursor) is better UX.
+The spec says "when an agent is added, it has access to the full conversation history." This is satisfied by the S2 stream containing all events — the agent CAN read from 0 by passing `?from=0` on the SSE endpoint. But the default (resume from cursors) is better UX.
 
 ### Interface
 
 ```go
 type CursorStore interface {
-    // GetCursor reads from memory first, falls back to Postgres.
-    // Returns 0 if no cursor exists (start from beginning).
-    GetCursor(ctx context.Context, agentID, convID uuid.UUID) (uint64, error)
+    // --- Delivery cursor (tail resume; two-tier, batched) ---
 
-    // UpdateCursor writes to memory only. No I/O, cannot fail, does not block.
-    UpdateCursor(agentID, convID uuid.UUID, seqNum uint64)
+    // GetDeliveryCursor reads delivery_seq: memory first, Postgres fallback.
+    // Returns 0 if no row exists (start tail from beginning).
+    GetDeliveryCursor(ctx context.Context, agentID, convID uuid.UUID) (uint64, error)
 
-    // FlushOne flushes a single cursor to Postgres (on disconnect/leave).
+    // UpdateDeliveryCursor writes to memory only. No I/O, cannot fail, does not block.
+    // Batched flush to Postgres by the background goroutine.
+    UpdateDeliveryCursor(agentID, convID uuid.UUID, seqNum uint64)
+
+    // FlushOne flushes a single agent's delivery_seq to Postgres (on disconnect/leave).
     FlushOne(ctx context.Context, agentID, convID uuid.UUID) error
 
-    // FlushAll flushes all dirty cursors to Postgres (periodic/shutdown).
+    // FlushAll flushes all dirty delivery_seq values to Postgres (periodic/shutdown).
     FlushAll(ctx context.Context) error
 
-    // Start begins the background flush goroutine. Blocks until ctx is canceled.
+    // Start begins the background delivery_seq flush goroutine. Blocks until ctx is canceled.
     Start(ctx context.Context)
+
+    // --- Ack cursor (client-controlled; single-tier, synchronous) ---
+
+    // Ack performs a synchronous write-through UPSERT of ack_seq.
+    // Regression-guarded: seq < current ack_seq is a silent no-op.
+    // Returns ErrAckBeyondHead if seq > head_seq of the conversation.
+    Ack(ctx context.Context, agentID, convID uuid.UUID, seq uint64) error
+
+    // GetAckCursor reads ack_seq directly from Postgres. Returns 0 if no row exists.
+    GetAckCursor(ctx context.Context, agentID, convID uuid.UUID) (uint64, error)
+
+    // ListUnreadForAgent returns every conversation the agent is a member of where
+    // head_seq > ack_seq, ordered by head_seq DESC. Default limit 100, max 500.
+    ListUnreadForAgent(ctx context.Context, agentID uuid.UUID, limit int32) ([]UnreadEntry, error)
+}
+
+type UnreadEntry struct {
+    ConversationID uuid.UUID
+    HeadSeq        uint64
+    AckSeq         uint64
+    EventDelta     uint64 // head_seq - ack_seq
 }
 ```
 
@@ -771,11 +850,24 @@ type MembershipService interface {
 }
 
 type CursorStore interface {
-    GetCursor(ctx context.Context, agentID, convID uuid.UUID) (uint64, error)
-    UpdateCursor(agentID, convID uuid.UUID, seqNum uint64)
+    // Delivery cursor (two-tier, batched). See §7 for full semantics.
+    GetDeliveryCursor(ctx context.Context, agentID, convID uuid.UUID) (uint64, error)
+    UpdateDeliveryCursor(agentID, convID uuid.UUID, seqNum uint64)
     FlushOne(ctx context.Context, agentID, convID uuid.UUID) error
     FlushAll(ctx context.Context) error
     Start(ctx context.Context)
+
+    // Ack cursor (single-tier, synchronous). See §7 for full semantics.
+    Ack(ctx context.Context, agentID, convID uuid.UUID, seq uint64) error
+    GetAckCursor(ctx context.Context, agentID, convID uuid.UUID) (uint64, error)
+    ListUnreadForAgent(ctx context.Context, agentID uuid.UUID, limit int32) ([]UnreadEntry, error)
+}
+
+type UnreadEntry struct {
+    ConversationID uuid.UUID
+    HeadSeq        uint64
+    AckSeq         uint64
+    EventDelta     uint64
 }
 ```
 
@@ -813,13 +905,24 @@ SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1);
 
 ```sql
 -- name: CreateConversation :exec
-INSERT INTO conversations (id, s2_stream_name, created_at) VALUES ($1, $2, now());
+INSERT INTO conversations (id, s2_stream_name, head_seq, created_at)
+VALUES ($1, $2, 0, now());
 
 -- name: GetConversation :one
-SELECT id, s2_stream_name, created_at FROM conversations WHERE id = $1;
+SELECT id, s2_stream_name, head_seq, created_at FROM conversations WHERE id = $1;
 
 -- name: ConversationExists :one
 SELECT EXISTS(SELECT 1 FROM conversations WHERE id = $1);
+
+-- name: GetConversationHeadSeq :one
+SELECT head_seq FROM conversations WHERE id = $1;
+
+-- name: UpdateConversationHeadSeq :exec
+-- Called inline with every successful S2 append using AppendResult.LastSeqNum().
+-- Regression-guarded: an out-of-order write cannot rewind head_seq.
+UPDATE conversations
+SET head_seq = $2
+WHERE id = $1 AND head_seq < $2;
 ```
 
 ### members.sql
@@ -859,18 +962,51 @@ SELECT agent_id FROM members WHERE conversation_id = $1;
 ### cursors.sql
 
 ```sql
--- name: GetCursor :one
-SELECT seq_num FROM cursors WHERE agent_id = $1 AND conversation_id = $2;
+-- name: GetDeliveryCursor :one
+SELECT delivery_seq FROM cursors WHERE agent_id = $1 AND conversation_id = $2;
 
--- name: UpsertCursor :exec
-INSERT INTO cursors (agent_id, conversation_id, seq_num, updated_at)
+-- name: GetAckCursor :one
+SELECT ack_seq FROM cursors WHERE agent_id = $1 AND conversation_id = $2;
+
+-- name: UpsertDeliveryCursor :exec
+-- Single-row delivery_seq UPSERT for disconnect/leave/shutdown flush of one agent.
+-- Does NOT touch ack_seq.
+INSERT INTO cursors (agent_id, conversation_id, delivery_seq, updated_at)
 VALUES ($1, $2, $3, now())
 ON CONFLICT (agent_id, conversation_id)
-DO UPDATE SET seq_num = $3, updated_at = now()
-WHERE cursors.seq_num < $3;
+DO UPDATE SET delivery_seq = EXCLUDED.delivery_seq, updated_at = EXCLUDED.updated_at
+WHERE cursors.delivery_seq < EXCLUDED.delivery_seq;
+
+-- name: AckCursor :exec
+-- Synchronous write-through UPSERT for POST /conversations/:cid/ack.
+-- Does NOT touch delivery_seq. Regression-guarded: replayed/out-of-order acks
+-- are silent no-ops. Handler validates seq <= conversations.head_seq before calling.
+INSERT INTO cursors (agent_id, conversation_id, ack_seq, updated_at)
+VALUES ($1, $2, $3, now())
+ON CONFLICT (agent_id, conversation_id)
+DO UPDATE SET ack_seq = EXCLUDED.ack_seq, updated_at = EXCLUDED.updated_at
+WHERE cursors.ack_seq < EXCLUDED.ack_seq;
+
+-- name: ListUnreadForAgent :many
+-- Powers GET /agents/me/unread. Single indexed join: members (agent-indexed)
+-- joined against conversations (PK) and LEFT JOIN cursors. Filters to only
+-- conversations with unread events (head_seq > ack_seq).
+SELECT c.id                                         AS conversation_id,
+       c.head_seq                                   AS head_seq,
+       COALESCE(k.ack_seq, 0)                       AS ack_seq,
+       c.head_seq - COALESCE(k.ack_seq, 0)          AS event_delta
+FROM members m
+JOIN conversations c ON c.id = m.conversation_id
+LEFT JOIN cursors k
+       ON k.agent_id = m.agent_id
+      AND k.conversation_id = m.conversation_id
+WHERE m.agent_id = $1
+  AND c.head_seq > COALESCE(k.ack_seq, 0)
+ORDER BY c.head_seq DESC
+LIMIT $2;
 ```
 
-**Batch cursor flush uses raw pgx (not sqlc)** because it requires `unnest()` with array parameters.
+**Batch delivery_seq flush uses raw pgx (not sqlc)** because it requires `unnest()` with array parameters. The single-row `UpsertDeliveryCursor` above is for disconnect/leave/shutdown paths; the periodic flush goroutine uses a hand-written `unnest()` upsert (see §7).
 
 ---
 

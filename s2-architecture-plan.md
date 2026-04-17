@@ -399,8 +399,8 @@ func (h *Handler) SSEStream(w http.ResponseWriter, r *http.Request) {
         fmt.Fprintf(w, "data: %s\n\n", event.Data)
         flusher.Flush()
 
-        // Update cursor in memory (batched flush to Postgres every 5s)
-        h.cursors.UpdateCursor(agentID, convID, rec.SeqNum)
+        // Update delivery_seq in memory (batched flush to Postgres every 5s)
+        h.cursors.UpdateDeliveryCursor(agentID, convID, rec.SeqNum)
     }
 
     // Session ended — check why
@@ -443,8 +443,8 @@ func (h *Handler) resolveStartPosition(ctx context.Context, r *http.Request, age
         return seq + 1  // resume AFTER the last received event
     }
 
-    // Priority 3: stored cursor (in-memory cache → Postgres fallback)
-    seq, err := h.cursors.GetCursor(ctx, agentID, convID)
+    // Priority 3: stored delivery_seq (in-memory cache → Postgres fallback)
+    seq, err := h.cursors.GetDeliveryCursor(ctx, agentID, convID)
     if err == nil && seq > 0 {
         return seq + 1  // resume AFTER the last delivered event
     }

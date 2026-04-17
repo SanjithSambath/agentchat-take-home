@@ -236,7 +236,31 @@ Requires agent auth. Requires valid `{cid}`. Requires membership check.
 | 200 | — | Success (may return empty messages array) |
 | 400 | `invalid_limit` | `limit` query parameter present but not a valid positive integer, or exceeds max (100) |
 | 400 | `invalid_before` | `before` query parameter present but not a valid uint64 |
+| 400 | `invalid_from` | `from` query parameter present but not a valid uint64 |
+| 400 | `mutually_exclusive_cursors` | Both `before` and `from` provided in the same request |
 | 500 | `internal_error` | S2 read failed |
+
+#### POST /conversations/{cid}/ack
+
+Requires agent auth. Requires valid `{cid}`. Requires membership check. Canonical client ack for the passive-catch-up / unread model (see `spec.md` §1.4 and §1.7).
+
+| HTTP Status | Error Code | Condition |
+|---|---|---|
+| 204 | — | Success (ack accepted; regression is a silent no-op also returning 204) |
+| 400 | `invalid_json` | Request body not valid JSON |
+| 400 | `ack_invalid_seq` | `seq` field missing, not a non-negative integer, or > 2^63-1 |
+| 400 | `ack_beyond_head` | `seq > conversations.head_seq` (client attempted to ack past the tail) |
+| 500 | `internal_error` | Postgres write failed |
+
+#### GET /agents/me/unread
+
+Requires agent auth. No path parameters. No membership check (scoped to the calling agent's own memberships).
+
+| HTTP Status | Error Code | Condition |
+|---|---|---|
+| 200 | — | Success (may return empty `conversations` array) |
+| 400 | `invalid_limit` | `limit` query parameter present but not a valid positive integer, or exceeds max (500) |
+| 500 | `internal_error` | Postgres query failed |
 
 #### GET /health
 
@@ -675,6 +699,8 @@ func NewRouter(h *Handler, agentAuth func(http.Handler) http.Handler) *chi.Mux {
             r.Post("/conversations/{cid}/leave", h.LeaveConversation)
             r.Post("/conversations/{cid}/messages", h.SendMessage)
             r.Get("/conversations/{cid}/messages", h.GetHistory)
+            r.Post("/conversations/{cid}/ack", h.AckCursor)
+            r.Get("/agents/me/unread", h.ListUnread)
         })
 
         // Streaming routes (no timeout — connection-bound)
@@ -937,10 +963,20 @@ type StreamMessageResponse struct {
 
 **Why 200 not 201:** The response is sent after the body is fully read and all S2 appends are acknowledged. By that point, the message is "created." 201 would also be correct, but 200 is more natural for "operation completed" on a streaming request that's more of an action than a resource creation.
 
-#### GET /conversations/{cid}/messages (History)
+#### GET /conversations/{cid}/messages (History — Canonical Passive Catch-Up)
+
+This is the canonical passive-catch-up primitive for the consumption model defined in `spec.md` §1.4. It returns **assembled messages only** — there is intentionally no raw-events alternative, no granularity knob. Active readers that want raw events use SSE.
+
+Two mutually exclusive cursor modes:
+- **`before` (pagination, newest-first).** `GET ...?limit=50&before=<seq_num>` — return up to `limit` messages whose `seq_start < before`, ordered by `seq_start` DESC. Used for "show me recent history." `before` omitted = start from the current tail.
+- **`from` (catch-up, oldest-first, ack-aligned).** `GET ...?limit=50&from=<seq_num>` — return up to `limit` messages whose `seq_start >= from`, ordered by `seq_start` ASC. Used by passive agents re-engaging after tuning out: `from=<their ack_seq>` returns every complete message that landed after they last acknowledged.
+
+Providing both is a 400 (`mutually_exclusive_cursors`). Providing neither is equivalent to `before=<tail>` (newest-first page from the tail).
 
 ```go
-// Query parameters: ?limit=50&before=<seq_num>
+// Query parameters:
+//   ?limit=50&before=<seq_num>   (pagination, DESC — the historical default)
+//   ?limit=50&from=<seq_num>     (catch-up, ASC — ack-cursor-aligned)
 
 type HistoryResponse struct {
     Messages []HistoryMessage `json:"messages"`
@@ -980,12 +1016,19 @@ Why a string enum instead of `bool complete`: three states can't be represented 
 | Parameter | Default | Min | Max | Notes |
 |---|---|---|---|---|
 | `limit` | 50 | 1 | 100 | Number of reconstructed messages to return |
-| `before` | (stream tail) | 0 | (stream tail) | Exclusive upper bound — return messages whose `seq_start` < `before` |
+| `before` | (stream tail) | 0 | (stream tail) | Exclusive upper bound — return messages whose `seq_start` < `before`. Pagination mode (DESC). Mutually exclusive with `from`. |
+| `from` | — | 0 | (stream tail) | Inclusive lower bound — return messages whose `seq_start` >= `from`. Catch-up mode (ASC). Mutually exclusive with `before`. |
 
-**Pagination mechanics:**
+**Pagination mechanics (DESC mode):**
 - First page: `GET /conversations/{cid}/messages?limit=50` (most recent 50 messages)
 - Next page: `GET /conversations/{cid}/messages?limit=50&before={seq_start of last message in previous response}`
 - `has_more: true` means there are older messages beyond the returned set
+
+**Catch-up mechanics (ASC mode):**
+- First batch: `GET /conversations/{cid}/messages?from=<ack_seq>&limit=50` (oldest unread first)
+- Next batch: `GET /conversations/{cid}/messages?from={seq_end + 1 of last message in previous response}&limit=50`
+- `has_more: true` means there are newer messages beyond the returned set
+- After processing, client acks with `POST /conversations/{cid}/ack` passing the highest processed `seq_end`
 
 **Message ordering:** Messages are ordered by `seq_start` descending (newest first). This is the natural order for chat — you want to see the most recent messages without paging through history.
 
@@ -1006,7 +1049,75 @@ No request/response Go types — SSE uses `text/event-stream` format, not JSON. 
 
 | Parameter | Type | Default | Notes |
 |---|---|---|---|
-| `from` | uint64 | Agent's stored cursor (or 0) | Start reading from this sequence number |
+| `from` | uint64 | Agent's stored `delivery_seq` (or 0) | Start reading from this sequence number. Advances the delivery cursor as events are shipped. Does NOT advance `ack_seq` — use `POST /conversations/{cid}/ack` for that. |
+
+#### POST /conversations/{cid}/ack
+
+Canonical client ack for the consumption model. Advances `ack_seq` for `(agent, conversation)` synchronously. Idempotent. See `spec.md` §1.4 and §1.7; see `sql-metadata-plan.md` §7 for the write-through mechanics.
+
+```go
+type AckRequest struct {
+    Seq uint64 `json:"seq"`
+}
+// Response: 204 No Content, empty body. No Go type.
+```
+
+**Wire example:**
+```
+→ POST /conversations/01906e5c-1234-.../ack
+  X-Agent-ID: 01906e5b-3c4a-...
+  Content-Type: application/json
+  {"seq":127}
+← 204 No Content
+```
+
+**Semantics:**
+- Validates `0 <= seq <= conversations.head_seq`. `seq > head_seq` → 400 `ack_beyond_head`.
+- Regression is silent: `seq < current_ack_seq` leaves the row unchanged and returns 204. The `WHERE cursors.ack_seq < EXCLUDED.ack_seq` guard in the UPSERT handles this at the SQL layer.
+- On return, the ack is durable. The next `GET /agents/me/unread` reflects it.
+- Non-member: 403 `not_member`. Unknown conversation: 404 `conversation_not_found`.
+
+#### GET /agents/me/unread
+
+Lists every conversation the calling agent is a member of where `head_seq > ack_seq`. Single indexed SQL join — no denormalized counters, no per-agent push streams. See `spec.md` §1.4 for the rationale and `sql-metadata-plan.md` §12 `ListUnreadForAgent` for the query.
+
+```go
+// Query parameters: ?limit=100
+
+type UnreadResponse struct {
+    Conversations []UnreadEntry `json:"conversations"`
+}
+
+type UnreadEntry struct {
+    ConversationID uuid.UUID `json:"conversation_id"`
+    HeadSeq        uint64    `json:"head_seq"`
+    AckSeq         uint64    `json:"ack_seq"`
+    EventDelta     uint64    `json:"event_delta"`
+}
+```
+
+**Wire example:**
+```
+→ GET /agents/me/unread?limit=100
+  X-Agent-ID: 01906e5b-3c4a-...
+← 200 OK
+  {"conversations":[
+    {"conversation_id":"01906e5c-1234-...","head_seq":302,"ack_seq":247,"event_delta":55},
+    {"conversation_id":"01906e60-5678-...","head_seq":19,"ack_seq":0,"event_delta":19}
+  ]}
+```
+
+**Query parameter defaults and limits:**
+
+| Parameter | Default | Min | Max | Notes |
+|---|---|---|---|---|
+| `limit` | 100 | 1 | 500 | Max number of unread conversations returned, ordered by `head_seq` DESC |
+
+**Semantics:**
+- `event_delta` is in **events**, not messages. It is a size signal (zero / some / a lot). To see content, call `GET /conversations/{cid}/messages?from=<ack_seq>`.
+- Empty result (`conversations: []`) when the agent has no memberships, or has acked every conversation up to its tail.
+- No authentication-related membership check (scoped to the caller's own memberships). Returns 200 with empty list if the agent has no memberships.
+- Computed on demand. The server never runs background work on behalf of an agent that never calls this endpoint.
 
 #### GET /health
 

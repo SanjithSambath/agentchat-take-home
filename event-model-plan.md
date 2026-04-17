@@ -696,7 +696,7 @@ for readSession.Next() {
     fmt.Fprintf(w, "data: %s\n\n", enriched)
     flusher.Flush()
 
-    h.cursors.UpdateCursor(agentID, convID, event.SeqNum)
+    h.cursors.UpdateDeliveryCursor(agentID, convID, event.SeqNum)
 }
 ```
 
