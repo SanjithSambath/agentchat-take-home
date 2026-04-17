@@ -6,6 +6,8 @@ import (
 	"runtime/debug"
 	"time"
 
+	"agentmail/internal/store"
+
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -138,6 +140,51 @@ func (sw *statusWriter) Write(b []byte) (int, error) {
 		sw.wroteHeader = true
 	}
 	return sw.ResponseWriter.Write(b)
+}
+
+// Unwrap exposes the underlying ResponseWriter so http.NewResponseController
+// can reach Flusher/Hijacker/SetReadDeadline on the concrete writer beneath
+// this middleware.
+func (sw *statusWriter) Unwrap() http.ResponseWriter {
+	return sw.ResponseWriter
+}
+
+// AgentAuth validates the X-Agent-ID header: present, well-formed UUID, and
+// matching a real agent row per the store's cached existence check. On
+// success the resolved uuid.UUID is attached to the context via WithAgentID
+// so handlers can retrieve it with AgentIDFromContext. Mounted on the
+// authenticated route group in NewRouter; the unauthenticated group
+// (POST /agents, GET /agents/resident, GET /health) skips it.
+func AgentAuth(meta store.MetadataStore) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			raw := r.Header.Get("X-Agent-ID")
+			if raw == "" {
+				WriteError(w, r, http.StatusBadRequest, CodeMissingAgentID,
+					"X-Agent-ID header is required")
+				return
+			}
+			id, err := uuid.Parse(raw)
+			if err != nil {
+				WriteError(w, r, http.StatusBadRequest, CodeInvalidAgentID,
+					"X-Agent-ID must be a valid UUID")
+				return
+			}
+			exists, err := meta.AgentExists(r.Context(), id)
+			if err != nil {
+				log.Ctx(r.Context()).Error().Err(err).Msg("agent auth: store check failed")
+				WriteError(w, r, http.StatusInternalServerError, CodeInternalError, "internal server error")
+				return
+			}
+			if !exists {
+				WriteError(w, r, http.StatusNotFound, CodeAgentNotFound,
+					"agent not found; POST /agents to register")
+				return
+			}
+			ctx := WithAgentID(r.Context(), id)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
 }
 
 // Ensure zerolog package is referenced so unused-import lint stays silent

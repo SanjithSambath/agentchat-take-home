@@ -59,14 +59,35 @@ const (
 	CodeLineTooLarge     = "line_too_large"
 
 	// Conversation ops
-	CodeInviteeNotFound       = "invitee_not_found"
-	CodeLastMember            = "last_member"
-	CodeResidentUnavailable   = "resident_agent_unavailable"
+	CodeInviteeNotFound     = "invitee_not_found"
+	CodeLastMember          = "last_member"
+	CodeResidentUnavailable = "resident_agent_unavailable"
 
 	// Generic request body
 	CodeMissingField = "missing_field"
 	CodeInvalidField = "invalid_field"
 	CodeUnknownField = "unknown_field"
+	CodeEmptyBody    = "empty_body"
+
+	// Router-level
+	CodeNotFound = "not_found"
+	CodeTimeout  = "timeout"
+
+	// History / cursors / ack
+	CodeMutuallyExclusiveCursors = "mutually_exclusive_cursors"
+	CodeInvalidFrom              = "invalid_from"
+	CodeInvalidBefore            = "invalid_before"
+	CodeInvalidLimit             = "invalid_limit"
+	CodeAckInvalidSeq            = "ack_invalid_seq"
+	CodeAckBeyondHead            = "ack_beyond_head"
+
+	// Streaming lifecycle
+	CodeIdleTimeout        = "idle_timeout"
+	CodeMaxDuration        = "max_duration"
+	CodeInProgressConflict = "in_progress_conflict"
+
+	// Post-SSE-headers error event
+	CodeS2ReadError = "s2_read_error"
 )
 
 // WriteError serializes an APIError at the given HTTP status. It never

@@ -1,4 +1,4 @@
-.PHONY: help build run test tidy sqlc lint clean fmt
+.PHONY: help build run test test-integration tidy sqlc lint clean fmt
 
 BINARY := bin/server
 PKG    := ./...
@@ -15,6 +15,10 @@ run: ## Run the server locally (reads .env via dotenv, falls back to process env
 
 test: ## Run unit tests.
 	go test $(PKG) -race -count=1
+
+test-integration: ## Run integration tests against live Neon/S2/Anthropic (reads .env).
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	go test ./tests/... -race -count=1 -tags integration -timeout 120s
 
 tidy: ## Run go mod tidy.
 	go mod tidy

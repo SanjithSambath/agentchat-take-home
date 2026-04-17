@@ -4,34 +4,80 @@ import (
 	"net/http"
 	"time"
 
+	"agentmail/internal/store"
+
 	"github.com/go-chi/chi/v5"
 )
 
-// Router returns a chi.Router with the Phase 0 middleware chain mounted
-// and only /health wired. Phase 1 agents register their route groups by
-// mounting onto this router in main.go.
+// NewRouter wires every Phase 1 route on top of the frozen middleware chain
+// and returns a ready-to-serve chi.Router.
 //
-// Middleware order (outermost → innermost) per http-api-layer-plan.md §2:
+// Middleware order (outermost → innermost):
 //
-//	Recovery → RequestID → Logger → (AgentAuth) → (Timeout) → Handler
+//	Recovery → RequestID → Logger → AgentAuth → Timeout → Handler
 //
-// Recovery wraps everything so panics become envelopes. RequestID comes
-// before Logger so every log line carries request_id. AgentAuth and
-// Timeout are applied per route group (Phase 1).
-func Router() chi.Router {
+// Three route groups:
+//
+//  1. Unauthenticated, short timeout (5s): /health, POST /agents,
+//     GET /agents/resident.
+//  2. Authenticated, CRUD timeout (30s): everything except the two streaming
+//     endpoints.
+//  3. Authenticated, no timeout: streaming writes and SSE — they manage
+//     their own idle detection and absolute caps.
+//
+// The 404/405 handlers write the standard error envelope so clients don't
+// have to special-case chi's default `text/plain` error pages.
+func NewRouter(s2 store.S2Store, meta store.MetadataStore, resident ResidentInfo, conns *ConnRegistry) chi.Router {
+	if conns == nil {
+		conns = NewConnRegistry()
+	}
+	h := NewHandler(s2, meta, resident, conns)
+
 	r := chi.NewRouter()
 	r.Use(Recovery)
 	r.Use(RequestID)
 	r.Use(Logger)
 
-	// Unauthenticated routes with a short timeout.
-	r.Group(func(r chi.Router) {
-		r.Use(Timeout(5 * time.Second))
-		r.Get("/health", Health)
+	r.NotFound(func(w http.ResponseWriter, req *http.Request) {
+		WriteError(w, req, http.StatusNotFound, CodeNotFound, "not found")
+	})
+	r.MethodNotAllowed(func(w http.ResponseWriter, req *http.Request) {
+		WriteError(w, req, http.StatusMethodNotAllowed, CodeMethodNotAllowed, "method not allowed")
 	})
 
-	// Phase 1 agents mount authenticated route groups here. Stub route
-	// group left intentionally empty so main.go compiles.
-	_ = http.StatusOK
+	// Unauthenticated group.
+	r.Group(func(r chi.Router) {
+		r.Use(Timeout(5 * time.Second))
+		r.Get("/health", h.Health)
+		r.Post("/agents", h.CreateAgent)
+		r.Get("/agents/resident", h.GetResidentAgent)
+	})
+
+	// Authenticated, non-streaming group.
+	r.Group(func(r chi.Router) {
+		r.Use(AgentAuth(meta))
+		r.Use(Timeout(30 * time.Second))
+
+		r.Get("/conversations", h.ListConversations)
+		r.Post("/conversations", h.CreateConversation)
+
+		r.Post("/conversations/{cid}/invite", h.InviteAgent)
+		r.Post("/conversations/{cid}/leave", h.LeaveConversation)
+		r.Post("/conversations/{cid}/messages", h.SendMessage)
+		r.Get("/conversations/{cid}/messages", h.GetHistory)
+		r.Post("/conversations/{cid}/ack", h.AckCursor)
+
+		r.Get("/agents/me/unread", h.ListUnread)
+	})
+
+	// Authenticated, streaming group — no Timeout middleware; handlers
+	// manage their own idle and absolute deadlines.
+	r.Group(func(r chi.Router) {
+		r.Use(AgentAuth(meta))
+
+		r.Post("/conversations/{cid}/messages/stream", h.StreamMessage)
+		r.Get("/conversations/{cid}/stream", h.SSEStream)
+	})
+
 	return r
 }

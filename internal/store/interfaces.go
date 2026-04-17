@@ -217,6 +217,10 @@ type MetadataStore interface {
 
 	// --- Lifecycle ---
 
+	// Ping verifies that the underlying Postgres pool can service a round-trip.
+	// Used by the /health endpoint; caller supplies a short timeout.
+	Ping(ctx context.Context) error
+
 	// Close releases the underlying connection pool.
 	Close() error
 }
