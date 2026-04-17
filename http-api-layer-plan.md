@@ -93,9 +93,10 @@ Every error condition across every endpoint, with its HTTP status code and error
 | 405 | `method_not_allowed` | Wrong HTTP method for this route | `"Method {method} not allowed on {path}"` |
 | 415 | `unsupported_media_type` | Wrong Content-Type on POST | `"Expected Content-Type {expected}, got {actual}"` |
 | 413 | `request_too_large` | JSON body exceeded per-endpoint `MaxBytesReader` cap | `"Request body exceeds {N} bytes"` |
-| 413 | `line_too_large` | NDJSON line exceeded the explicit 1 MiB + 1 KiB scanner cap (§6.1) | `"NDJSON line exceeds {N} bytes"` |
 | 413 | `content_too_large` | S2 rejected a record for exceeding its 1 MiB limit (maps the downstream error to a stable code) | `"Content exceeds the 1 MiB record limit"` |
 | 400 | `invalid_utf8` | `content` field (complete-message or streaming line) contained bytes that are not valid UTF-8 | `"Content is not valid UTF-8"` |
+
+**Note:** `line_too_large` (413) is also a stable code but is reachable on only one endpoint (streaming send) and is therefore listed only in that endpoint's per-endpoint table and in §6.6, not in this universal table.
 
 #### Agent Auth Middleware Errors
 
@@ -1899,19 +1900,23 @@ for scanner.Scan() {
 if err := scanner.Err(); err != nil {
     switch {
     case errors.Is(err, bufio.ErrTooLong):
-        abortMessage(ctx, s, messageID, "line_too_large")
+        abortMessage(ctx, s, messageID, AbortReasonLineTooLarge) // "line_too_large"
         writeError(w, 413, "line_too_large",
             fmt.Sprintf("NDJSON line exceeds %d bytes", maxNDJSONLineBytes))
         return
-    case errors.Is(err, context.Canceled),
-         errors.Is(err, context.DeadlineExceeded),
+    case errors.Is(err, context.DeadlineExceeded),
          errors.Is(err, os.ErrDeadlineExceeded):
-        // Idle timeout (§5) or client disconnect — handled by the existing abort path.
-        abortMessage(ctx, s, messageID, "eof")
+        // Idle timeout fired (§5 SetReadDeadline). Response already committed;
+        // no further writeError.
+        abortMessage(ctx, s, messageID, AbortReasonIdleTimeout) // "idle_timeout"
+        return
+    case errors.Is(err, context.Canceled):
+        // Client disconnect (ctx canceled by request lifecycle) or server shutdown.
+        abortMessage(ctx, s, messageID, AbortReasonDisconnect) // "disconnect"
         return
     default:
-        // TCP read error, framing error — existing internal-error path.
-        abortMessage(ctx, s, messageID, "eof")
+        // TCP read error, framing error — treat as lost client.
+        abortMessage(ctx, s, messageID, AbortReasonDisconnect) // "disconnect"
         return
     }
 }
@@ -1959,7 +1964,9 @@ After `decodeJSON` (§3) or NDJSON line parse succeeds, the following checks run
 | `conversation_id` path param is a UUID | Not parseable | `400 invalid_conversation_id` (already in §1) |
 | `agent_id` in invite body is a UUID | Not parseable | `400 invalid_field` (already in §1) |
 
-**Why UTF-8 validation is nearly free.** `json.Unmarshal` into a Go `string` performs UTF-8 validation as a side effect of decoding. We do not add a second pass. The only explicit UTF-8 check we add is for the complete-message `content` field at the type boundary — a one-liner:
+**Why UTF-8 validation requires an explicit pass.** Go's `encoding/json` does **not** validate UTF-8 when decoding a JSON string into a Go `string`. Invalid byte sequences (lone continuation bytes, truncated multi-byte sequences, overlong encodings) pass through `json.Unmarshal` into the Go string unchanged. The plaintext-preservation contract (README: "purely plaintext communication") requires rejection rather than silent corruption, so we add an explicit `utf8.ValidString` check at every `content`-accepting entry point. It is cheap — a single linear byte scan — but it is not free-by-decoding.
+
+**Complete-message path (`POST /conversations/{cid}/messages`):**
 
 ```go
 if !utf8.ValidString(req.Content) {
@@ -1968,7 +1975,27 @@ if !utf8.ValidString(req.Content) {
 }
 ```
 
-For the streaming path, the `content` field on each NDJSON line goes through `json.Unmarshal` into a string, which already enforces UTF-8. The `invalid_utf8` code is therefore only reachable on the complete-message path in practice. It is still listed on the streaming endpoint's table because a future change that routes raw bytes rather than strings would need the code to exist.
+**Streaming path (`POST /conversations/{cid}/messages/stream`):** Same check, applied per-line after `json.Unmarshal` succeeds on the NDJSON `{"content": "..."}` object and before the S2 append. On failure, the handler writes `message_abort` with reason `invalid_utf8` (registered in `event-model-plan.md` §3) and closes the connection:
+
+```go
+for scanner.Scan() {
+    var chunk struct{ Content string `json:"content"` }
+    if err := json.Unmarshal(scanner.Bytes(), &chunk); err != nil {
+        // Abort on bad JSON line (§3 streaming-endpoint decision).
+        abortMessage(ctx, s, messageID, AbortReasonDisconnect)
+        writeError(w, 400, "invalid_json", err.Error())
+        return
+    }
+    if !utf8.ValidString(chunk.Content) {
+        abortMessage(ctx, s, messageID, AbortReasonInvalidUTF8)
+        writeError(w, 400, "invalid_utf8", "Content is not valid UTF-8")
+        return
+    }
+    // ... append to S2 ...
+}
+```
+
+The cost of the per-line `utf8.ValidString` pass is negligible: LLM token chunks are typically 1–20 bytes. At 30k concurrent streams producing 100 tokens/sec each, the global UTF-8 scan budget is on the order of microseconds per second of wall time.
 
 **Why empty-content rejection is at the API layer, not the event model.** The event model (`event-model-plan.md` §2) treats the event as a pure data structure with no semantic rules. The HTTP layer owns the "an append is by definition a non-empty delta" rule. This keeps the event model reusable (e.g., by the resident agent, which constructs events directly).
 

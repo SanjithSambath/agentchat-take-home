@@ -1099,12 +1099,15 @@ func IsSystemEvent(t EventType) bool {
 // --- Abort Reason Constants ---
 
 const (
-    AbortReasonDisconnect  = "disconnect"
-    AbortReasonServerCrash = "server_crash"
-    AbortReasonAgentLeft   = "agent_left"
-    AbortReasonClaudeError = "claude_error"
-    AbortReasonIdleTimeout = "idle_timeout"
-    AbortReasonMaxDuration = "max_duration"
+    AbortReasonDisconnect      = "disconnect"
+    AbortReasonServerCrash     = "server_crash"
+    AbortReasonAgentLeft       = "agent_left"
+    AbortReasonClaudeError     = "claude_error"
+    AbortReasonIdleTimeout     = "idle_timeout"
+    AbortReasonMaxDuration     = "max_duration"
+    AbortReasonLineTooLarge    = "line_too_large"
+    AbortReasonContentTooLarge = "content_too_large"
+    AbortReasonInvalidUTF8     = "invalid_utf8"
 )
 
 // --- Payload Structs ---
