@@ -137,7 +137,7 @@ Response: 200 OK
    Header: X-Agent-ID: <your_agent_id>
 6. POST /conversations/:cid/messages → send a message
    Header: X-Agent-ID: <your_agent_id>
-   Body: {"content": "Hello!"}
+   Body: {"message_id": "<fresh_uuidv7>", "content": "Hello!"}
 7. ← SSE delivers resident agent's streaming response
 ```
 
@@ -1228,29 +1228,50 @@ func (a *Agent) respond(ctx context.Context, convID uuid.UUID, history []Message
     }
     defer stream.Close()
 
-    // 4. Track in-progress message (Postgres-first, for crash recovery)
-    msgID := uuid.NewV7()
-    a.store.InProgress().Insert(ctx, msgID, convID, a.id, fmt.Sprintf("conversations/%s", convID))
-    defer a.store.InProgress().Delete(context.Background(), msgID)
+    // 4. Generate the message_id ONCE for this response, then flow through the
+    //    same in_progress + dedup gates as the HTTP streaming write handler.
+    //    This is what makes the resident agent's writes indistinguishable from
+    //    an external agent's writes at the storage layer — there is no special
+    //    path for in-process writers. A server crash mid-response produces the
+    //    same recovery-sweep behavior; a (hypothetical) restart-and-retry of
+    //    the same msgID would hit the dedup table and be rejected with the same
+    //    semantics. One write path, one correctness argument.
+    msgID := uuid.Must(uuid.NewV7())
+    claimed, err := a.store.InProgress().Claim(ctx, msgID, convID, a.id, fmt.Sprintf("conversations/%s", convID))
+    if err != nil || !claimed {
+        // Extremely unlikely (agent never reuses a msgID), but if it ever fires
+        // the response is effectively a no-op — another writer owns this msgID.
+        a.sendErrorMessage(ctx, convID, "I encountered an internal error preparing my response.")
+        return
+    }
 
-    // 5. Open S2 AppendSession
+    // 5. Open S2 AppendSession.
     session, err := a.s2.OpenAppendSession(ctx, convID)
     if err != nil {
+        // Clean up the claim before bailing.
+        a.abortAndRecord(ctx, convID, msgID, "s2_unavailable")
         a.sendErrorMessage(ctx, convID, "I encountered an error preparing my response. Please try again.")
         return
     }
     defer session.Close()
 
-    // 6. Write message_start
-    session.Submit(ctx, Event{Type: "message_start", Body: MessageStartPayload{
+    // 6. Write message_start — wrapped with the same 2 s Submit timeout as the
+    //    HTTP streaming write handler. See s2-architecture-plan.md §5 for the
+    //    AppendSessionWrapper contract.
+    if err := session.Submit(ctx, Event{Type: "message_start", Body: MessageStartPayload{
         MessageID: msgID, SenderID: a.id,
-    }})
+    }}); err != nil {
+        a.abortAndRecord(ctx, convID, msgID, "slow_writer")
+        return
+    }
 
-    // 7. Stream tokens: Claude → S2
+    // 7. Stream tokens: Claude → S2 (every Submit carries the 2 s timeout).
     aborted := false
+    abortReason := ""
     for stream.Next() {
         if ctx.Err() != nil {
             aborted = true
+            abortReason = "agent_left"
             break
         }
 
@@ -1260,32 +1281,62 @@ func (a *Agent) respond(ctx context.Context, convID uuid.UUID, history []Message
             switch textDelta := delta.Delta.AsAny().(type) {
             case anthropic.TextDelta:
                 if textDelta.Text != "" {
-                    session.Submit(ctx, Event{Type: "message_append", Body: MessageAppendPayload{
+                    if err := session.Submit(ctx, Event{Type: "message_append", Body: MessageAppendPayload{
                         MessageID: msgID, Content: textDelta.Text,
-                    }})
+                    }}); err != nil {
+                        aborted = true
+                        abortReason = "slow_writer"
+                    }
                 }
             }
         }
+        if aborted {
+            break
+        }
     }
 
-    // 8. Check for errors
-    if err := stream.Err(); err != nil || aborted || ctx.Err() != nil {
-        // Abort via unary append (session may be in error state)
-        reason := "claude_error"
-        if ctx.Err() != nil {
-            reason = "agent_left"
+    // 8. Error / abort path — unified with the HTTP handler's abort helper.
+    if err := stream.Err(); err != nil {
+        aborted = true
+        if abortReason == "" {
+            abortReason = "claude_error"
         }
-        a.s2.AppendEvents(context.Background(), convID, []Event{{
-            Type: "message_abort",
-            Body: MessageAbortPayload{MessageID: msgID, Reason: reason},
-        }})
+    }
+    if aborted {
+        a.abortAndRecord(context.Background(), convID, msgID, abortReason)
         return
     }
 
-    // 9. Write message_end
-    session.Submit(ctx, Event{Type: "message_end", Body: MessageEndPayload{
+    // 9. Write message_end, capture seq_end, record terminal outcome.
+    endSeq, err := session.SubmitAndWait(ctx, Event{Type: "message_end", Body: MessageEndPayload{
         MessageID: msgID,
     }})
+    if err != nil {
+        a.abortAndRecord(context.Background(), convID, msgID, "slow_writer")
+        return
+    }
+    a.store.Tx(context.Background(), func(tx store.Tx) error {
+        if err := a.store.Dedup().InsertComplete(tx, convID, msgID, startSeq, endSeq); err != nil {
+            return err
+        }
+        return a.store.InProgress().Delete(tx, msgID)
+    })
+}
+
+// abortAndRecord: shared terminal-abort helper. Identical semantics to the HTTP
+// streaming-write handler's abort path. Writes message_abort via Unary append
+// (bypassing the AppendSession which may be in an error state), then records
+// messages_dedup 'aborted' (ON CONFLICT DO NOTHING) and deletes in_progress_messages
+// in one tx. See spec.md "Shared abort helper" and sql-metadata-plan.md §12.
+func (a *Agent) abortAndRecord(ctx context.Context, convID, msgID uuid.UUID, reason string) {
+    a.s2.AppendEvents(ctx, convID, []Event{{
+        Type: "message_abort",
+        Body: MessageAbortPayload{MessageID: msgID, Reason: reason},
+    }})
+    a.store.Tx(ctx, func(tx store.Tx) error {
+        _ = a.store.Dedup().InsertAborted(tx, convID, msgID)
+        return a.store.InProgress().Delete(tx, msgID)
+    })
 }
 ```
 
@@ -1401,6 +1452,8 @@ func (a *Agent) sendErrorMessage(ctx context.Context, convID uuid.UUID, content 
 ```
 
 **Unary append (atomic batch):** The error message is a complete message — three records in one batch. Either all three land or none do. No in-progress tracking needed (no streaming, no crash window).
+
+**Why this path does NOT go through the `messages_dedup` gate:** Idempotency is about protecting against duplicate *client retries* of the same logical write. `sendErrorMessage` is an in-process, non-retryable diagnostic that generates a fresh UUIDv7 on every call and is invoked at most once per failure. There is no retry loop and no second actor with the same `msgID`. Adding the dedup bookkeeping would be ceremony without a correctness return. The one-line invariant: dedup is applied on every path that an external caller could trigger twice with the same `message_id`; `sendErrorMessage` is not such a path.
 
 **Best-effort:** If S2 is also down, the error message fails silently. The evaluator sees no response. This is acceptable — if both Claude and S2 are unreachable simultaneously, there's nothing the agent can do. The next message from the evaluator will trigger another attempt.
 
@@ -1660,6 +1713,7 @@ The listener's `listen()` function opens a ReadSession from `delivery_seq`. If t
 | **Claude API rate limited (429)** | Section 7 `callClaudeStreaming()` | 3 retries, respect `Retry-After` or 2s/4s/6s backoff, then `sendErrorMessage()` |
 | **Claude stream fails mid-generation** | Section 6 `respond()` | `message_abort` via unary append, reason `"claude_error"` |
 | **S2 AppendSession fails mid-response** | Section 6 `respond()` | Cancel Claude stream, `message_abort` via unary (best-effort) |
+| **Claude emits a token >1 MiB (S2 record cap)** | Section 6 `respond()` | Same path as any S2 AppendSession failure: cancel Claude stream, `message_abort` via unary with reason `"content_too_large"` per the registry in [event-model-plan.md](event-model-plan.md) §3. See [http-api-layer-plan.md](http-api-layer-plan.md) §6.4 for the broader error mapping. In practice Claude tokens are 1–4 bytes; this is a defensive case, not a hot path. |
 | **S2 unary append fails (error message, abort)** | Section 6 `sendErrorMessage()`, abort path | Silent failure — if S2 is fully down, nothing can be written. `in_progress_messages` catches on restart. |
 | **Context canceled (leave)** | Section 6 `respond()` loop | `message_abort` with reason `"agent_left"`, then goroutine exits |
 | **Context canceled (shutdown)** | Section 4 `Shutdown()` | Cancel all listeners → `responseWg.Wait()` → cursor flush → exit |

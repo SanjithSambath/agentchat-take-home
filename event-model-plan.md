@@ -189,13 +189,15 @@ Same reasoning as timestamp. Sequence numbers are S2 metadata, not event data. T
 
 **Should constructors reject zero UUIDs?** Yes. A message with a nil message_id or sender_id is always a bug — it means the caller forgot to generate or pass the UUID. Constructor functions validate and return an error (or panic — see Section 4).
 
+**Provenance of `MessageID`.** The event-model code does NOT generate `message_id`. For messages written by external agents it is supplied by the client on the request body (the complete-message POST includes it as a required JSON field; the streaming POST declares it on the mandatory first NDJSON line). For messages written by the in-process resident Claude agent it is generated once by the agent in `respond.go` via `uuid.Must(uuid.NewV7())` before the response begins, so the agent and the HTTP handler flow through the same `in_progress_messages` + `messages_dedup` gates. Either way, by the time a `MessageStartPayload` is constructed, `MessageID` is already chosen — the event model's job is to serialize it onto the stream, not to invent it. See [http-api-layer-plan.md](http-api-layer-plan.md) §3 (wire types) and [sql-metadata-plan.md](sql-metadata-plan.md) §5 (`messages_dedup` rationale).
+
 ### Edge Case: Empty Content in `MessageAppendPayload`
 
 The spec says: "Empty content lines are allowed (LLMs sometimes emit empty tokens)." So `Content: ""` is valid for `message_append`. The constructor does NOT reject empty content. The payload struct accepts it. Consumers handle it (the agent's `strings.Builder.WriteString("")` is a no-op — correct behavior).
 
 ### Edge Case: Very Large Content
 
-S2's maximum record size is 1 MiB. A single `message_append` with a 1 MiB content string would hit this limit. In practice, LLM tokens are 1–20 bytes. The API layer validates at the HTTP level (spec.md §1.3: "No max length enforced at API layer — S2's 1 MiB record limit is the natural cap"). The event model does not enforce size limits — that's the transport layer's job.
+S2's maximum record size is 1 MiB. A single `message_append` with a 1 MiB content string would hit this limit. In practice, LLM tokens are 1–20 bytes. The size limits are owned by the HTTP layer — see [http-api-layer-plan.md](http-api-layer-plan.md) §6.1 (explicit 1 MiB + 1 KiB `scanner.Buffer(...)` cap producing `413 line_too_large`) and §6.4 (S2's 1 MiB rejection mapped to `413 content_too_large`). The event model itself does not enforce size limits — that's the transport layer's job. Constructors accept arbitrary-length content; serialization into an `s2.AppendRecord` at write time surfaces any S2 rejection to the HTTP handler.
 
 ### Edge Case: Unicode and Special Characters
 
@@ -209,12 +211,15 @@ JSON handles Unicode natively. `json.Marshal` escapes control characters and pro
 
 ```go
 const (
-    AbortReasonDisconnect  = "disconnect"    // client disconnected mid-stream
-    AbortReasonServerCrash = "server_crash"  // recovery sweep found unterminated message
-    AbortReasonAgentLeft   = "agent_left"    // agent removed from conversation mid-write
-    AbortReasonClaudeError = "claude_error"  // Claude API failure during resident agent response
-    AbortReasonIdleTimeout = "idle_timeout"  // streaming write idle for >5 minutes
-    AbortReasonMaxDuration = "max_duration"  // streaming write exceeded 1 hour
+    AbortReasonDisconnect    = "disconnect"       // client disconnected mid-stream
+    AbortReasonServerCrash   = "server_crash"     // recovery sweep found unterminated message
+    AbortReasonAgentLeft     = "agent_left"       // agent removed from conversation mid-write
+    AbortReasonClaudeError   = "claude_error"     // Claude API failure during resident agent response
+    AbortReasonIdleTimeout   = "idle_timeout"     // streaming write idle for >5 minutes
+    AbortReasonMaxDuration   = "max_duration"     // streaming write exceeded 1 hour
+    AbortReasonLineTooLarge  = "line_too_large"   // NDJSON line exceeded 1 MiB + 1 KiB (http-api-layer-plan.md §6.1)
+    AbortReasonContentTooLarge = "content_too_large" // S2 rejected a record for exceeding 1 MiB (http-api-layer-plan.md §6.4)
+    AbortReasonInvalidUTF8   = "invalid_utf8"     // content bytes were not valid UTF-8 (http-api-layer-plan.md §6.3)
 )
 ```
 
@@ -309,7 +314,7 @@ A nil UUID in a constructor is always a programmer error — the caller forgot t
 
 This follows Go convention: `regexp.MustCompile` panics on invalid patterns, `template.Must` panics on parse errors. Construction of well-known types with programmer-controlled inputs should panic on invalid input.
 
-**If this were user-controlled input** (e.g., parsing from an HTTP request), returning an error would be correct. But event creation is always internal — the server generates the UUIDs.
+**If this were user-controlled input** (e.g., parsing directly from an HTTP body into this struct), returning an error would be correct. But by the time a constructor is called, the HTTP layer has already validated the `message_id` — see §1 "Provenance of `MessageID`" — and resolved bad input into a `400 missing_message_id` / `400 invalid_message_id` before any event is constructed. At the constructor boundary the UUID is always either a validated client-supplied value (for external writes) or an agent-generated one (for the resident agent). A nil UUID reaching a constructor therefore means a server-side bug, and panic is the correct response.
 
 ### Why Constructors Return `Event`, Not `s2.AppendRecord`
 
@@ -367,8 +372,9 @@ func NewCompleteMessageEvents(messageID, senderID uuid.UUID, content string) []E
 
 **Why panic on empty content:** The spec says "For complete message POST: content must not be empty" (spec.md §1.3). The API handler validates this before calling the constructor. An empty content here is a programming error (handler forgot to validate).
 
-This helper is used by the `SendMessage` handler:
+This helper is used by the `SendMessage` handler. Note that `msgID` is `req.MessageID` — the client-supplied UUIDv7 from the request body, already validated by the HTTP layer and passed through the `messages_dedup` + `in_progress_messages` gates before this call (see [http-api-layer-plan.md](http-api-layer-plan.md) §5 "Complete Message Write Lifecycle"):
 ```go
+msgID := req.MessageID  // client-supplied, already validated
 events := model.NewCompleteMessageEvents(msgID, agentID, req.Content)
 result, err := h.s2.AppendEvents(ctx, convID, events)
 ```
@@ -887,7 +893,7 @@ S2 `AppendRetryPolicyAll` can produce duplicate records (s2-architecture-plan.md
 - Duplicate `message_append`: Content is appended twice. The reader sees repeated tokens. Cosmetic issue, not a correctness problem.
 - Duplicate `message_end`: First `message_end` completes the message and removes it from `pending`. Second `message_end` hits the `!ok` branch → skipped. Harmless.
 
-**Production enhancement (FUTURE.md):** For strict deduplication, track seen `(message_id, seq_num)` pairs and skip duplicates. Not needed at take-home scale — the retry window is milliseconds, and S2 Express rarely needs retries.
+**Why event-level dedup remains unnecessary even after the handler-level idempotency work:** The HTTP-level idempotency gate (`messages_dedup` + UNIQUE on `in_progress_messages`, see [sql-metadata-plan.md](sql-metadata-plan.md) §5) closes the outer loop — a whole-request client retry never produces a second logical message. The remaining duplicate source is the S2 SDK's own retry-on-jitter, whose duplicates carry the *same* `message_id` and the *same* content bytes. Readers' natural `message_id` demultiplexing (described above — the three "Duplicate" bullets) handles those transparently. Adding event-level `(message_id, seq_num)` tracking would be the belt on top of the belt-and-suspenders we already have; it only becomes interesting if a future design allows multiple *different* logical messages to legitimately share a `message_id`, which this system explicitly forbids. Kept as a pure enhancement note: not built, not needed.
 
 ---
 

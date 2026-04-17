@@ -260,6 +260,27 @@ CREATE TABLE cursors (
     CHECK (delivery_seq >= 0),
     CHECK (ack_seq >= 0)
 );
+
+-- Messages dedup: terminal outcome record per (conversation, client-supplied message_id).
+-- Written once when a message transitions to a terminal state:
+--   'complete' — message_end successfully appended to S2; carries start_seq + end_seq
+--                for replaying the same response on client retry.
+--   'aborted'  — message_abort was written (client disconnect, leave mid-stream, S2
+--                slow_writer timeout, or recovery sweep). Retries with the same
+--                message_id are rejected with 409 already_aborted so the client
+--                generates a fresh message_id.
+-- Primary key (conversation_id, message_id) is the idempotency key. The message_id
+-- is the client-supplied UUIDv7 — the same key readers demultiplex by in S2. One key,
+-- one concept.
+CREATE TABLE messages_dedup (
+    conversation_id  UUID NOT NULL,
+    message_id       UUID NOT NULL,
+    status           TEXT NOT NULL CHECK (status IN ('complete', 'aborted')),
+    start_seq        BIGINT,
+    end_seq          BIGINT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (conversation_id, message_id)
+);
 ```
 
 ### Table-by-Table Rationale
@@ -302,11 +323,20 @@ CREATE TABLE cursors (
 - **`CHECK (delivery_seq >= 0)` and `CHECK (ack_seq >= 0)`.** Defense-in-depth against negative sequence bugs. S2 sequences start at 0.
 - **PK order `(agent_id, conversation_id)`:** Optimized for disconnect cleanup — "flush all cursors for agent X" is a range scan on physically adjacent rows. Also the ideal layout for the `GET /agents/me/unread` join, which starts from `members` (agent_id-indexed) and probes this table by `(agent_id, conversation_id)`.
 
+#### `messages_dedup`
+
+- **Purpose:** closes the HTTP-level retry hole. If a client writes a message and the connection drops *after* S2 has committed the events but *before* the HTTP 200 returns, the client retries. Without dedup, that retry produces a second copy of the same message. With dedup, the retry finds the prior terminal outcome keyed by `(conversation_id, message_id)` and replays the original seq numbers (`status='complete'`) or rejects with 409 (`status='aborted'`).
+- **Why client-supplied `message_id` is the key:** the `message_id` already exists as the natural identifier of a message and as the demultiplexing key readers use to assemble events on the stream. Reusing it as the idempotency key collapses two concepts into one — no parallel `Idempotency-Key` header, no server-generated surrogate.
+- **No foreign keys.** Like `cursors`, this table is on the performance-critical write path. FK checks on every INSERT add overhead. The API layer validates `conversation_id` before any dedup operation.
+- **`start_seq` and `end_seq` nullable:** `status='complete'` rows carry both (needed for replay). `status='aborted'` rows may carry neither (if the abort happened before `message_start` was appended) or only `start_seq` (if the abort happened mid-stream). Nullable is honest about the partial-state semantics.
+- **PK `(conversation_id, message_id)`:** the only query pattern is point lookup by exact key during write-path dedup. PK index handles it.
+- **No TTL enforced at schema level.** At take-home scale, the table stays small (bounded by write rate × retention window). A retention job that deletes rows older than 24–48h is the production-scale follow-up — documented for `FUTURE.md`, not built.
+
 ### Why No Additional Tables
 
-The schema has exactly four tables. No more are needed:
+The schema has exactly five tables. No more are needed:
 
-- **No `messages` table.** Messages live in S2 streams. The metadata layer doesn't store message content.
+- **No `messages` table.** Messages live in S2 streams. The metadata layer doesn't store message content. `messages_dedup` is a dedup *index*, not a content store — it holds only `(conversation_id, message_id, status, start_seq, end_seq)`, never any message body.
 - **No `sessions` or `connections` table.** Active connections are tracked in-memory (`ConnRegistry`). Persisting them to Postgres would add write overhead for ephemeral state.
 - **No `events` or `audit` table.** S2 streams ARE the audit log. Every membership change is recorded as an `agent_joined` or `agent_left` event on the conversation's stream.
 
@@ -809,6 +839,11 @@ The spec implies a single reader per agent per conversation. If an agent opens a
 
 This prevents resource leaks from abandoned connections.
 
+**Cross-reference:** The ConnRegistry enforces one defacto API-layer limit, plus serves as the leave-termination hookup for streaming writes:
+
+- **One SSE connection per `(agent, conversation)`** — a new connection cancels the old one (described above). Prevents SSE resource leaks from abandoned connections.
+- **Streaming write leave-termination hookup** — for each active streaming-write POST, ConnRegistry records a cancel func keyed by `(agent_id, conversation_id, message_id)` so the leave handler (and server shutdown) can abort the write cleanly. It does NOT enforce "one streaming write per (agent, conv)" — the same agent may have multiple distinct `message_id`s in flight concurrently; each has its own cancel func. Duplicate-write protection keyed on `message_id` is the job of `in_progress_messages (conversation_id, message_id)` UNIQUE, not the ConnRegistry.
+
 ---
 
 ## 11. Store Interface: Complete Go Design
@@ -822,6 +857,8 @@ type Store interface {
     Conversations() ConversationStore
     Members() MembershipService
     Cursors() CursorStore
+    InProgress() InProgressStore   // in-flight idempotency claim + crash-recovery index (see spec.md §1.3, s2-architecture-plan.md §10)
+    Dedup() DedupStore              // terminal-outcome record per (conv, message_id) — see §5 `messages_dedup`
     ConnRegistry() *ConnRegistry
     Close() error
 }
@@ -869,6 +906,25 @@ type UnreadEntry struct {
     AckSeq         uint64
     EventDelta     uint64
 }
+
+// InProgressStore: atomic in-flight claim + crash-recovery index. See spec.md §1.3
+// and s2-architecture-plan.md §10. The Claim method is the idempotency gate —
+// backed by ClaimInProgressMessage in §12 (INSERT … ON CONFLICT DO NOTHING on the
+// UNIQUE (conversation_id, message_id) constraint).
+type InProgressStore interface {
+    Claim(ctx context.Context, messageID, convID, agentID uuid.UUID, s2StreamName string) (bool, error)
+    Delete(ctx context.Context, messageID uuid.UUID) error
+    List(ctx context.Context) ([]InProgressRow, error)  // used by recovery sweep on startup
+}
+
+// DedupStore: terminal-outcome records per (conversation_id, client-supplied
+// message_id). Backed by GetMessageDedup, InsertMessageDedupComplete, and
+// InsertMessageDedupAborted in §12.
+type DedupStore interface {
+    Get(ctx context.Context, convID, messageID uuid.UUID) (*DedupRow, bool, error)
+    InsertComplete(ctx context.Context, convID, messageID uuid.UUID, startSeq, endSeq uint64) error
+    InsertAborted(ctx context.Context, convID, messageID uuid.UUID) error
+}
 ```
 
 ### Domain Types
@@ -885,6 +941,20 @@ type ConversationWithMembers struct {
     ID        uuid.UUID
     Members   []uuid.UUID
     CreatedAt time.Time
+}
+
+type InProgressRow struct {
+    MessageID      uuid.UUID
+    ConversationID uuid.UUID
+    AgentID        uuid.UUID
+    S2StreamName   string
+    StartedAt      time.Time
+}
+
+type DedupRow struct {
+    Status    string     // 'complete' | 'aborted'
+    StartSeq  *uint64    // populated when Status == 'complete'
+    EndSeq    *uint64    // populated when Status == 'complete'
 }
 ```
 
@@ -1005,6 +1075,46 @@ WHERE m.agent_id = $1
   AND c.head_seq > COALESCE(k.ack_seq, 0)
 ORDER BY c.head_seq DESC
 LIMIT $2;
+
+-- name: GetMessageDedup :one
+-- Write-path idempotency lookup. Called at the very start of both message-write
+-- handlers (complete and streaming). If hit, the handler replays the cached
+-- terminal outcome instead of writing to S2 again.
+SELECT status, start_seq, end_seq
+FROM messages_dedup
+WHERE conversation_id = $1 AND message_id = $2;
+
+-- name: InsertMessageDedupComplete :exec
+-- Called after a successful S2 append of message_start + appends + message_end.
+-- ON CONFLICT DO NOTHING: safe against a concurrent sweeper or a duplicate call;
+-- the first writer wins and subsequent calls become no-ops.
+INSERT INTO messages_dedup (conversation_id, message_id, status, start_seq, end_seq)
+VALUES ($1, $2, 'complete', $3, $4)
+ON CONFLICT (conversation_id, message_id) DO NOTHING;
+
+-- name: InsertMessageDedupAborted :exec
+-- Called when a message is terminated abnormally:
+--   * streaming client disconnect mid-message
+--   * leave-mid-write
+--   * AppendSession slow_writer (2s Submit timeout)
+--   * recovery sweep on startup (for orphaned in_progress_messages rows)
+-- start_seq may be NULL if the abort happened before message_start was appended.
+INSERT INTO messages_dedup (conversation_id, message_id, status, start_seq, end_seq)
+VALUES ($1, $2, 'aborted', $3, NULL)
+ON CONFLICT (conversation_id, message_id) DO NOTHING;
+
+-- name: ClaimInProgressMessage :execrows
+-- Atomic idempotency gate on the write path. Returns 1 if this handler now owns
+-- the message_id, 0 if a concurrent writer already claimed it (→ 409
+-- in_progress_conflict) OR the row persisted from a crashed prior attempt
+-- (→ 409 in_progress_conflict; the recovery sweep will resolve it, client must
+-- retry with a fresh message_id after seeing dedup status='aborted').
+-- The UNIQUE (conversation_id, message_id) on in_progress_messages enforces
+-- the invariant; ON CONFLICT DO NOTHING turns the unique-violation into a
+-- check-the-affected-rowcount dance.
+INSERT INTO in_progress_messages (message_id, conversation_id, agent_id, s2_stream_name, started_at)
+VALUES ($1, $2, $3, $4, now())
+ON CONFLICT (conversation_id, message_id) DO NOTHING;
 ```
 
 **Batch delivery_seq flush uses raw pgx (not sqlc)** because it requires `unnest()` with array parameters. The single-row `UpsertDeliveryCursor` above is for disconnect/leave/shutdown paths; the periodic flush goroutine uses a hand-written `unnest()` upsert (see §7).

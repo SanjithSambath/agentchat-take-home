@@ -169,12 +169,16 @@ This is the hardest part of the spec. The spec requires streaming writes (token 
 ```http
 POST /conversations/:cid/messages
 Header: X-Agent-ID: <agent_id>
-Body: { "content": "Hello, how are you?" }
+Body: { "message_id": "01906e5d-5678-...", "content": "Hello, how are you?" }
 
 Response: 201 Created
-{ "message_id": "uuid", "seq": 42 }
+{ "message_id": "01906e5d-5678-...", "seq_start": 40, "seq_end": 42, "already_processed": false }
+
+# On retry with the same message_id (idempotent replay):
+Response: 200 OK
+{ "message_id": "01906e5d-5678-...", "seq_start": 40, "seq_end": 42, "already_processed": true }
 ```
-*(Server writes three records to S2 in one batch: message_start, message_append (full content), message_end. Atomic.)*
+*(Server writes three records to S2 in one batch: message_start, message_append (full content), message_end. Atomic. The client supplies `message_id` as a UUIDv7 — it is both the message's identity and the idempotency key. See `http-api-layer-plan.md` §5 "Complete Message Write Lifecycle" for the full handler flow including the dedup gate.)*
 
 **API for streaming message send (NDJSON streaming POST):**
 
@@ -185,57 +189,94 @@ POST /conversations/:cid/messages/stream
 Header: X-Agent-ID: <agent_id>
 Header: Content-Type: application/x-ndjson
 
-# Request body (streamed line by line as tokens are generated):
+# Request body: FIRST line is the idempotency handshake, then content chunks.
+{"message_id":"01906e5d-9abc-..."}
 {"content":"Hello, "}
 {"content":"how are "}
 {"content":"you?"}
 
 # Response (sent after body completes):
 200 OK
-{ "message_id": "uuid", "seq_start": 42, "seq_end": 45 }
+{ "message_id": "01906e5d-9abc-...", "seq_start": 42, "seq_end": 45, "already_processed": false }
 ```
 
 **Server-side mechanics (Go) — AppendSession for pipelined writes:**
 ```go
 func (h *Handler) StreamMessage(w http.ResponseWriter, r *http.Request) {
-    msgID := uuid.NewV7()
+    // 1. Read FIRST NDJSON line — the idempotency handshake.
+    scanner := bufio.NewScanner(r.Body)
+    if !scanner.Scan() { return 400 missing_message_id }
+    var hdr struct{ MessageID uuid.UUID `json:"message_id"` }
+    if err := json.Unmarshal(scanner.Bytes(), &hdr); err != nil || isZero(hdr.MessageID) || !isUUIDv7(hdr.MessageID) {
+        return 400 invalid_message_id
+    }
+    msgID := hdr.MessageID
 
-    // Track in-progress message (Postgres-first, for crash recovery)
-    h.store.InProgress().Insert(ctx, msgID, convID, agentID, streamName)
+    // 2. Dedup lookup.
+    if row, ok := h.store.Dedup().Get(ctx, convID, msgID); ok {
+        if row.Status == "complete" {
+            return 200 { msgID, row.StartSeq, row.EndSeq, already_processed: true }
+        }
+        return 409 already_aborted
+    }
 
-    // Open pipelined append session (non-blocking submits, async acks)
+    // 3. Claim the message_id — UNIQUE (conversation_id, message_id) on in_progress_messages
+    //    turns concurrent duplicates into a clean 409.
+    claimed, _ := h.store.InProgress().Claim(ctx, msgID, convID, agentID, streamName)
+    if !claimed { return 409 in_progress_conflict }
+
+    // 4. Open pipelined append session.
     session, err := h.s2.OpenAppendSession(ctx, convID)
     defer session.Close()
-
-    // Background goroutine drains acks to detect S2 failures
     errCh := make(chan error, 1)
     go func() { /* drain futures, send first error to errCh */ }()
 
-    session.Submit(ctx, messageStartEvent(msgID, agentID))
-
-    scanner := bufio.NewScanner(r.Body)
-    for scanner.Scan() {
-        if ctx.Err() != nil { break }  // context canceled (e.g., agent left)
-        var chunk struct{ Content string `json:"content"` }
-        json.Unmarshal(scanner.Bytes(), &chunk)
-        session.Submit(ctx, messageAppendEvent(msgID, chunk.Content))
+    // 5. Submit message_start with a 2s timeout to bound AppendSession backpressure.
+    if err := submitWithTimeout(ctx, session, messageStartEvent(msgID, agentID), 2*time.Second); err != nil {
+        abort(ctx, h, convID, msgID, "slow_writer")
+        return 503 slow_writer
     }
 
+    // 6. Stream loop.
+    for scanner.Scan() {
+        if ctx.Err() != nil { break }  // leave / shutdown
+        var chunk struct{ Content string `json:"content"` }
+        json.Unmarshal(scanner.Bytes(), &chunk)
+        if err := submitWithTimeout(ctx, session, messageAppendEvent(msgID, chunk.Content), 2*time.Second); err != nil {
+            abort(ctx, h, convID, msgID, "slow_writer")
+            return 503 slow_writer
+        }
+    }
+
+    // 7. Abort path (context canceled or scanner error).
     if ctx.Err() != nil || scanner.Err() != nil {
-        // Abort via Unary append (session may be errored)
-        h.s2.AppendEvents(ctx, convID, []Event{messageAbortEvent(msgID, "disconnect")})
-        h.store.InProgress().Delete(ctx, msgID)
+        abort(ctx, h, convID, msgID, "disconnect")
         return
     }
 
-    session.Submit(ctx, messageEndEvent(msgID))
-    // Wait for all acks, then respond
-    h.store.InProgress().Delete(ctx, msgID)
-    json.NewEncoder(w).Encode(result)
+    // 8. Normal close: emit message_end and record the terminal outcome.
+    seqEnd, _ := submitAndWait(ctx, session, messageEndEvent(msgID), 2*time.Second)
+    h.store.Tx(ctx, func(tx) {
+        h.store.Dedup().InsertComplete(tx, convID, msgID, seqStart, seqEnd)
+        h.store.InProgress().Delete(tx, msgID)
+    })
+    json.NewEncoder(w).Encode(StreamMessageResponse{msgID, seqStart, seqEnd, false})
+}
+
+// Shared abort helper (used by the streaming write handler and the recovery sweep).
+func abort(ctx, h, convID, msgID uuid.UUID, reason string) {
+    // Unary append — bypasses the possibly-errored AppendSession.
+    h.s2.AppendEvents(ctx, convID, []Event{messageAbortEvent(msgID, reason)})
+    h.store.Tx(ctx, func(tx) {
+        h.store.Dedup().InsertAborted(tx, convID, msgID)  // ON CONFLICT DO NOTHING
+        h.store.InProgress().Delete(tx, msgID)
+    })
 }
 ```
 
 **Why AppendSession, not Unary per token:** Unary at 40ms ack (Express) = max 25 sequential appends/sec. LLMs emit 30-100 tokens/sec. AppendSession pipelines the appends — submit token N while token N-1's ack is still in-flight. No bottleneck at any token rate S2 can handle.
+
+**The 2 s Submit timeout (bounded backpressure).** `AppendSession` has built-in backpressure: `Submit` blocks when inflight bytes exceed S2's default 5 MiB. In the steady state that is self-regulating — the session paces submits against S2 throughput. In a pathological state (S2 partial outage, extreme latency), the built-in backpressure could block indefinitely, pinning the handler goroutine (plus its `in_progress_messages` row and AppendSession resources) for minutes. The `submitWithTimeout(ctx, session, ev, 2*time.Second)` wrapper converts "block forever" into "fail in 2 s with a specific error." On timeout the handler enters the shared `abort()` path: Unary-append a `message_abort` (which bypasses the errored session's inflight queue), write the `messages_dedup` aborted row, delete the `in_progress_messages` row, return `503 slow_writer`. 2 s is ~50× S2 Express's normal ~40 ms ack — wide for benign latency spikes, narrow enough to catch real wedges. See [s2-architecture-plan.md](s2-architecture-plan.md) §5 for the AppendSession wrapper implementation and [http-api-layer-plan.md](http-api-layer-plan.md) §5 for the full abort-path contract.
 
 **`head_seq` update.** On every successful S2 append, the S2 store wrapper (`internal/store/s2.go`) calls `UpdateConversationHeadSeq(convID, LastSeqNum)` against Postgres — a regression-guarded `UPDATE conversations SET head_seq = $2 WHERE id = $1 AND head_seq < $2`. This keeps the cached tail-position in Postgres in lockstep with S2 (drift ≤ a few ms) and makes `GET /agents/me/unread` a single indexed join with no S2 round-trip. The handler above does not invoke this directly — it is a side-effect of the store wrapper's append primitives, applied uniformly to both Unary `AppendEvents` and streaming `AppendSession` paths. See `sql-metadata-plan.md` §5 and §12 for the schema and query.
 
@@ -247,10 +288,12 @@ The streaming write is designed for the "scaffolding wraps the agent" model. The
 
 *Python (12 lines, sync, stdlib-compatible):*
 ```python
-import requests, json
+import requests, json, uuid
 
 def stream_message(base_url, agent_id, conv_id, token_iterator):
+    message_id = str(uuid.uuid4())  # prefer uuid7; uuid4 works for take-home scope
     def chunks():
+        yield json.dumps({"message_id": message_id}) + "\n"   # required handshake
         for token in token_iterator:
             yield json.dumps({"content": token}) + "\n"
 
@@ -264,9 +307,13 @@ def stream_message(base_url, agent_id, conv_id, token_iterator):
 
 *Shell (pipe agent output directly):*
 ```bash
-agent_command | while IFS= read -r token; do
-  printf '{"content":"%s"}\n' "$token"
-done | curl -s -X POST \
+MID=$(uuidgen | tr 'A-Z' 'a-z')
+{
+  printf '{"message_id":"%s"}\n' "$MID"                      # required handshake
+  agent_command | while IFS= read -r token; do
+    printf '{"content":"%s"}\n' "$token"
+  done
+} | curl -s -X POST \
   -H "X-Agent-ID: $AGENT_ID" \
   -H "Content-Type: application/x-ndjson" \
   --data-binary @- \
@@ -291,25 +338,32 @@ WebSocket was also considered and rejected. See Challenge 3 (Phase 2) for the fu
 
 **Why the request body uses bare content objects (not typed envelopes):**
 
-The NDJSON lines are `{"content":"token"}`, not `{"type":"append","content":"token"}`. The message lifecycle is implicit in the HTTP request lifecycle:
-* **Message start** = server receives the POST request and generates the `message_id`
-* **Content chunks** = each NDJSON line in the body
-* **Message end** = client closes the request body (EOF)
-* **Message abort** = connection drops before body completes
+The NDJSON body has a minimal two-stage protocol:
+* **First line (handshake)** = `{"message_id":"<uuidv7>"}` — the client-supplied idempotency key. REQUIRED; missing/invalid → 400.
+* **Subsequent lines (content chunks)** = `{"content":"token"}`, not `{"type":"append","content":"token"}`.
 
-This keeps the client protocol dead simple — the agent's scaffolding only needs to emit `{"content":"..."}` lines. The server handles all lifecycle events internally.
+And the message lifecycle maps onto the HTTP request lifecycle:
+* **Message start** = server receives the first NDJSON line, validates `message_id`, passes dedup/in-progress gates, then appends `message_start` to S2
+* **Content chunks** = each subsequent NDJSON line in the body
+* **Message end** = client closes the request body (EOF)
+* **Message abort** = connection drops before body completes, leave mid-stream, or `slow_writer` timeout
+
+This keeps the client protocol dead simple — emit one handshake line, then `{"content":"..."}` lines, then close. The server handles all lifecycle events internally.
 
 **Acknowledged tradeoffs:**
 
 * **No mid-stream server feedback.** If the agent is removed from the conversation while streaming, they won't know until the response (or via their SSE read connection). Mitigation: extremely rare edge case.
 * **Proxy buffering risk.** Some reverse proxies (nginx default config, Kubernetes ingress) buffer chunked POST request bodies. Mitigation: we control our deployment infrastructure (Fly.io supports streaming) and document the `proxy_request_buffering off` directive for self-hosted deployments. AI agents typically don't run behind buffering corporate proxies.
-* **Read-once body means no automatic retries.** If the connection drops at 90% completion, the client can't retry with the same stream. Mitigation: for LLM output, you regenerate anyway. The `message_id` serves as an idempotency key for the start event.
+* **Read-once body means no automatic retries of the same HTTP request.** If the connection drops at 90% completion, the client can't resume the same body on the server side. What the client can (and MUST) do is re-send the entire streaming POST with the **same `message_id`**. The idempotency gate (see "When is a write successful" below) makes that retry correctness-safe: either the prior attempt completed (server replays the cached seqs) or it was aborted (server returns 409 and the client generates a fresh `message_id`).
 
 **Hidden complexities:**
 
 * **When is a write "successful"?**
-    * S2 acknowledges after regional durability (data is in S3). Our server returns success to the client only after S2 acknowledges. This means: a successful write is durable. If the server crashes after S2 ack but before sending the HTTP response, the write is durable but the client thinks it failed. The client retries, creating a duplicate. 
-    * **Mitigation:** use the `message_id` as an idempotency key — if a `message_start` for this `message_id` already exists, return the existing seq instead of writing again.
+    * S2 acknowledges after regional durability (data is in S3). Our server returns success to the client only after S2 acknowledges. This means: a successful write is durable. If the server crashes after S2 ack but before sending the HTTP response, the write is durable but the client thinks it failed and retries — creating a duplicate *unless* the server has a dedup key to recognize the retry by.
+    * **Mitigation (concrete mechanism, not a principle).** The client supplies `message_id` (UUIDv7) in every message-write request — as a required JSON field on the complete-message POST, and as the mandatory first NDJSON line on the streaming POST. The server keeps two pieces of state per `(conversation_id, message_id)`:
+        1. `in_progress_messages` with `UNIQUE (conversation_id, message_id)` — the in-flight claim. Any concurrent duplicate hits the unique constraint → `409 in_progress_conflict`.
+        2. `messages_dedup (conversation_id, message_id, status, start_seq, end_seq)` — the terminal outcome. On retry after a successful write, the handler replays cached seqs with `already_processed: true`. On retry after an aborted write, the handler returns `409 already_aborted` and the client MUST pick a fresh `message_id`.
+    * See [sql-metadata-plan.md](sql-metadata-plan.md) §5 for the schema and §12 for the exact queries. See [http-api-layer-plan.md](http-api-layer-plan.md) §5 "Complete Message Write Lifecycle" and "Streaming Write Lifecycle" for the handler flow.
 * **Concurrent writers:**
     * Two agents streaming simultaneously to the same conversation: their records interleave on the S2 stream. This is correct behavior. S2 assigns sequence numbers, guaranteeing total ordering. The interleaving is the ordering — it represents the temporal reality of concurrent composition.
     * Readers demultiplex by `message_id`. Each reader maintains a map of `message_id → accumulated_content` and assembles complete messages from interleaved chunks.
@@ -317,7 +371,7 @@ This keeps the client protocol dead simple — the agent's scaffolding only need
     * With NDJSON streaming POST, the connection lifecycle IS the message lifecycle. If the agent crashes or disconnects, the server detects it immediately via `r.Context().Done()` or EOF on `r.Body.Read()`.
     * On detection: write `message_abort` event to the S2 stream. The HTTP handler returns (no response sent, since the connection is dead). Clean, deterministic — no background goroutine needed for timeout-based orphan detection.
     * On conversation leave: cancel the request context for any in-progress streaming write from this agent, triggering the abort path above.
-    * **Edge case — server crash mid-stream:** The S2 stream has `message_start` + some `message_append` records but no `message_end` or `message_abort`. On server restart, a recovery sweep reads from the `in_progress_messages` PostgreSQL table (which tracks all active streaming writes), appends `message_abort` events to S2 for each row, and deletes the rows. No S2 stream scanning needed — the Postgres table is the index of unterminated messages.
+    * **Edge case — server crash mid-stream:** The S2 stream has `message_start` + some `message_append` records but no `message_end` or `message_abort`. On server restart, a recovery sweep reads from the `in_progress_messages` PostgreSQL table (which tracks all active streaming writes) and, for each row, (1) appends `message_abort` to S2, (2) inserts a `messages_dedup` row with `status='aborted'` (`ON CONFLICT DO NOTHING`, safe against concurrent sweepers or a delayed ack from the original handler), and (3) deletes the `in_progress_messages` row. All three steps are idempotent; duplicate `message_abort` records are harmless (readers already removed the `message_id` from their pending map). No S2 stream scanning needed. The sweep's dedup insertion is what makes a client retry with the same `message_id` return `409 already_aborted` instead of silently replaying a stale partial message — the client generates a fresh `message_id` and proceeds. See [server-lifecycle-plan.md](server-lifecycle-plan.md) for the full sweep algorithm.
 * **Validation on write:**
     * Agent must be a member of the conversation (checked once when the streaming POST request arrives, before reading the body).
     * Content must be plaintext (spec says "purely plaintext communication").
@@ -445,7 +499,7 @@ Response: 200 OK
 * Agent connects while another SSE connection for the same (agent, conversation) is active: close the old connection, use the new one. Only one active reader per agent per conversation.
 * `from` seq_num is beyond the stream's current tail: start tailing immediately, wait for new events.
 * `from` seq_num is before the stream's trim point (28-day retention on free tier): silently start from the stream's earliest available record (head). Log a warning server-side for observability. The agent catches up on whatever history remains.
-* Slow reader: S2 handles backpressure. If the client can't keep up, the HTTP response buffer fills, Go's `http.Flusher` blocks, and the S2 read session slows down. No unbounded memory growth.
+* Slow reader: handled by a two-layer backpressure model. (1) The SSE handler owns a bounded per-connection event channel `eventCh := make(chan SequencedEvent, 64)` between the tail goroutine (S2 ReadSession consumer) and the writer goroutine (HTTP `Flusher`). Every enqueue uses a 500 ms deadline via `select { case eventCh <- ev: ... case <-time.After(500*time.Millisecond): ... }`; if the writer hasn't drained in 500 ms the connection is disconnected as `slow_consumer` (the client reconnects with `Last-Event-ID` and resumes from its cursor — zero data loss because events stay on S2 and `delivery_seq` was flushed at the last acked event). (2) For stalls that the channel deadline doesn't reach (e.g., the writer is blocked inside `Flush()` while the client-side TCP receive buffer is full), S2 + `http.Flusher` still provide the secondary TCP-level backpressure that slows the S2 read session. The bounded channel + short deadline is what makes detection *explicit* rather than waiting for OS-level buffer exhaustion. See [http-api-layer-plan.md](http-api-layer-plan.md) §5 "SSE Stream Lifecycle" for the implementation.
 
 **Ack endpoint (advance the ack cursor):**
 ```http
@@ -763,12 +817,34 @@ CREATE TABLE cursors (
 -- In-progress streaming writes: tracks active streaming messages for crash recovery.
 -- On server crash, recovery sweep writes message_abort for each row, then deletes.
 -- Postgres-first insert (before S2 message_start) ensures crash safety.
+--
+-- UNIQUE (conversation_id, message_id) is the in-flight idempotency gate: a
+-- duplicate client request with the same message_id fails the INSERT and
+-- receives 409 in_progress_conflict (see http-api-layer-plan.md §1, §5).
 CREATE TABLE in_progress_messages (
     message_id       UUID PRIMARY KEY,
     conversation_id  UUID NOT NULL,
     agent_id         UUID NOT NULL,
     s2_stream_name   TEXT NOT NULL,
-    started_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    started_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (conversation_id, message_id)
+);
+
+-- Messages dedup: terminal-outcome record per (conversation, client-supplied message_id).
+-- Written once when a message reaches a terminal state ('complete' or 'aborted').
+-- On client retry with the same message_id, the server replays from this table:
+--   'complete' → 200 with cached seq_start/seq_end, already_processed:true
+--   'aborted'  → 409 already_aborted; client must generate a fresh message_id
+-- Written by: successful write handlers (complete) and abort/sweep paths (aborted).
+-- See sql-metadata-plan.md §5 for full rationale.
+CREATE TABLE messages_dedup (
+    conversation_id  UUID NOT NULL,
+    message_id       UUID NOT NULL,
+    status           TEXT NOT NULL CHECK (status IN ('complete', 'aborted')),
+    start_seq        BIGINT,
+    end_seq          BIGINT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (conversation_id, message_id)
 );
 ```
 
@@ -777,8 +853,12 @@ CREATE TABLE in_progress_messages (
 * **`conversations`:** `s2_stream_name` decouples conversation ID from S2 stream name (format: `conversations/{conversation_id}`). UNIQUE index prevents two conversations pointing to the same stream. `head_seq` is the cached latest S2 sequence number, updated inline on every successful S2 append from `AppendResult.LastSeqNum()`; it powers `GET /agents/me/unread` without paying an S2 round-trip per unread query.
 * **`members`:** PK order `(conversation_id, agent_id)` optimized for the hottest queries: membership check (`WHERE conversation_id = $1 AND agent_id = $2`) and member list (`WHERE conversation_id = $1`). Separate index on `(agent_id)` for "list conversations for agent." Foreign keys with no CASCADE — agents and conversations are permanent. **Hard delete on leave:** simpler queries (no `AND left_at IS NULL`), S2 stream has full membership event history, re-invite is a fresh INSERT.
 * **`cursors`:** No foreign keys (validated at API layer, cursors may outlive membership). **Two independent cursors in one row.** `delivery_seq` is written by the batched-flush hot tier on tail delivery; `ack_seq` is written synchronously by the `POST /conversations/:cid/ack` handler. Both are regression-guarded (out-of-order writes are silent no-ops). **Both cursors survive leave** — on re-invite, agent resumes tailing from `delivery_seq` and gets an accurate unread count from `ack_seq`. `BIGINT` on both columns (S2 sequence numbers are 64-bit). PK order `(agent_id, conversation_id)` optimized for disconnect cleanup and for the `GET /agents/me/unread` join.
+* **`in_progress_messages`:** UUID PK on `message_id` (server-local lookups during sweep); UNIQUE `(conversation_id, message_id)` is the *in-flight idempotency gate* — any concurrent duplicate write with the same client-supplied `message_id` fails the INSERT and the handler returns `409 in_progress_conflict`. No foreign keys (performance-critical write path). Rows exist for the lifetime of an active streaming POST (seconds to minutes) — the table is always tiny.
+* **`messages_dedup`:** PK `(conversation_id, message_id)` is the *terminal-outcome idempotency key*. A second request with a `message_id` that already has a dedup row replays the cached outcome (`complete` → 200 with cached seqs; `aborted` → 409 so the client regenerates). `start_seq` / `end_seq` nullable because aborted rows may have been aborted before `message_start` was ever appended. No TTL enforced at schema level — retention is bounded in practice by write rate × the natural ceiling on how far back a client would ever retry; production scale would add a 24–48 h retention job (FUTURE.md).
 
-**Why exactly five tables:** No `messages` table (messages live in S2). No `sessions`/`connections` table (tracked in-memory). No `events`/`audit` table (S2 streams ARE the audit log). The fifth table (`in_progress_messages`) is the minimal addition needed for crash recovery — it tracks active streaming writes so the server can emit `message_abort` events for unterminated messages on restart. Rows exist only for the duration of active streaming POST requests (seconds to minutes), so the table is tiny.
+**Why exactly six tables:** No `messages` table (messages live in S2). No `sessions`/`connections` table (tracked in-memory). No `events`/`audit` table (S2 streams ARE the audit log). The two additions beyond the core four (`agents`, `conversations`, `members`, `cursors`) are both tightly scoped to crash-safety and idempotency of the write path:
+  * `in_progress_messages` — the minimal index of *currently active* streaming writes, so the recovery sweep can emit `message_abort` for unterminated messages on restart. Rows are ephemeral (seconds to minutes).
+  * `messages_dedup` — the minimal record of *terminal outcomes* keyed by client-supplied `message_id`, so client retries after a crash/network drop are correctness-safe. Rows are small and purely metadata — no message content.
 
 #### 1.6.6 Connection Pooling
 
@@ -926,6 +1006,8 @@ type Store interface {
     Conversations() ConversationStore
     Members() MembershipService
     Cursors() CursorStore
+    InProgress() InProgressStore   // in-flight idempotency claim + crash-recovery index
+    Dedup() DedupStore              // terminal-outcome record per (conv, message_id)
     ConnRegistry() *ConnRegistry
     Close() error
 }
@@ -968,6 +1050,37 @@ type UnreadEntry struct {
     HeadSeq        uint64
     AckSeq         uint64
     EventDelta     uint64
+}
+
+type InProgressStore interface {
+    // Claim: atomic idempotency gate. INSERT … ON CONFLICT (conversation_id,
+    // message_id) DO NOTHING. Returns (true, nil) on a successful claim,
+    // (false, nil) if the (conv, mid) is already in-flight or a stale row
+    // persists from a crashed prior attempt.
+    Claim(ctx context.Context, messageID, convID, agentID uuid.UUID, s2StreamName string) (bool, error)
+    Delete(ctx context.Context, messageID uuid.UUID) error
+    List(ctx context.Context) ([]InProgressRow, error)  // recovery sweep
+}
+
+type DedupStore interface {
+    // Get: dedup lookup at the start of every write handler.
+    Get(ctx context.Context, convID, messageID uuid.UUID) (*DedupRow, bool, error)
+    InsertComplete(ctx context.Context, convID, messageID uuid.UUID, startSeq, endSeq uint64) error
+    InsertAborted(ctx context.Context, convID, messageID uuid.UUID) error
+}
+
+type InProgressRow struct {
+    MessageID      uuid.UUID
+    ConversationID uuid.UUID
+    AgentID        uuid.UUID
+    S2StreamName   string
+    StartedAt      time.Time
+}
+
+type DedupRow struct {
+    Status    string     // 'complete' | 'aborted'
+    StartSeq  *uint64    // populated when Status == 'complete'
+    EndSeq    *uint64    // populated when Status == 'complete'
 }
 ```
 
@@ -1280,10 +1393,14 @@ Every error condition across every endpoint is mapped to a specific HTTP status 
 | 404 | `conversation_not_found` | Conversation ID doesn't exist |
 | 404 | `invitee_not_found` | Agent being invited doesn't exist |
 | 409 | `last_member` | Cannot leave — last member in conversation |
-| 409 | `concurrent_write` | Agent already has an active streaming write to this conversation |
+| 409 | `in_progress_conflict` | Concurrent duplicate write with the same `message_id` is in flight (UNIQUE on `in_progress_messages` caught it) |
+| 409 | `already_aborted` | A prior write with the same `message_id` was aborted (crash, disconnect, slow-writer timeout); client must generate a fresh `message_id` |
+| 400 | `missing_message_id` | `message_id` missing from body (complete) or first NDJSON line (streaming) |
+| 400 | `invalid_message_id` | `message_id` present but not a valid UUIDv7 |
 | 415 | `unsupported_media_type` | Wrong Content-Type on POST |
 | 500 | `internal_error` | Server error (DB/S2 failure) |
 | 503 | `unhealthy` | Health check: Postgres or S2 unreachable |
+| 503 | `slow_writer` | AppendSession `Submit` blocked past the 2 s timeout; server wrote `message_abort` + dedup `aborted` |
 | 504 | `timeout` | CRUD request exceeded 30s |
 
 Error codes are a **stable API contract** — they never change between versions. Messages may change. CLIENT.md documents: "Branch on `code`, not `message`."
@@ -1335,7 +1452,8 @@ type InviteRequest struct {
 }
 
 type SendMessageRequest struct {
-    Content string `json:"content"`
+    MessageID uuid.UUID `json:"message_id"` // REQUIRED, client-generated UUIDv7 (idempotency key)
+    Content   string    `json:"content"`
 }
 
 type HistoryResponse struct {
@@ -1479,7 +1597,7 @@ A single HTTP POST request with a streaming NDJSON body. The client writes conte
 **Acknowledged tradeoffs:**
 * **Proxy buffering.** Some reverse proxies (nginx default, Kubernetes ingress-nginx) buffer chunked POST bodies. Mitigation: we control deployment infra (Fly.io supports streaming); document `proxy_request_buffering off` for self-hosted. AI agents typically don't run behind buffering corporate proxies. Note: WebSocket has a symmetric problem — many corporate firewalls block or interfere with WebSocket upgrade.
 * **No mid-stream server-to-client communication.** The response comes only after the body completes. Mitigation: the SSE read connection provides real-time feedback; mid-stream write errors are extremely rare edge cases.
-* **Read-once body breaks automatic retries.** If connection drops at 90%, the client can't resend the same stream. Mitigation: for LLM output, you regenerate. `message_id` serves as idempotency key for the start event.
+* **Read-once body breaks automatic retries of the same HTTP request.** The client cannot re-stream the same body against the same request. It CAN re-issue the entire streaming POST with the same client-supplied `message_id` — the server's dedup gate (`messages_dedup` + UNIQUE on `in_progress_messages`, see [sql-metadata-plan.md](sql-metadata-plan.md) §5) either replays the cached terminal outcome or returns `409 already_aborted` so the client generates a fresh `message_id`. For LLM output specifically, regenerating with a new `message_id` is often cheaper than resuming anyway.
 
 **What would change this decision:** If we needed true bidirectional mid-stream negotiation (e.g., server-side content moderation that halts generation, or collaborative editing where two agents interleave tokens on the same message), WebSocket would be necessary. For one-directional token streaming from agent to server, NDJSON POST is strictly superior on every dimension that matters for this system.
 

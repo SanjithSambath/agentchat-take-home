@@ -556,8 +556,12 @@ If startup order is wrong, the server crashes on the first request. If shutdown 
 │                                                             │
 │  7. Recovery sweep                                          │
 │     ├─ SELECT * FROM in_progress_messages                   │
-│     ├─ For each: append message_abort to S2 stream          │
-│     ├─ Delete row from in_progress_messages                 │
+│     ├─ For each row:                                        │
+│     │   ├─ Append message_abort to S2 stream                │
+│     │   ├─ INSERT messages_dedup (conv, mid, 'aborted')     │
+│     │   │  ON CONFLICT DO NOTHING  — so retries see 409     │
+│     │   │  already_aborted (spec.md §1.3, s2 §10)           │
+│     │   └─ DELETE FROM in_progress_messages WHERE …         │
 │     └─ LOG count: "recovered N orphaned messages"           │
 │                                                             │
 │  8. Initialize stores and caches                            │

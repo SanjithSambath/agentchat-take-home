@@ -631,7 +631,7 @@ Composes the pgxpool, agent cache, membership cache, cursor cache, and connectio
 
 **Step 8: Recovery sweep — WARN ON FAILURE, DON'T FAIL.**
 
-The recovery sweep reads the `in_progress_messages` table and writes `message_abort` events to S2 for any unterminated messages from the previous server run.
+The recovery sweep reads the `in_progress_messages` table and, for every unterminated message from the previous server run: (1) writes `message_abort` to S2, (2) inserts a `messages_dedup` row with `status='aborted'` (`ON CONFLICT DO NOTHING`), and (3) deletes the `in_progress_messages` row. Step 2 is what makes a client retry with the same `message_id` after a crash return `409 already_aborted` — without it, the dedup table would have no record of the aborted attempt and the retry would proceed silently with duplicate semantics. See [s2-architecture-plan.md](s2-architecture-plan.md) §10 for the function body.
 
 Why warn-and-continue instead of fail-fast:
 - If Postgres is up but S2 is down, the recovery sweep can't write abort events. The rows stay in the table and are retried on next restart. This is self-healing by design (s2-architecture-plan.md §10).
@@ -756,11 +756,11 @@ S2 connectivity check warns. Recovery sweep warns and leaves rows for next resta
 
 **Server starts immediately after a crash (OOM, SIGKILL):**
 
-The `in_progress_messages` table has rows from unterminated streaming writes. Recovery sweep writes `message_abort` for each and deletes the rows. Cursor hot tier is empty — agents reconnect with cursors from Postgres (at most 5 seconds stale). Agent listeners re-open ReadSessions from their last flushed cursor. Total recovery: automatic, no manual intervention.
+The `in_progress_messages` table has rows from unterminated streaming writes. Recovery sweep, per row: (1) writes `message_abort` to S2; (2) inserts a `messages_dedup` row with `status='aborted'` (`ON CONFLICT DO NOTHING`) so any client that retries with the same `message_id` receives `409 already_aborted` rather than silently starting a new write; (3) deletes the `in_progress_messages` row. Cursor hot tier is empty — agents reconnect with cursors from Postgres (at most 5 seconds stale). Agent listeners re-open ReadSessions from their last flushed cursor. Total recovery: automatic, no manual intervention. See [s2-architecture-plan.md](s2-architecture-plan.md) §10 for the sweep algorithm body.
 
 **Two server instances start simultaneously (horizontal scaling or deployment overlap):**
 
-Both run migrations — idempotent (`IF NOT EXISTS`). Both warm agent caches — read-only, no conflict. Both run recovery sweeps — race condition: both try to write `message_abort` for the same in-progress message. S2 append succeeds for both — duplicate `message_abort` on the stream. Readers see two aborts for the same `message_id` — they ignore the second (already removed from pending map). Both delete the Postgres row — second delete is a no-op (row already gone). Both register the resident agent — `ON CONFLICT DO NOTHING`. Both reconcile conversations — both start listeners for the same conversations.
+Both run migrations — idempotent (`IF NOT EXISTS`). Both warm agent caches — read-only, no conflict. Both run recovery sweeps — race condition: both try to write `message_abort` for the same in-progress message. S2 append succeeds for both — duplicate `message_abort` on the stream. Readers see two aborts for the same `message_id` — they ignore the second (already removed from pending map). Both attempt `INSERT INTO messages_dedup … status='aborted' ON CONFLICT DO NOTHING` — first writer wins, second is a silent no-op (the `(conversation_id, message_id)` PK conflict is the expected case, not an error). Both delete the Postgres `in_progress_messages` row — second delete is a no-op (row already gone). Both register the resident agent — `ON CONFLICT DO NOTHING`. Both reconcile conversations — both start listeners for the same conversations.
 
 **The problem with two instances listening to the same conversations:** Both agents respond to every message. The evaluator sees double responses. This is a fundamental single-instance assumption. Multi-instance requires leader election for the resident agent — document in FUTURE.md, don't build for take-home.
 

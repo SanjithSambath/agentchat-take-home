@@ -256,6 +256,24 @@ future, _ := producer.Submit(s2.AppendRecord{Body: data})
 
 **Lifecycle:** One AppendSession per streaming POST request. The session lives exactly as long as the HTTP request. Clean lifecycle — no shared mutable state, no cross-message batching complexity.
 
+**Bounded Submit via 2 s timeout wrapper.** The built-in 5 MiB backpressure is self-regulating in the steady state but can block indefinitely if S2 is partially unavailable — which would pin the handler goroutine along with the `in_progress_messages` row and the open AppendSession for minutes. We wrap every `Submit` call in an `AppendSessionWrapper` that runs each submit under a fresh `context.WithTimeout(parentCtx, 2*time.Second)`:
+
+```go
+// internal/store/s2.go
+func (a *AppendSessionWrapper) Submit(parentCtx context.Context, ev model.Event) (s2.SubmitFuture, error) {
+    ctx, cancel := context.WithTimeout(parentCtx, 2*time.Second)
+    defer cancel()
+    record := eventToAppendRecord(ev)
+    future, err := a.session.Submit(ctx, &s2.AppendInput{Records: []s2.AppendRecord{record}})
+    if errors.Is(err, context.DeadlineExceeded) {
+        return nil, ErrSlowWriter
+    }
+    return future, err
+}
+```
+
+`ErrSlowWriter` propagates up to the streaming write handler, which enters the `abort` path: Unary-append `message_abort` (a separate SDK call path that does not inherit the errored session's queue state), write the `messages_dedup` aborted row, delete `in_progress_messages`, respond `503 slow_writer`. The 2 s bound is ~50× S2 Express's normal ~40 ms ack — wide enough to absorb benign latency spikes, narrow enough that a handler cannot be pinned for longer than the operator's next metric scrape. See [http-api-layer-plan.md](http-api-layer-plan.md) §5 "Streaming Write Lifecycle" for the full abort-path contract and [spec.md](spec.md) "The 2 s Submit timeout" for the rationale summary.
+
 ### Why Not Producer for Streaming Tokens
 
 The Producer's 5ms linger delay is the problem. A token arriving at t=0 isn't sent to S2 until t=5ms (waiting for more tokens to batch together). With Express at 40ms ack, the reader sees the token at t=45ms instead of t=40ms — a 12.5% latency increase.
@@ -270,14 +288,34 @@ The streaming write handler uses AppendSession with a background goroutine to de
 func (h *Handler) StreamMessage(w http.ResponseWriter, r *http.Request) {
     convID := getConvID(r)
     agentID := getAgentID(r)
-    msgID := uuid.NewV7()
     streamName := fmt.Sprintf("conversations/%s", convID)
     stream := h.basin.Stream(streamName)
 
-    // Track in-progress message in Postgres (for crash recovery)
-    h.store.InProgress().Insert(ctx, msgID, convID, agentID, streamName)
+    // 1. First NDJSON line is the idempotency handshake — client supplies message_id.
+    //    Scanner buffer sized for 1 MiB + 1 KiB lines (S2 record cap + JSON envelope).
+    //    See http-api-layer-plan.md §6.1 for rationale and error mapping.
+    scanner := bufio.NewScanner(r.Body)
+    const maxNDJSONLineBytes = 1<<20 + 1024
+    scanner.Buffer(make([]byte, 64<<10), maxNDJSONLineBytes)
+    if !scanner.Scan() { /* return 400 missing_message_id */ }
+    var hdr struct{ MessageID uuid.UUID `json:"message_id"` }
+    if err := json.Unmarshal(scanner.Bytes(), &hdr); err != nil || hdr.MessageID == uuid.Nil {
+        /* return 400 invalid_message_id */
+    }
+    msgID := hdr.MessageID
 
-    // Open pipelined append session
+    // 2. Dedup lookup — complete → 200 replay, aborted → 409 already_aborted, miss → proceed.
+    if row, ok := h.store.Dedup().Get(ctx, convID, msgID); ok {
+        if row.Status == "complete" { /* return 200 replay */ }
+        /* return 409 already_aborted */
+    }
+
+    // 3. Claim via UNIQUE (conversation_id, message_id) on in_progress_messages —
+    //    ON CONFLICT DO NOTHING turns a concurrent duplicate into 409 in_progress_conflict.
+    claimed, _ := h.store.InProgress().Claim(ctx, msgID, convID, agentID, streamName)
+    if !claimed { /* return 409 in_progress_conflict */ }
+
+    // 4. Open pipelined append session.
     session, err := stream.AppendSession(ctx, nil)
     if err != nil { /* return 503 */ }
     defer session.Close()
@@ -301,8 +339,8 @@ func (h *Handler) StreamMessage(w http.ResponseWriter, r *http.Request) {
     })
     futures <- startFuture
 
-    // Read NDJSON body, submit each line as message_append
-    scanner := bufio.NewScanner(r.Body)
+    // Continue reading NDJSON body (scanner was created at step 1 for the handshake),
+    // submit each subsequent line as message_append.
     for scanner.Scan() {
         select {
         case err := <-errCh:
@@ -313,9 +351,10 @@ func (h *Handler) StreamMessage(w http.ResponseWriter, r *http.Request) {
 
         var chunk struct{ Content string `json:"content"` }
         json.Unmarshal(scanner.Bytes(), &chunk)
-        future, _ := session.Submit(&s2.AppendInput{
+        future, _ := submitWithTimeout(session, &s2.AppendInput{
             Records: []s2.AppendRecord{messageAppendRecord(msgID, chunk.Content)},
-        })
+        }, 2*time.Second)
+        if err != nil { goto abort }  // slow_writer timeout
         futures <- future
     }
 
@@ -326,37 +365,50 @@ func (h *Handler) StreamMessage(w http.ResponseWriter, r *http.Request) {
 
     // Append message_end
     {
-        endFuture, _ := session.Submit(&s2.AppendInput{
+        endFuture, _ := submitWithTimeout(session, &s2.AppendInput{
             Records: []s2.AppendRecord{messageEndRecord(msgID)},
-        })
+        }, 2*time.Second)
         futures <- endFuture
         close(futures)
         // Wait for all acks to complete
         if err := <-errCh; err != nil { goto abort }
     }
 
-    // Clean completion
-    h.store.InProgress().Delete(ctx, msgID)
+    // Clean completion — atomically record the terminal outcome.
+    h.store.Tx(ctx, func(tx) {
+        h.store.Dedup().InsertComplete(tx, convID, msgID, startSeq, endSeq)
+        h.store.InProgress().Delete(tx, msgID)
+    })
     json.NewEncoder(w).Encode(StreamResult{MessageID: msgID, ...})
     return
 
 abort:
     close(futures)
-    // Try to write message_abort to S2 (best-effort)
+    // Write message_abort to S2 via Unary append (best-effort). The session may
+    // be in an error state; Unary bypasses the session's inflight queue entirely.
     stream.Append(ctx, &s2.AppendInput{
         Records: []s2.AppendRecord{messageAbortRecord(msgID, "disconnect")},
     })
-    h.store.InProgress().Delete(ctx, msgID)
+    // Record the terminal outcome. Without this dedup INSERT, a client retry
+    // with the same message_id after a crash would silently start a new write
+    // instead of receiving 409 already_aborted.
+    h.store.Tx(ctx, func(tx) {
+        h.store.Dedup().InsertAborted(tx, convID, msgID)  // ON CONFLICT DO NOTHING
+        h.store.InProgress().Delete(tx, msgID)
+    })
     // No response — connection is dead or errored
 }
 ```
 
 **Key design choices in this handler:**
+- Client-supplied `message_id` via first NDJSON line is the idempotency gate; dedup lookup + `in_progress_messages` UNIQUE claim run before any S2 append
+- Every `Submit` is wrapped with a 2 s timeout (see §5 "Bounded Submit via 2 s timeout wrapper") — timeout → `slow_writer` → abort
 - `futures` channel connects the main loop to the ack-draining goroutine
 - `errCh` with capacity 1 — first error signals abort, no blocking
 - `session.Close()` via defer ensures the S2 session is cleaned up even on panic
 - The abort path uses **Unary** append (not the session) for the `message_abort` record — the session may be in an error state
-- Postgres `in_progress_messages` tracking wraps the entire lifecycle
+- Terminal outcome is recorded in `messages_dedup` (both clean completion and abort) so client retries see the correct state
+- Postgres `in_progress_messages` tracking wraps the entire lifecycle (claim at entry, delete at terminal state)
 
 ---
 
@@ -658,26 +710,35 @@ CREATE TABLE in_progress_messages (
     conversation_id  UUID NOT NULL,
     agent_id         UUID NOT NULL,
     s2_stream_name   TEXT NOT NULL,
-    started_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    started_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (conversation_id, message_id)
 );
 ```
 
 **Why `s2_stream_name` is stored:** So the recovery sweep doesn't need to join against the `conversations` table. Self-contained recovery.
 
+**Why `UNIQUE (conversation_id, message_id)`:** This is the in-flight idempotency gate on the write path. A concurrent duplicate request with the same client-supplied `message_id` attempting `INSERT … ON CONFLICT DO NOTHING` fails the insert (zero rows affected); the handler translates that to `409 in_progress_conflict`. See [sql-metadata-plan.md](sql-metadata-plan.md) §5 ("Why `UNIQUE (conversation_id, message_id)`") and §12 (`ClaimInProgressMessage`).
+
 ### Lifecycle
 
 ```
 Streaming POST arrives:
-  1. Generate message_id (UUIDv7)
-  2. INSERT INTO in_progress_messages (Postgres-first)
-  3. Append message_start to S2 (via AppendSession)
-  4. Read NDJSON body, append message_append records
-  5. On clean completion:
-     a. Append message_end to S2
-     b. DELETE FROM in_progress_messages
-  6. On disconnect/cancel/error:
-     a. Append message_abort to S2 (best-effort)
-     b. DELETE FROM in_progress_messages
+  1. Read FIRST NDJSON line, parse message_id (client-supplied UUIDv7)
+  2. SELECT messages_dedup WHERE (conv, mid)
+     HIT 'complete' → 200 replay with cached seqs + already_processed:true
+     HIT 'aborted'  → 409 already_aborted
+  3. INSERT INTO in_progress_messages ON CONFLICT (conversation_id, message_id) DO NOTHING
+     rows_affected == 0 → 409 in_progress_conflict
+  4. Append message_start to S2 (via AppendSession, 2s Submit timeout)
+  5. Read NDJSON body, Submit message_append records (2s timeout each)
+  6. On clean completion:
+     a. Submit message_end to S2
+     b. Tx: INSERT messages_dedup 'complete' ON CONFLICT DO NOTHING;
+             DELETE FROM in_progress_messages
+  7. On disconnect / context cancel / scanner error / slow_writer timeout:
+     a. Append message_abort to S2 (best-effort, Unary — bypasses errored session)
+     b. Tx: INSERT messages_dedup 'aborted' ON CONFLICT DO NOTHING;
+             DELETE FROM in_progress_messages
 ```
 
 ### Why Postgres-First (Step 2 Before Step 3)
@@ -707,6 +768,14 @@ func (s *Server) recoverInProgressMessages(ctx context.Context) error {
             log.Warn().Err(err).Str("message_id", row.MessageID.String()).Msg("failed to recover in-progress message")
             continue
         }
+        // Record the terminal outcome so a client retry with the same message_id
+        // receives 409 already_aborted (instead of silently starting a fresh write).
+        // ON CONFLICT DO NOTHING: safe against (a) a concurrent recovery by another
+        // instance and (b) a late handler that raced us and already wrote the dedup row.
+        if err := s.store.Dedup().InsertAborted(ctx, row.ConversationID, row.MessageID); err != nil {
+            log.Warn().Err(err).Str("message_id", row.MessageID.String()).Msg("failed to insert dedup aborted during recovery")
+            continue
+        }
         s.store.InProgress().Delete(ctx, row.MessageID)
     }
 
@@ -718,6 +787,8 @@ func (s *Server) recoverInProgressMessages(ctx context.Context) error {
 **Self-healing:** If S2 is unreachable during recovery, rows remain in the table. Next restart tries again. Eventually succeeds.
 
 **Staleness check:** If `started_at` is more than 24 hours old, log a warning — something may be systemically wrong with S2 connectivity.
+
+**Why the dedup insertion matters.** Without step `Dedup().InsertAborted`, a client that retries a crashed streaming POST with the same `message_id` would find an empty dedup table, pass the in-progress claim (the row was deleted by the sweep), open a new AppendSession, and silently write a *new* logical message — while the original partial message already exists on the S2 stream with a `message_abort`. The dedup row closes this loop: the retry sees `status='aborted'` and is told to generate a fresh `message_id`. This is the "retry-after-crash correctness" guarantee that makes idempotency useful end-to-end.
 
 ---
 
@@ -865,12 +936,21 @@ retryConfig := &s2.RetryConfig{
 }
 ```
 
-**Why `AppendRetryPolicyAll`:** We don't use fencing tokens or `MatchSeqNum`, so duplicate records from retries are possible. But they're harmless:
+**Why `AppendRetryPolicyAll`:** We don't use fencing tokens or `MatchSeqNum`, so duplicate records from **SDK-internal** retries (a single `Submit` transparently retrying on network jitter) are possible. But they're harmless at the reader level:
 - Duplicate `message_append`: reader sees a few extra tokens — the same content repeated. Minor cosmetic issue, not a correctness problem.
 - Duplicate `message_start`: reader sees two starts for the same `message_id` — ignore the second one.
 - Duplicate `message_end`: reader sees two ends for the same `message_id` — ignore the second one.
 
-The `message_id` on every record serves as a natural deduplication key. Readers already demultiplex by `message_id`, so duplicates for the same message are trivially handled.
+The `message_id` on every record serves as a natural reader-side deduplication key. Readers already demultiplex by `message_id`, so duplicates for the same message are trivially handled.
+
+**Two independent dedup layers — and what each one protects against:**
+
+| Layer | Where it lives | Protects against | Mechanism |
+|---|---|---|---|
+| **SDK-internal retry safety** | S2 SDK's `AppendRetryPolicyAll` + reader-side `message_id` demux | Transparent retries of a single `Submit` due to network jitter or transient S2 errors. Produces at most N-1 duplicate records per retried submit (same `message_id`, same content). | Readers dedupe by `(message_id, content)` during assembly. Logical cost: a few extra bytes on the stream; no client-observable effect. |
+| **HTTP-level handler dedup** | `messages_dedup` table + `UNIQUE (conversation_id, message_id)` on `in_progress_messages` (see [sql-metadata-plan.md](sql-metadata-plan.md) §5) | A whole HTTP request retry — the client never saw our 200, believed the write failed, re-issued the entire POST. Without this layer, the retry produces a second complete logical message. | Handler dedup gate runs before any S2 append (see [http-api-layer-plan.md](http-api-layer-plan.md) §5 "Complete Message Write Lifecycle" and "Streaming Write Lifecycle"). Retry with the same client-supplied `message_id` → either a cached replay (200 `already_processed: true`) or a 409 telling the client to regenerate. |
+
+These layers are complementary. SDK retries are invisible to the client and protect the inner plumbing. Handler dedup is visible (the client sees the cached response shape) and protects the outer contract. Neither replaces the other.
 
 ### ReadSession Reconnection
 

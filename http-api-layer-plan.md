@@ -92,6 +92,10 @@ Every error condition across every endpoint, with its HTTP status code and error
 | 500 | `internal_error` | Unexpected server error (DB failure, S2 failure, panic recovery) | `"Internal server error"` |
 | 405 | `method_not_allowed` | Wrong HTTP method for this route | `"Method {method} not allowed on {path}"` |
 | 415 | `unsupported_media_type` | Wrong Content-Type on POST | `"Expected Content-Type {expected}, got {actual}"` |
+| 413 | `request_too_large` | JSON body exceeded per-endpoint `MaxBytesReader` cap | `"Request body exceeds {N} bytes"` |
+| 413 | `line_too_large` | NDJSON line exceeded the explicit 1 MiB + 1 KiB scanner cap (§6.1) | `"NDJSON line exceeds {N} bytes"` |
+| 413 | `content_too_large` | S2 rejected a record for exceeding its 1 MiB limit (maps the downstream error to a stable code) | `"Content exceeds the 1 MiB record limit"` |
+| 400 | `invalid_utf8` | `content` field (complete-message or streaming line) contained bytes that are not valid UTF-8 | `"Content is not valid UTF-8"` |
 
 #### Agent Auth Middleware Errors
 
@@ -175,25 +179,62 @@ No request body. Requires agent auth. Requires valid `{cid}`. Requires membershi
 
 #### POST /conversations/{cid}/messages (Complete Send)
 
-Requires agent auth. Requires valid `{cid}`. Requires membership check.
+Requires agent auth. Requires valid `{cid}`. Requires membership check. Idempotent on the client-supplied `message_id`.
+
+**Request body:**
+
+```json
+{
+  "message_id": "01906e5c-...-...",  // REQUIRED, client-generated UUIDv7
+  "content": "..."                    // REQUIRED, non-empty
+}
+```
 
 | HTTP Status | Error Code | Condition |
 |---|---|---|
-| 201 | — | Success (message created) |
+| 201 | — | Success (message created). Response carries `start_seq`, `end_seq`, and `already_processed: false`. |
+| 200 | — | Idempotency replay: same `message_id` was successfully processed earlier. Response carries cached `start_seq`, `end_seq`, and `already_processed: true`. |
 | 400 | `invalid_json` | Request body is not valid JSON |
+| 400 | `missing_message_id` | `message_id` field missing from body |
+| 400 | `invalid_message_id` | `message_id` is present but not a valid UUIDv7 string |
 | 400 | `missing_field` | `content` field missing |
 | 400 | `empty_content` | `content` field present but empty string |
+| 400 | `invalid_utf8` | `content` contains bytes that are not valid UTF-8 |
 | 400 | `unknown_field` | Unrecognized fields in body |
-| 500 | `internal_error` | S2 append failed |
+| 413 | `request_too_large` | Body exceeded the 1 MB `MaxBytesReader` cap |
+| 413 | `content_too_large` | Content cleared the body cap but S2 rejected the record for exceeding 1 MiB |
+| 409 | `in_progress_conflict` | A write with the same `message_id` is currently in flight (duplicate client request racing). Client may retry after a short backoff; the in-flight writer will resolve the `message_id` to either `complete` or `aborted`. |
+| 409 | `already_aborted` | A prior write with the same `message_id` was aborted (crash, disconnect, slow-writer timeout). Client must generate a fresh `message_id`. |
+| 503 | `slow_writer` | S2 backpressure exceeded the 2 s Submit timeout. Server wrote `message_abort` and recorded the dedup row as `aborted`. Client must generate a fresh `message_id` to retry. |
+| 500 | `internal_error` | S2 append failed for a reason not covered above |
 
 #### POST /conversations/{cid}/messages/stream (Streaming Send)
 
-Requires agent auth. Requires valid `{cid}`. Requires membership check.
+Requires agent auth. Requires valid `{cid}`. Requires membership check. Idempotent on the client-supplied `message_id`, declared on the **first NDJSON line** of the request body.
+
+**Request body (NDJSON, one JSON object per line):**
+
+```
+{"message_id":"01906e5c-...-..."}     ← REQUIRED first line, UUIDv7
+{"content":"first chunk"}
+{"content":"second chunk"}
+...
+```
+
+The very first line MUST contain only `{"message_id": "<uuidv7>"}`. The server parses and validates it before opening the `AppendSession`. Every subsequent line carries a `content` chunk. EOF (graceful close) produces `message_end`; connection reset produces `message_abort`.
 
 | HTTP Status | Error Code | Condition | Notes |
 |---|---|---|---|
-| 200 | — | Success (message streamed and completed) | |
-| 409 | `concurrent_write` | Agent already has an active streaming write to this conversation | Only one active stream per (agent, conversation) |
+| 200 | — | Success (message streamed and completed). Response carries `start_seq`, `end_seq`, `already_processed: false`. | |
+| 200 | — | Idempotency replay: same `message_id` already completed. Response carries cached seqs + `already_processed: true`; the server does NOT read the rest of the NDJSON body — it closes the connection immediately. | |
+| 400 | `missing_message_id` | First NDJSON line missing `message_id` (or body empty before first line) | Server responds before reading any content |
+| 400 | `invalid_message_id` | First NDJSON line `message_id` is not a valid UUIDv7 | Server responds before reading any content |
+| 400 | `invalid_utf8` | A `content` field in an NDJSON line contained bytes that are not valid UTF-8 | Handler aborts the message (writes `message_abort` reason `invalid_utf8`) and closes the connection |
+| 413 | `line_too_large` | A single NDJSON line exceeded the 1 MiB + 1 KiB scanner buffer (§6.1) | Handler aborts the message (writes `message_abort` reason `line_too_large`) |
+| 413 | `content_too_large` | A line cleared the scanner buffer but S2 rejected the record for exceeding 1 MiB | Handler aborts the message (writes `message_abort` reason `content_too_large`) |
+| 409 | `in_progress_conflict` | A write with the same `message_id` is currently in flight | Unique constraint on `in_progress_messages (conversation_id, message_id)` |
+| 409 | `already_aborted` | A prior write with the same `message_id` was aborted | Client must generate a fresh `message_id` |
+| 503 | `slow_writer` | AppendSession `Submit` blocked past the 2 s timeout. Server wrote `message_abort`, recorded dedup `aborted`. | |
 | 500 | `internal_error` | S2 append session failed | |
 
 **Mid-stream errors** (after body reading has started): The server can't change the status code once it's committed to reading the body. If S2 fails mid-stream, the server appends `message_abort` and closes the connection. The client receives either a truncated response or a connection reset. The abort event on the S2 stream is the source of truth.
@@ -905,61 +946,101 @@ type LeaveResponse struct {
 
 ```go
 type SendMessageRequest struct {
-    Content string `json:"content"`
+    MessageID uuid.UUID `json:"message_id"` // REQUIRED, client-generated UUIDv7 (idempotency key)
+    Content   string    `json:"content"`
 }
 
 type SendMessageResponse struct {
-    MessageID uuid.UUID `json:"message_id"`
-    Seq       uint64    `json:"seq"`
+    MessageID        uuid.UUID `json:"message_id"`
+    SeqStart         uint64    `json:"seq_start"`          // S2 seq of message_start
+    SeqEnd           uint64    `json:"seq_end"`            // S2 seq of message_end
+    AlreadyProcessed bool      `json:"already_processed"`  // true if replayed from messages_dedup
 }
 ```
 
-**Wire example:**
+**Wire example (first attempt):**
 ```
 → POST /conversations/01906e5c-1234-.../messages
   X-Agent-ID: 01906e5b-3c4a-...
   Content-Type: application/json
-  {"content":"Hello, how are you?"}
+  {"message_id":"01906e5d-5678-...","content":"Hello, how are you?"}
 ← 201 Created
-  {"message_id":"01906e5d-5678-...","seq":42}
+  {"message_id":"01906e5d-5678-...","seq_start":40,"seq_end":42,"already_processed":false}
 ```
 
-**`seq` field:** The S2 sequence number of the `message_end` record. Useful for cursor positioning — a client that receives this knows it has read up to at least seq 42.
+**Wire example (idempotent replay):**
+```
+→ POST /conversations/01906e5c-1234-.../messages
+  X-Agent-ID: 01906e5b-3c4a-...
+  Content-Type: application/json
+  {"message_id":"01906e5d-5678-...","content":"Hello, how are you?"}
+← 200 OK
+  {"message_id":"01906e5d-5678-...","seq_start":40,"seq_end":42,"already_processed":true}
+```
+
+**`seq_start` / `seq_end`:** The S2 sequence numbers of `message_start` and `message_end` respectively. Cached in `messages_dedup` so retries replay them identically.
+
+**`message_id` validation:**
+- Missing → 400 `missing_message_id`
+- Not a valid UUIDv7 → 400 `invalid_message_id`
+- Client SHOULD generate one fresh UUIDv7 per logical message and reuse it across retries of that same logical message.
 
 **Content validation:**
 - Missing `content` field → 400 `missing_field`
 - Empty string `""` → 400 `empty_content`
+- Bytes that are not valid UTF-8 → 400 `invalid_utf8` (§6.3)
 - Whitespace-only → allowed (agents might intentionally send whitespace)
-- No max length enforced at API layer (S2's 1 MiB record limit is the natural cap; at ~4 chars/byte, that's ~250K characters per message — far beyond any LLM response)
+- Max length: 1 MB body cap via `MaxBytesReader` (§3 table) → 413 `request_too_large`; content that clears the body cap but exceeds S2's 1 MiB record limit → 413 `content_too_large` (§6.4). At ~4 chars/byte, 1 MiB is ~250K characters per message — far beyond any LLM response.
 
 #### POST /conversations/{cid}/messages/stream (Streaming Send)
 
 ```go
-// Request body is NDJSON stream, read line-by-line:
+// Request body is NDJSON. First line MUST carry the idempotency key:
+type StreamHeader struct {
+    MessageID uuid.UUID `json:"message_id"` // REQUIRED, client-generated UUIDv7
+}
+
+// Every subsequent line:
 type StreamChunk struct {
     Content string `json:"content"`
 }
 
 type StreamMessageResponse struct {
-    MessageID uuid.UUID `json:"message_id"`
-    SeqStart  uint64    `json:"seq_start"`
-    SeqEnd    uint64    `json:"seq_end"`
+    MessageID        uuid.UUID `json:"message_id"`
+    SeqStart         uint64    `json:"seq_start"`
+    SeqEnd           uint64    `json:"seq_end"`
+    AlreadyProcessed bool      `json:"already_processed"`
 }
 ```
 
-**Wire example:**
+**Wire example (first attempt):**
 ```
 → POST /conversations/01906e5c-1234-.../messages/stream
   X-Agent-ID: 01906e5b-3c4a-...
   Content-Type: application/x-ndjson
+  {"message_id":"01906e5d-9abc-..."}
   {"content":"Hello, "}
   {"content":"how are "}
   {"content":"you?"}
 ← 200 OK
-  {"message_id":"01906e5d-9abc-...","seq_start":42,"seq_end":45}
+  {"message_id":"01906e5d-9abc-...","seq_start":42,"seq_end":45,"already_processed":false}
+```
+
+**Wire example (idempotent replay — client retried after a network glitch):**
+```
+→ POST /conversations/01906e5c-1234-.../messages/stream
+  X-Agent-ID: 01906e5b-3c4a-...
+  Content-Type: application/x-ndjson
+  {"message_id":"01906e5d-9abc-..."}
+  {"content":"Hello, "}   ← server closes connection before reading these
+  ...
+← 200 OK
+  {"message_id":"01906e5d-9abc-...","seq_start":42,"seq_end":45,"already_processed":true}
 ```
 
 **`seq_start` / `seq_end`:** The range of S2 sequence numbers for this message's records (`message_start` through `message_end`). Lets the client know exactly which events it just created.
+
+**First-line handshake:** The server reads exactly one NDJSON line before opening the `AppendSession`. That line MUST be `{"message_id":"<uuidv7>"}`. The dedup lookup and `in_progress_messages` claim happen before any content is consumed, so a replay of a completed message returns the cached response without reading the body — the client's retransmitted chunks are discarded.
 
 **Why 200 not 201:** The response is sent after the body is fully read and all S2 appends are acknowledged. By that point, the message is "created." 201 would also be correct, but 200 is more natural for "operation completed" on a streaming request that's more of an action than a resource creation.
 
@@ -1205,7 +1286,7 @@ func decodeJSON[T any](w http.ResponseWriter, r *http.Request, maxBytes int64) (
 |---|---|---|
 | POST /conversations/{cid}/invite | 1 KB | Single UUID field. 1 KB is 10x generous. |
 | POST /conversations/{cid}/messages | 1 MB | Complete message content. S2's 1 MiB record limit is the natural cap. |
-| POST /conversations/{cid}/messages/stream | Unlimited | Streaming body — `MaxBytesReader` not applied. Individual lines bounded by scanner buffer. |
+| POST /conversations/{cid}/messages/stream | Unlimited total | Streaming body — `MaxBytesReader` not applied. Individual lines bounded to 1 MiB + 1 KiB by the explicit `scanner.Buffer(...)` call (§6.1). |
 | All other POSTs | 1 KB | Safety net. |
 
 ### Path Parameter Parsing Helper
@@ -1466,6 +1547,80 @@ for {
 
 **Why 24-hour absolute cap:** Fly.io machines can restart for maintenance, deployments, or scaling events. A 24-hour cap ensures connections are periodically refreshed. The client auto-reconnects with `Last-Event-ID`, so there's no data loss. Without a cap, a leaked goroutine (client that disconnected but the server didn't detect it) runs forever.
 
+**Bounded event channel and slow-consumer disconnect.** Each SSE connection owns two goroutines: a *tailer* reading from the S2 ReadSession and a *writer* flushing to the HTTP response. They communicate via a buffered channel `eventCh := make(chan SequencedEvent, 64)`. The cap is deliberate — it absorbs short stalls (GC pauses, proxy reconnects) but not unbounded lag. Every enqueue uses a 500 ms deadline:
+
+```go
+select {
+case eventCh <- ev:
+    // delivered to the writer goroutine
+case <-time.After(500 * time.Millisecond):
+    // writer hasn't drained in 500 ms — the consumer is wedged.
+    metrics.SlowConsumerDisconnects.WithLabelValues(convID.String()).Inc()
+    log.Warn().Str("agent_id", agentID.String()).
+        Str("conversation_id", convID.String()).
+        Uint64("last_seq", ev.SeqNum).
+        Msg("sse slow_consumer: disconnecting")
+    cancel()            // tears down ReadSession + writer goroutine
+    return errSlowConsumer
+case <-ctx.Done():
+    return ctx.Err()
+}
+```
+
+**Why 64 events and 500 ms.** Normal SSE delivery is sub-millisecond end-to-end (in-process channel → HTTP response buffer → TCP send). A 64-event backlog covers ~2 seconds of peak LLM streaming at 30 tokens/sec per conversation — ample headroom for a brief GC pause or TCP retransmit. A 500 ms enqueue deadline means the *writer goroutine* has been stuck for half a second, which is deeply anomalous: a healthy writer drains each event and calls `http.Flusher.Flush()` in microseconds. Half a second of blockage means the client-side TCP receive buffer is full (client not reading), the proxy is stalled, or the network path is broken. Disconnecting at that point is correct:
+
+- The client's SSE library will auto-reconnect with `Last-Event-ID` — zero data loss (events are still on S2; cursor was flushed at the last delivered seq).
+- The server releases the goroutine, the ReadSession, the ConnRegistry slot, and any pinned cursor hot-tier memory.
+
+**Why this is additive to TCP backpressure.** TCP-level backpressure via `http.Flusher` alone is not sufficient: a slow-but-not-dead consumer keeps the TCP connection open indefinitely, the kernel happily buffers, and the writer goroutine blocks in `Flush()` potentially for minutes while the tailer goroutine keeps filling the channel's send buffer in the OS kernel. The bounded in-process channel + short deadline gives us a detection point and a clean teardown before the problem reaches OS-level buffering.
+
+**Slow-consumer disconnect is not an error event.** The client just sees its SSE connection close. SSE libraries reconnect automatically; on reconnect with `Last-Event-ID`, catch-up resumes from the last acked seq. No special client-side handling required.
+
+### Complete Message Write Lifecycle
+
+`POST /conversations/{cid}/messages` is a single request/response. The idempotency gate runs before any S2 write; the body is read fully into memory first (bounded by `MaxBytesReader` = 1 MB).
+
+```text
+Request received
+  │
+  ├─ Initial validation (agent auth, membership check, content-type, body ≤ 1 MB)
+  │   If validation fails: return error immediately
+  │
+  ├─ Parse body: { message_id, content }
+  │   Missing message_id        → 400 missing_message_id
+  │   Not a valid UUIDv7         → 400 invalid_message_id
+  │   Missing content            → 400 missing_field
+  │   Empty content              → 400 empty_content
+  │
+  ├─ Dedup lookup: SELECT messages_dedup WHERE (conv, mid)
+  │   HIT status='complete'      → 200 with cached { seq_start, seq_end, already_processed: true }
+  │   HIT status='aborted'       → 409 already_aborted
+  │
+  ├─ Claim: INSERT in_progress_messages (message_id, conv, agent, stream_name)
+  │         ON CONFLICT (conversation_id, message_id) DO NOTHING
+  │   rows_affected == 0         → 409 in_progress_conflict
+  │
+  ├─ S2 unary batch append [message_start, message_append(content), message_end]
+  │   This is one atomic AppendInput — S2 assigns three contiguous seqs.
+  │   On S2 error:
+  │     - Best-effort unary append of message_abort (may no-op if S2 fully down)
+  │     - Tx: INSERT messages_dedup 'aborted' ON CONFLICT DO NOTHING; DELETE in_progress
+  │     - Return 503 internal_error (or 503 slow_writer if error was a deadline)
+  │
+  ├─ Commit the terminal state:
+  │   BEGIN
+  │     INSERT messages_dedup (conv, mid, 'complete', seq_start, seq_end)
+  │            ON CONFLICT DO NOTHING
+  │     DELETE in_progress_messages WHERE message_id = $1
+  │   COMMIT
+  │
+  └─ 201 Created with { message_id, seq_start, seq_end, already_processed: false }
+```
+
+**Crash between S2 append and dedup commit.** If the server crashes between the S2 append and the final transaction, the `in_progress_messages` row persists with no corresponding dedup row, but S2 already has `message_start` + `message_append` + `message_end` on the stream. The recovery sweep on next startup (see `server-lifecycle-plan.md` §recovery sweep) finds the orphan row and writes `message_abort` to S2 + INSERTs dedup with `status='aborted'`. The row is cleaned up either way. A client retrying with the same `message_id` will see the `aborted` dedup row and must pick a fresh `message_id` — a tiny cost for not requiring a distributed transaction between S2 and Postgres.
+
+**Why unary append, not AppendSession, for the complete path.** Three records in one `AppendInput` is S2's atomic-batch primitive — all three land or none do. AppendSession is for the streaming path where records arrive over time and pipelining matters. For three-in-one, unary is simpler and strictly correct.
+
 ### Streaming Write Lifecycle
 
 ```text
@@ -1474,20 +1629,38 @@ Connection opened
   ├─ Initial validation (agent auth, membership check, content-type)
   │   If validation fails: return error immediately (no body read)
   │
-  ├─ Concurrent write check (ConnRegistry)
-  │   If already streaming: return 409 concurrent_write
+  ├─ Read FIRST NDJSON line (handshake, idempotency key)
+  │   Missing or not a JSON object with "message_id" → 400 missing_message_id
+  │   Not a valid UUIDv7                             → 400 invalid_message_id
   │
-  ├─ Register in ConnRegistry
-  │   Insert in_progress_messages row in Postgres
-  │   Open S2 AppendSession
-  │   Submit message_start
+  ├─ Dedup lookup: SELECT messages_dedup WHERE (conv, mid)
+  │   HIT status='complete'  → 200 replay { seq_start, seq_end, already_processed: true }
+  │                            (server closes connection without reading remaining body)
+  │   HIT status='aborted'   → 409 already_aborted
+  │
+  ├─ Register with ConnRegistry (leave-termination hookup)
+  │   ConnRegistry records a cancel func for this streaming write so the leave
+  │   handler (and server shutdown) can abort it cleanly. It does NOT enforce
+  │   "one streaming write per (agent, conv)" — the same agent may have multiple
+  │   distinct message_ids in flight concurrently; each one has its own cancel
+  │   func keyed by message_id under the (agent, conv) bucket. Per-message-id
+  │   duplicate protection is provided by in_progress_messages UNIQUE in the
+  │   next step, not by ConnRegistry.
+  │
+  ├─ Claim: INSERT in_progress_messages ON CONFLICT (conversation_id, message_id) DO NOTHING
+  │   rows_affected == 0 → 409 in_progress_conflict
+  │
+  ├─ Open S2 AppendSession
+  │   Submit message_start   (wrapped in context.WithTimeout(parent, 2s) — see below)
   │
   ├─ Body reading loop
   │   │
-  │   ├─ scanner.Scan() blocks until NDJSON line arrives
+  │   ├─ scanner.Scan() blocks until NDJSON content line arrives
   │   │   Idle timeout: 5 minutes between lines
   │   │   │
-  │   │   ├─ On line: parse JSON, submit message_append to S2
+  │   │   ├─ On line: parse JSON, Submit message_append to S2
+  │   │   │   Submit is wrapped with 2s context.WithTimeout.
+  │   │   │   On Submit timeout: goto abort path with reason "slow_writer" → 503
   │   │   │
   │   │   ├─ On idle timeout: abort message, close connection
   │   │   │   Rationale: LLMs don't pause 5 minutes mid-generation.
@@ -1496,20 +1669,28 @@ Connection opened
   │   │   └─ Absolute safety cap: 1 hour
   │   │       No single LLM response runs for an hour.
   │   │
-  │   ├─ On EOF (body complete): submit message_end, return success response
+  │   ├─ On EOF (body complete):
+  │   │   Submit message_end (2s timeout); capture seq_start + seq_end
+  │   │   Tx: INSERT messages_dedup 'complete' ON CONFLICT DO NOTHING;
+  │   │       DELETE in_progress_messages
+  │   │   Return 200 { seq_start, seq_end, already_processed: false }
   │   │
-  │   ├─ On context cancel (leave, server shutdown):
+  │   ├─ On context cancel (leave, server shutdown, slow_writer timeout):
   │   │   Submit message_abort via Unary append (session may be errored)
-  │   │   Return (no response — connection is dead)
+  │   │   Tx: INSERT messages_dedup 'aborted' ON CONFLICT DO NOTHING;
+  │   │       DELETE in_progress_messages
+  │   │   Return 503 slow_writer (on timeout) or drop connection (on leave/shutdown)
   │   │
   │   └─ On scanner error / malformed JSON:
-  │       Submit message_abort, return error response
+  │       Submit message_abort, same dedup/in_progress cleanup as above,
+  │       return error response
   │
-  ├─ Deregister from ConnRegistry
-  │   Delete in_progress_messages row
-  │
-  └─ Done
+  └─ Done (ConnRegistry deregister happens in deferred cleanup)
 ```
+
+**The 2 s `Submit` timeout.** S2's `AppendSession` has built-in backpressure (blocks when inflight bytes exceed 5 MiB; see [s2-architecture-plan.md](s2-architecture-plan.md) §5). In the normal case that backpressure is self-regulating — the session paces submits against S2 throughput. In a pathological case (S2 partial outage, extreme latency), the built-in backpressure could block indefinitely, pinning the handler goroutine and its Postgres-held resources. Wrapping every call to `AppendSessionWrapper.Submit(ctx, event)` with `ctx, cancel := context.WithTimeout(parentCtx, 2*time.Second)` converts "block forever" into "fail after 2 s with a specific error," which the handler then translates into a clean abort path: write `message_abort` via Unary append (a separate path that isn't blocked by the session's inflight queue), record dedup `aborted`, delete `in_progress_messages`, respond `503 slow_writer`. The client's retry produces a fresh `message_id` (because the dedup row is `aborted`) and has a good chance of succeeding if the S2 incident was transient.
+
+**The 2 s number.** S2 Express regional ack target is ~40 ms. A 2 s timeout is 50× the normal case — wide enough to absorb ordinary latency spikes, narrow enough that a handler can't be pinned for minutes. It is deliberately NOT tied to the 30 s CRUD timeout (which is the request-level deadline for the unauthenticated/authenticated routes, not for streaming ones); the streaming write has no overall request timeout, but every individual Submit has this 2 s inner deadline.
 
 **Idle timeout implementation:**
 
@@ -1582,12 +1763,16 @@ Actually, the cleanest Go pattern for this is to wrap `r.Body` in a reader that 
 // Wrap the body with idle timeout
 body := newIdleTimeoutReader(r.Body, 5*time.Minute)
 scanner := bufio.NewScanner(body)
+// Explicit line cap: 1 MiB + 1 KiB envelope. See §6.1 for rationale.
+const maxNDJSONLineBytes = 1<<20 + 1024
+scanner.Buffer(make([]byte, 64<<10), maxNDJSONLineBytes)
 
 for scanner.Scan() {
     // scanner.Scan() calls body.Read(), which resets the idle timer
     // on each successful read
     // ... process line ...
 }
+// scanner.Err() error mapping lives in §6.1.
 ```
 
 The idle timeout reader uses `SetReadDeadline` on the underlying TCP connection (accessible via `http.ResponseController` in Go 1.20+):
@@ -1655,7 +1840,214 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 
 ---
 
-## 6. Cross-Cutting Concerns
+## 6. Input Limits & Validation
+
+### The Problem
+
+Every ingress surface is a trust boundary. Without explicit limits, three classes of failure occur:
+
+1. **Silent correctness bugs.** Go's `bufio.Scanner` defaults to a 64 KiB line buffer. S2 accepts records up to 1 MiB. If a client sends an NDJSON line larger than 64 KiB, `scanner.Scan()` returns `false` with `bufio.ErrTooLong` — the request terminates mid-stream with a cryptic error and no `message_abort` event reason the client can act on. This is not hypothetical; a base64-encoded tool-call argument or a large LLM token burst reaches 64 KiB routinely.
+2. **Resource exhaustion.** Unbounded header sizes, unbounded request IDs, unbounded stream durations. Each is a knob an adversary — or a buggy client — can turn.
+3. **Downstream failures surfacing as opaque errors.** If validation happens only at the S2 layer or the Postgres layer, the error text that reaches the client is `"record exceeds 1 MiB"` from S2, not a stable `{"code": "content_too_large"}` from our API. Our error-code contract (§1) breaks.
+
+The take-home scope excludes authentication and rate-limiting infrastructure. That is not an excuse to skip limits — it is the reason to pick them carefully. Every boundary is either **enforced now** (with a dedicated error code) or **explicitly accepted as unlimited at evaluation scale** (with a named reason and a production mitigation).
+
+No implicit limits. No "we'll figure it out later." Every knob is named.
+
+### Layered Enforcement Model
+
+```
+Client
+  │
+  ▼
+[chi router]          ← URL length (Go default 8 KiB header line; 1 MiB total header block)
+  │                   ← HTTP header block (Go default 1 MiB — deployment-plan.md §4.6)
+  ▼
+[middleware]          ← X-Agent-ID format (§2 Agent Auth: UUID parse)
+                      ← X-Request-ID length + charset (§2 Request ID: ≤128 chars, silent fallback)
+                      ← Content-Type validation (§4)
+                      ← Timeout binding (§5)
+  │
+  ▼
+[handler]             ← JSON body: MaxBytesReader per endpoint (§3 table)
+                      ← NDJSON line: explicit 1 MiB + 1 KiB scanner buffer (§6.1)
+                      ← Path params: UUID parse
+                      ← Body invariants: UTF-8, non-empty content, UUIDv7 IDs
+  │
+  ▼
+[store / S2 client]   ← Postgres UNIQUE constraints (defacto limits — §6.4)
+                      ← S2 record ≤ 1 MiB (enforced by S2; mapped to content_too_large)
+```
+
+Fail fast on the cheapest check first. Header checks before body parsing. Length checks before semantic validation. Path-parameter parsing before membership lookup. Membership lookup before any S2 call.
+
+### 6.1 The NDJSON Scanner Buffer (Correctness-Critical)
+
+Go's `bufio.Scanner` default buffer is 64 KiB. S2's record limit is 1 MiB. If we use `bufio.NewScanner(r.Body)` unchanged, long tokens, tool-call arguments, or base64-encoded content cause `scanner.Scan()` to return `false` with `bufio.ErrTooLong`. The handler then cannot distinguish "client closed cleanly" from "line too long" without inspecting `scanner.Err()`. Mishandled, this silently produces `message_abort` events with reason `eof` when the real cause was an oversized line.
+
+**Decision: explicit 1 MiB + 1 KiB scanner buffer, with an explicit error mapping.**
+
+```go
+const maxNDJSONLineBytes = 1<<20 + 1024 // 1 MiB + 1 KiB envelope overhead
+
+scanner := bufio.NewScanner(body) // body already wrapped with idle-timeout reader (§5)
+scanner.Buffer(make([]byte, 64<<10), maxNDJSONLineBytes)
+
+for scanner.Scan() {
+    // process line
+}
+if err := scanner.Err(); err != nil {
+    switch {
+    case errors.Is(err, bufio.ErrTooLong):
+        abortMessage(ctx, s, messageID, "line_too_large")
+        writeError(w, 413, "line_too_large",
+            fmt.Sprintf("NDJSON line exceeds %d bytes", maxNDJSONLineBytes))
+        return
+    case errors.Is(err, context.Canceled),
+         errors.Is(err, context.DeadlineExceeded),
+         errors.Is(err, os.ErrDeadlineExceeded):
+        // Idle timeout (§5) or client disconnect — handled by the existing abort path.
+        abortMessage(ctx, s, messageID, "eof")
+        return
+    default:
+        // TCP read error, framing error — existing internal-error path.
+        abortMessage(ctx, s, messageID, "eof")
+        return
+    }
+}
+```
+
+**Why 1 MiB + 1 KiB:** S2's 1 MiB record cap is the natural ceiling for the `content` field. The extra 1 KiB envelope accommodates the JSON framing (`{"content":"..."}` plus any optional fields) without reserving additional room for content itself. A line that clears the scanner but subsequently fails S2's 1 MiB check surfaces as a distinct S2 error (mapped to `content_too_large`, 413) — two limits, two codes, two root causes.
+
+**Why the initial buffer is 64 KiB (not 1 MiB):** `bufio.Scanner.Buffer` takes both an initial buffer AND a maximum. The scanner grows the buffer on demand. For 99% of lines (a few hundred bytes each — one LLM token per line), the 64 KiB initial slab never grows. Pre-allocating 1 MiB per concurrent stream would waste memory at 1k+ concurrent writes (1 GiB of idle buffer).
+
+**Interaction with the idle-timeout pattern (§5 Streaming Write Lifecycle):** The `http.ResponseController.SetReadDeadline` approach from §5 fires `os.ErrDeadlineExceeded` through `scanner.Err()`. Our mapping above preserves that path — deadline errors don't collide with `ErrTooLong`.
+
+**Interaction with the "abort on bad JSON line" decision (§3 Streaming Send endpoint):** JSON-malformed lines are caught by the in-loop `json.Unmarshal` call, not by the scanner. The scanner's job is byte framing; JSON validity is the handler's job. These two paths do not overlap and each has its own abort reason.
+
+### 6.2 Header Validation
+
+**`X-Agent-ID` (required on authenticated routes).** Validated by the Agent Auth middleware (§2 Middleware 4). Existing error codes: `missing_agent_id` (400), `invalid_agent_id` (400 — not a valid UUID), `agent_not_found` (404 — valid UUID but unknown). No new codes needed here.
+
+Note: the middleware accepts any valid UUID, not only UUIDv7. In practice every agent ID we issue is UUIDv7 (§ `sql-metadata-plan.md` §4), so a client passing a UUIDv4 will always fail at the DB lookup with `agent_not_found`. Tightening the middleware to reject non-UUIDv7 at parse time is a one-line regex change; we defer it because the existing codes already cover the failure unambiguously.
+
+**`X-Request-ID` (optional, echoed in response).**
+
+| Property | Value | Rationale |
+|---|---|---|
+| Length | 1 to 128 characters | 128 is generous for UUIDs, trace IDs, ULIDs, concatenated traces |
+| Charset | ASCII printable (`0x20`–`0x7E`) | Prevents log-injection via control characters; prevents header-smuggling via CRLF |
+| Missing | Server generates a UUIDv4 | §2 Middleware 2 |
+| Oversized | Silently replaced with a server-generated UUIDv4 | Do NOT 400 on request ID problems — the request itself is still valid. Log a warning |
+| Invalid charset | Silently replaced | Same rationale |
+
+**Why silently replace (not reject):** `X-Request-ID` is a correlation aid, not a semantic input. A client that sent a garbled one still deserves a response. Rejecting would turn a log-correlation bug into a user-facing failure.
+
+**`Content-Type`:** already covered in §4.
+
+**Unknown headers:** passed through untouched. Do not strip. Do not fail. (Reverse proxies inject headers routinely.)
+
+### 6.3 Body Invariants (Post-Parse)
+
+After `decodeJSON` (§3) or NDJSON line parse succeeds, the following checks run in the handler before any S2 call:
+
+| Invariant | Violation | Error |
+|---|---|---|
+| `content` non-empty on `message_append` / complete-message | Empty string | `400 empty_content` (already in §1) |
+| `content` is valid UTF-8 | Non-UTF-8 byte sequence | `400 invalid_utf8` (new in §1) |
+| `message_id` is UUIDv7 (not UUIDv4) | Wrong version bits | `400 invalid_message_id` (already in §1) |
+| `conversation_id` path param is a UUID | Not parseable | `400 invalid_conversation_id` (already in §1) |
+| `agent_id` in invite body is a UUID | Not parseable | `400 invalid_field` (already in §1) |
+
+**Why UTF-8 validation is nearly free.** `json.Unmarshal` into a Go `string` performs UTF-8 validation as a side effect of decoding. We do not add a second pass. The only explicit UTF-8 check we add is for the complete-message `content` field at the type boundary — a one-liner:
+
+```go
+if !utf8.ValidString(req.Content) {
+    writeError(w, 400, "invalid_utf8", "Content is not valid UTF-8")
+    return
+}
+```
+
+For the streaming path, the `content` field on each NDJSON line goes through `json.Unmarshal` into a string, which already enforces UTF-8. The `invalid_utf8` code is therefore only reachable on the complete-message path in practice. It is still listed on the streaming endpoint's table because a future change that routes raw bytes rather than strings would need the code to exist.
+
+**Why empty-content rejection is at the API layer, not the event model.** The event model (`event-model-plan.md` §2) treats the event as a pure data structure with no semantic rules. The HTTP layer owns the "an append is by definition a non-empty delta" rule. This keeps the event model reusable (e.g., by the resident agent, which constructs events directly).
+
+**Zero-width / invisible content:** not rejected. A client that sends `\u200B` (zero-width space) gets that exact byte through to the stream. Plaintext preservation (README) forbids normalization.
+
+**Max content per `message_append`:** naturally bounded by the scanner (1 MiB + 1 KiB) and S2 (1 MiB record). No explicit handler check — the scanner check fires first. This is intentional: one limit, one error path, no redundant code.
+
+### 6.4 Defacto Limits (Enforced Elsewhere, Cross-Referenced Here)
+
+These limits are real but enforced outside the API layer. Listed here so the reader of this plan sees the full picture:
+
+| Limit | Where Enforced | Error at Violation |
+|---|---|---|
+| One SSE connection per `(agent, conversation)` | Connection registry — `sql-metadata-plan.md` §10 | Existing stream closed; new stream wins |
+| One in-progress message per `(conversation, message_id)` | `in_progress_messages` UNIQUE — `s2-architecture-plan.md` §10 | `409 in_progress_conflict` |
+| Message dedup by `(conversation, message_id)` | `messages_dedup` PK — `sql-metadata-plan.md` §5 | `200/201` with cached `seq_start`/`seq_end` (idempotent replay) or `409 already_aborted` |
+| S2 record ≤ 1 MiB | S2 itself | Mapped by the S2 client wrapper to `413 content_too_large` |
+| S2 batch ≤ 1000 records or 1 MiB | S2 `AppendSession` SDK | Handled internally by `AppendSession` batching |
+| Header block ≤ 1 MiB | Go `http.Server.MaxHeaderBytes` default — `deployment-plan.md` §4.6 | `431 Request Header Fields Too Large` (stdlib) |
+| URL path length | Go `http.Server` default buffers | Stdlib `414 URI Too Long` |
+| Per-request timeouts | §5 Timeout Tiers | `408` or `504` per tier |
+
+### 6.5 Accepted-Surface (Documented, Not Enforced)
+
+At evaluation scale (a handful of agents, tens of conversations) these are safe at their default of "unlimited." Each is named so the senior-engineer reading this knows we thought about it.
+
+| Knob | Current Behavior | Fails at Roughly | Production Enforcement |
+|---|---|---|---|
+| Conversations per agent | Unlimited | 10⁶ rows in `conversation_members` per agent before list query degrades | Per-agent quota via a `quotas` table; 429 on exceed |
+| Members per conversation | Unlimited | At ~10³ members per conversation, `agent_joined`/`agent_left` fanout starts to dominate event volume | Hard cap (e.g., 256), 400 on invite over cap |
+| Total agents | Unlimited | Neon row storage cost — not a failure mode, just a bill | Agent TTL: unused agents expire after N days |
+| Total conversations | Unlimited | S2 stream creation rate limits + basin capacity | Tenant quota on basin; per-tenant basins |
+| Concurrent SSE across all agents | Fly machine file-descriptor limit (~65k) | ~30–50k concurrent streams per Fly machine | Admission control + horizontal scaling; `server-lifecycle-plan.md` §6 |
+| Concurrent NDJSON writes across all agents | Same fd limit; S2 AppendSession count | Same ~30–50k before fd pressure | Same |
+| Per-agent request rate | No rate limiting | Unbounded — a misbehaving client can saturate the instance | Token bucket per `X-Agent-ID`; §7 Rate Limiting |
+| Per-agent concurrent requests | No limit | Per-agent amplification of any other pressure | Semaphore per agent, 429 on exceed |
+| Message bytes per conversation (lifetime) | Unlimited (28-day S2 retention bounds it) | S2 storage cost only | Per-conversation quota |
+| NDJSON stream duration | 5-min idle timeout (§5); no absolute maximum | An open stream producing one token per 4 min runs forever | Absolute max stream duration (e.g., 1 hour) |
+
+**Explicit statement for the evaluator:** every item in this table is an accepted risk for the take-home scope, not an oversight. At production scale, every row gets an enforcement story; the enforcement story lives in `future-plan.md`.
+
+**The single exception that IS enforced now:** the take-home still requires the system to survive a single well-behaved evaluator's test suite. If evaluation reveals any of these surfaces as a real failure mode, the fix is localized (a single middleware, a single UNIQUE constraint, a single admission counter) — not a redesign.
+
+### 6.6 Error-Code Additions to the §1 Registry
+
+This section introduces the following stable codes into §1:
+
+| Code | Status | Category | Introduced in |
+|---|---|---|---|
+| `line_too_large` | 413 | Request size | §6.1 NDJSON scanner |
+| `content_too_large` | 413 | Request size | §6.4 S2 1 MiB mapping |
+| `invalid_utf8` | 400 | Validation | §6.3 Body invariants |
+| `request_too_large` | 413 | Request size | Existing behavior of `decodeJSON` (§3) — formalized here |
+
+All four are stable contract codes. Clients branch on them exactly like the rest of §1.
+
+### 6.7 Testing Strategy
+
+Four tests — table-driven where possible, no ceremony:
+
+1. **NDJSON oversize line.** Build a POST body with a 2 MiB content field in one line. Assert `413 line_too_large`. Assert a `message_abort` event with reason `line_too_large` is written to S2.
+2. **Header validation matrix.** Table-driven: missing, malformed, wrong-length, non-ASCII `X-Agent-ID` → assert the correct existing error code per row. Same for `X-Request-ID` silent-fallback behavior.
+3. **Body invariants.** Complete-message POST with: empty content, non-UTF-8 bytes (`\xC3\x28`), UUIDv4 `message_id` → assert the three correct error codes.
+4. **Idle stream bound.** Open an NDJSON POST, send one line, wait 5 min 10s. Assert the stream closes with the existing idle-timeout path from §5 (no new code — verifies our limits don't break the existing timeout contract).
+
+All four run against real Postgres + a throwaway S2 basin. These are boundary tests; mocks defeat them.
+
+### 6.8 Files Touched
+
+- `internal/api/middleware/request_id.go` — length/charset guard with silent fallback
+- `internal/api/handlers/stream_write.go` — explicit `scanner.Buffer(...)` + error mapping
+- `internal/api/handlers/messages.go` — `utf8.ValidString` on complete-message `content`
+- `internal/api/handlers/errors.go` — four stable codes registered (`line_too_large`, `content_too_large`, `invalid_utf8`, `request_too_large`)
+- `internal/s2/errors.go` — map S2 "record too large" to `content_too_large`
+- No schema changes. No store changes. No middleware order changes.
+
+---
+
+## 7. Cross-Cutting Concerns
 
 ### Response Writing Helper
 
@@ -1725,10 +2117,17 @@ If the evaluator tests from a browser-based tool (Postman, Insomnia, or a custom
 | POST /conversations | No (each call creates new conversation) | By design |
 | POST /conversations/{cid}/invite | Yes | `INSERT ... ON CONFLICT DO NOTHING` |
 | POST /conversations/{cid}/leave | No (second leave returns 403) | Membership check |
-| POST /conversations/{cid}/messages | No (each call creates new message) | By design |
-| POST /conversations/{cid}/messages/stream | No (each call creates new message) | `message_id` as recovery key |
+| POST /conversations/{cid}/messages | **Yes** (keyed by client-supplied `message_id`) | `messages_dedup` + UNIQUE on `in_progress_messages` |
+| POST /conversations/{cid}/messages/stream | **Yes** (keyed by client-supplied `message_id` on first NDJSON line) | `messages_dedup` + UNIQUE on `in_progress_messages` |
+| POST /conversations/{cid}/ack | Yes (regression-guarded) | `WHERE ack_seq < EXCLUDED.ack_seq` |
 
-No explicit idempotency key header needed. The natural semantics are sufficient.
+**Write-path idempotency contract.** Both message-write endpoints require a client-supplied `message_id` (UUIDv7). The same `message_id` submitted twice is idempotent:
+
+1. If the prior attempt completed, the server replays the cached `start_seq` + `end_seq` from `messages_dedup` with `already_processed: true`. Same HTTP status, same response shape.
+2. If the prior attempt was aborted (client disconnect, leave mid-stream, slow-writer timeout, recovery sweep), the server returns `409 already_aborted`. The client must generate a fresh `message_id` to retry.
+3. If a concurrent attempt is in flight (two requests racing), the second hits the `UNIQUE (conversation_id, message_id)` on `in_progress_messages` and receives `409 in_progress_conflict`.
+
+No `Idempotency-Key` header. The `message_id` is already the message's identity and the key readers demultiplex by on the S2 stream — collapsing identity and idempotency into one field keeps the contract tight and the handler logic branch-free. See [sql-metadata-plan.md](sql-metadata-plan.md) §5 (`messages_dedup` table) and §12 (queries).
 
 ### Request Logging Correlation
 
@@ -1757,7 +2156,7 @@ The 30-second CRUD timeout ensures in-flight requests don't block shutdown indef
 
 ---
 
-## 7. Handler Structure Template
+## 8. Handler Structure Template
 
 Every handler follows the same structure:
 
@@ -1811,7 +2210,7 @@ func (h *Handler) ExampleEndpoint(w http.ResponseWriter, r *http.Request) {
 
 ---
 
-## 8. Complete Endpoint Summary
+## 9. Complete Endpoint Summary
 
 ```text
 ┌───────┬──────────────────────────────────────────┬──────────┬────────┬───────────┬─────────┐
@@ -1833,7 +2232,7 @@ func (h *Handler) ExampleEndpoint(w http.ResponseWriter, r *http.Request) {
 
 ---
 
-## 9. Scaling Considerations for the API Layer
+## 10. Scaling Considerations for the API Layer
 
 ### At Thousands (Take-Home)
 
@@ -1858,7 +2257,7 @@ Everything in this document works as-is. Single Fly.io instance, `sync.Map` agen
 
 ---
 
-## 10. Files
+## 11. Files
 
 All HTTP API layer code lives in `internal/api/`:
 

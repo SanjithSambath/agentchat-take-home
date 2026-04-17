@@ -85,11 +85,11 @@ Six event types on the S2 stream: `message_start`, `message_append`, `message_en
 
 ### 4. Write Path
 
-Two write patterns, both writing to the same S2 stream:
+Two write patterns, both writing to the same S2 stream. Both require the client to supply `message_id` (UUIDv7) as the idempotency key — for the complete POST it is a required JSON field; for the streaming POST it is declared on the mandatory first NDJSON line. Retries with the same `message_id` either replay the cached result (`already_processed: true`) or receive `409 already_aborted` so the client generates a fresh id.
 
-**Complete message send** (`POST /conversations/{cid}/messages`): Server writes `[message_start, message_append, message_end]` as a single S2 batch append — atomic, all-or-nothing. Single round-trip.
+**Complete message send** (`POST /conversations/{cid}/messages`): Body carries `{"message_id", "content"}`. Server runs the dedup gate (see `messages_dedup` + UNIQUE on `in_progress_messages` in §8), then writes `[message_start, message_append, message_end]` as a single S2 batch append — atomic, all-or-nothing. Single round-trip.
 
-**Streaming message send** (`POST /conversations/{cid}/messages/stream`): Agent opens a single HTTP POST with an NDJSON streaming body. Server reads `{"content":"..."}` lines via `bufio.NewScanner(r.Body)`, appending each to S2 in real-time via pipelined AppendSession. Message lifecycle is implicit in the HTTP request lifecycle — start = request received, chunks = NDJSON lines, end = body closes, abort = connection drops.
+**Streaming message send** (`POST /conversations/{cid}/messages/stream`): Agent opens a single HTTP POST with an NDJSON streaming body. Server reads the first line `{"message_id":"..."}` to run the dedup gate, then reads `{"content":"..."}` lines via `bufio.NewScanner(r.Body)` with an explicit 1 MiB + 1 KiB line-buffer cap (see [`http-api-layer-plan.md`](http-api-layer-plan.md) §6.1), appending each to S2 in real-time via pipelined AppendSession. Every `Submit` is wrapped with a 2 s `context.WithTimeout` so a stalled S2 path cannot pin the handler goroutine indefinitely — on timeout, the handler enters the shared `abort` path (Unary-append `message_abort`, record `messages_dedup` aborted, delete `in_progress_messages`, return `503 slow_writer`). Message lifecycle is implicit in the HTTP request lifecycle — start = dedup gate passed and `message_start` appended, chunks = NDJSON lines, end = body closes, abort = connection drops, leave, or Submit timeout.
 
 **Why NDJSON streaming POST** (not WebSocket, not per-token HTTP POST): HTTP-native (every proxy understands it), agent-friendly (12 lines of sync Python), decoupled from read path (independent failure domains), stateless for horizontal scaling, standard middleware applies unchanged. WebSocket and per-token POST were evaluated and rejected with full rationale.
 
@@ -129,13 +129,13 @@ S2 is the entire message storage and delivery layer. One stream per conversation
 - **ReadSession (tailing):** One per SSE connection. Catch-up → real-time, indefinite tailing.
 - **Read range:** History endpoint, recovery sweep. Bounded batch, no tailing.
 
-**Crash recovery:** `in_progress_messages` PostgreSQL table tracks active streaming writes. On server restart, recovery sweep writes `message_abort` for each row. No S2 stream scanning.
+**Crash recovery:** `in_progress_messages` PostgreSQL table tracks active streaming writes. On server restart, recovery sweep, per row: (1) writes `message_abort` to S2, (2) inserts a `messages_dedup` row with `status='aborted'` (`ON CONFLICT DO NOTHING`) so a client that retries with the same `message_id` receives `409 already_aborted` rather than silently starting a new write, (3) deletes the `in_progress_messages` row. No S2 stream scanning.
 
 → Full architecture: [`s2-architecture-plan.md`](s2-architecture-plan.md)
 
 ### 8. PostgreSQL Metadata (Neon)
 
-Five tables: `agents`, `conversations` (with cached `head_seq` updated inline on every S2 append, powers the unread query), `members`, `cursors` (two columns per row — `delivery_seq` + `ack_seq`), `in_progress_messages`. pgx v5 native interface + sqlc code generation. UUIDv7 primary keys. pgxpool with 15 connections (~50K queries/sec throughput on indexed point lookups).
+Six tables: `agents`, `conversations` (with cached `head_seq` updated inline on every S2 append, powers the unread query), `members`, `cursors` (two columns per row — `delivery_seq` + `ack_seq`), `in_progress_messages` (UNIQUE `(conversation_id, message_id)` is the in-flight idempotency gate), `messages_dedup` (terminal-outcome record per `(conversation_id, message_id)` — `complete` rows carry cached `start_seq` / `end_seq` for idempotent replay; `aborted` rows make retries return `409 already_aborted`). pgx v5 native interface + sqlc code generation. UUIDv7 primary keys. pgxpool with 15 connections (~50K queries/sec throughput on indexed point lookups).
 
 **Caching layers:**
 - Agent existence: `sync.Map` (write-once, read-many, ~50ns reads, no eviction needed)
@@ -163,11 +163,11 @@ Standard JSON error envelope on every error. Machine-readable `code` for AI agen
 | GET | `/conversations` | Yes | 30s | — | JSON |
 | POST | `/conversations/{cid}/invite` | Yes | 30s | JSON | JSON |
 | POST | `/conversations/{cid}/leave` | Yes | 30s | — | JSON |
-| POST | `/conversations/{cid}/messages` | Yes | 30s | JSON | JSON |
+| POST | `/conversations/{cid}/messages` | Yes | 30s | JSON `{message_id,content}` | JSON |
 | GET | `/conversations/{cid}/messages` | Yes | 30s | — | JSON |
 | POST | `/conversations/{cid}/ack` | Yes | 30s | JSON | — |
 | GET | `/agents/me/unread` | Yes | 30s | — | JSON |
-| POST | `/conversations/{cid}/messages/stream` | Yes | — | NDJSON | JSON |
+| POST | `/conversations/{cid}/messages/stream` | Yes | — | NDJSON `{message_id}`, then `{content}`… | JSON |
 | GET | `/conversations/{cid}/stream` | Yes | — | — | SSE |
 
 → Full design (errors, middleware, contracts, timeouts): [`http-api-layer-plan.md`](http-api-layer-plan.md)
