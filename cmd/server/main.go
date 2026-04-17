@@ -13,11 +13,11 @@
 //  6. If configured, construct the Anthropic client and start the resident
 //     Claude agent.
 //  7. Build the HTTP router and serve.
-//  8. On SIGINT/SIGTERM, drain in this order: HTTP server (graceful, then
-//     hard), resident agent, per-pair connection registry (via per-agent
-//     leaves that already happened; otherwise BaseContext cancellation),
-//     final cursor flush, Postgres close. See
-//     ALL_DESIGN_IMPLEMENTATION/server-lifecycle-plan.md §Shutdown.
+//  8. On SIGINT/SIGTERM (e.g. a `cloudflared tunnel` restart or local Ctrl-C),
+//     drain in this order: HTTP server (graceful, then hard), resident agent,
+//     per-pair connection registry (via per-agent leaves that already happened;
+//     otherwise BaseContext cancellation), final cursor flush, Postgres close.
+//     See ALL_DESIGN_IMPLEMENTATION/server-lifecycle-plan.md §Shutdown.
 package main
 
 import (

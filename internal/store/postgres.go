@@ -371,11 +371,12 @@ func (s *postgresMetadataStore) StartDeliveryCursorFlusher(ctx context.Context) 
 		return
 	}
 	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
 	s.flushCtx = runCtx
 	s.flushCancel = cancel
-	s.flushDone = make(chan struct{})
+	s.flushDone = done
 	go func() {
-		defer close(s.flushDone)
+		defer close(done)
 		s.cursors.Run(runCtx)
 	}()
 }

@@ -245,11 +245,12 @@ GAP 1 SUBSTEPS END
   ---
   Gap 6: Deployment Configuration
 
-  Dockerfile and fly.toml are listed but not specified:
+  Deployment surface (static Go binary + Cloudflare Tunnel) is listed but not specified:
 
-  - Multi-stage Docker build: what base image? What Go version? Static binary?
-  - fly.toml: machine size, region, internal port, health check config, env var secrets?
-  - How are secrets (DATABASE_URL, S2_ACCESS_TOKEN, ANTHROPIC_API_KEY) managed? fly secrets set?
+  - Build flags for the static binary: `CGO_ENABLED=0`, `-trimpath`, `-ldflags`?
+  - Host sizing, port, health check wiring, process supervisor (systemd/launchd)?
+  - `cloudflared` mode (quick `trycloudflare.com` vs named tunnel with `ingress:` YAML)?
+  - How are secrets (DATABASE_URL, S2_ACCESS_TOKEN, ANTHROPIC_API_KEY) managed? `.env` + shell export, systemd `EnvironmentFile=`, or cloud secrets manager?
 
   ---
   Priority Order for Remaining Design Work

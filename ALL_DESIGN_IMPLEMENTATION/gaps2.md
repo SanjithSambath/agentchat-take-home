@@ -122,7 +122,7 @@ What needs designing:
 
 Structured log schema: mandatory fields (request_id, agent_id, conversation_id, seq, message_id, component, level), JSON format
 Log levels policy (what's INFO vs DEBUG vs WARN)
-Log aggregation path on Fly.io (stdout → Fly logs) and where that goes next (Axiom/Betterstack/Loki) with cost
+Log aggregation path for the Cloudflare-tunneled host (stdout → journalctl / systemd-cat or container log driver) and where that goes next (Axiom/Betterstack/Loki) with cost
 Metrics: concrete list of counters / gauges / histograms worth emitting, not "metrics: active SSE connections, messages/sec" (that's naming not designing)
 Metrics transport: Prometheus scrape endpoint? OTLP push? Does the take-home emit them even if no scraper exists?
 Distributed tracing: OpenTelemetry spans on each handler, each S2 operation, each DB query — or deferred to FUTURE.md with explicit rationale
@@ -234,7 +234,7 @@ Severity: Medium. Explicitly deferred but the deferral isn't sufficient.
 
 server-lifecycle-plan.md §6 acknowledges: "Multiple instances each run their own agent, all listening to the same conversations, all responding to every message. Fix: leader election for agent ownership. Document in FUTURE.md."
 
-That's three sentences. "Leader election" is hand-wavy — is it Fly.io machine uniqueness, Postgres advisory lock, Redis SETNX, Raft quorum? Each has different failure modes. Since FUTURE.md doesn't exist yet, this promise is currently a rounding error.
+That's three sentences. "Leader election" is hand-wavy — is it a single-instance invariant enforced by the process supervisor, a Postgres advisory lock, Redis SETNX, Raft quorum? Each has different failure modes. Since FUTURE.md doesn't exist yet, this promise is currently a rounding error.
 
 Recommend: Either a concrete resident-agent-HA section inside future-plan.md (once that exists) or an acknowledgment that the take-home deploys single-instance with a documented failure mode (evaluator sees downtime during deploy rolling restarts), and that's the accepted trade-off.
 

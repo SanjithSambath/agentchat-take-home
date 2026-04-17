@@ -24,7 +24,7 @@ Conversation events live in [S2](https://s2.dev) streams (one stream per convers
 
 **Writes: NDJSON over a single POST** (`POST /conversations/{cid}/messages/stream`). The client sends a header line (`{"message_id": "..."}`), then one JSON chunk per line, then closes. On EOF the server emits `message_end` and returns 200. On client disconnect the server emits `message_abort(disconnect)` and closes the S2 append session.
 
-**Why not WebSocket.** A WebSocket buys bidirectionality we don't need (the server's response on a streaming write is terminal, not an ongoing dialog) and costs us: framing, heartbeats, upgrade middleware, and a second transport to proxy across Fly.io's edge. A single POST with NDJSON is boringly HTTP — every HTTP proxy, load balancer, and debug tool already understands it.
+**Why not WebSocket.** A WebSocket buys bidirectionality we don't need (the server's response on a streaming write is terminal, not an ongoing dialog) and costs us: framing, heartbeats, upgrade middleware, and a second transport to proxy across Cloudflare's edge. A single POST with NDJSON is boringly HTTP — every HTTP proxy, load balancer, and debug tool already understands it.
 
 **Reads: SSE** (`GET /conversations/{cid}/stream`) with `id:` = S2 seq, `Last-Event-ID` for auto-resume, 30 s heartbeat comments, 24 h absolute cap.
 
@@ -55,7 +55,7 @@ Every write — complete or streaming — is gated by two Postgres tables:
 
 **Why.** Two concurrent SSE streams from the same agent to the same conversation would double-deliver. Two concurrent streaming writes with the same `message_id` would get gated by `in_progress_messages` anyway, but two writes with *different* `message_id`s are legitimate — so the write registry tracks multiple by `message_id` while the SSE registry enforces exclusivity.
 
-**Trade-off.** The registry is in-memory per instance. With a single Fly.io machine this is correct; a fleet of instances needs a coordination layer (Redis pub/sub, or sticky routing by agent id) — see `FUTURE.md` §horizontal scaling.
+**Trade-off.** The registry is in-memory per instance. With a single process behind one Cloudflare Tunnel this is correct; a fleet of instances needs a coordination layer (Redis pub/sub, or sticky routing by agent id at the Cloudflare Load Balancer / Worker layer) — see `FUTURE.md` §horizontal scaling.
 
 ## 7. Resident Claude agent as a first-class HTTP client (almost)
 
@@ -75,22 +75,24 @@ The resident agent is wired in-process: when `RESIDENT_AGENT_ID` and `ANTHROPIC_
 - `google/uuid` — UUIDv7 for `message_id` (time-ordered, useful for tie-breaks and debugging).
 - `rs/zerolog` — structured logging with zero allocations on the hot path. Request ID is attached at middleware level and flows through every handler log line.
 
-## 9. Deployment: single Fly.io machine, `iad` region
+## 9. Deployment: single Go binary behind a Cloudflare Tunnel
 
-`shared-cpu-1x`, 512 MB RAM, multi-stage Docker (Go builder → Alpine runtime, non-root user, ~15 MB image). `iad` is the region closest to Neon's `us-east-1` Postgres, minimizing the round-trip on the hot path.
+The server compiles to one static Go binary (`go build ./cmd/server`) and runs on any host — laptop, VM, bare metal — reading configuration from the process environment. Public ingress is a `cloudflared tunnel` pointing at `http://localhost:8080`; Cloudflare's edge terminates TLS and forwards HTTP/2 to the local port. No inbound ports, no certificates to manage, no container runtime required.
 
-**Why one instance.** The state that matters (S2, Postgres) is managed. The in-memory state (caches, connection registry, cursor hot tier) is per-instance but not shared — correctness doesn't depend on it being global. The only correctness risk with horizontal scaling is the single-connection invariant (see §6), which is why we ship one machine for now.
+**Why cloudflared + one binary.** The managed state (S2, Postgres) is what matters; the server itself is stateless apart from in-memory caches and the connection registry. A single Go binary + tunnel collapses the deploy surface to "run the binary" — no platform-specific config, no Dockerfile, no region pinning. The tunnel is long-lived, HTTP/2-native, and handles SSE and NDJSON streaming without reverse-proxy surprises.
 
-**Graceful shutdown** drains in this exact order: HTTP server graceful → resident agent shutdown → final cursor flush → Postgres pool close. A shared `shutdownCtx` enforces the budget end-to-end.
+**One instance.** In-memory state (caches, `ConnRegistry`, cursor hot tier) is per-process and not shared — correctness does not depend on it being global. The only correctness risk with horizontal scaling is the single-connection invariant (see §6), which is why we ship one instance; see FUTURE.md §1 for the sticky-routing + pub/sub story.
 
-**Health check** pings Postgres and S2 in parallel, each with a 3 s budget, under the Fly 5 s ceiling. A stream-not-found on the nil-UUID probe is treated as S2 success — it still proves auth and routing.
+**Graceful shutdown** drains in this exact order on SIGINT/SIGTERM: HTTP server graceful → resident agent shutdown → final cursor flush → Postgres pool close. A shared `shutdownCtx` enforces the budget end-to-end, so `cloudflared`'s connection drain and a local Ctrl-C both converge on the same deterministic exit path.
+
+**Health check** at `GET /health` pings Postgres and S2 in parallel, each with a 3 s budget, returning 200 on both-ok and 503 otherwise with a per-dependency breakdown. A stream-not-found on the nil-UUID S2 probe is treated as success — it still proves auth and routing. Cloudflare's tunnel doesn't probe this for us; external uptime checks (UptimeRobot, Pingdom, or a Cloudflare Worker on a cron) are the right wiring for alerting.
 
 **Crash recovery.** On startup, before accepting HTTP traffic, the server sweeps `in_progress_messages` and finalizes each row: append `message_abort(server_crash)` to S2, dedup-abort in Postgres, delete the claim. Transient dedup/delete failures retry with short backoff; anything left over reruns on the next restart.
 
 ## 10. What we explicitly chose not to do
 
 - **Authentication beyond `X-Agent-ID`.** The take-home doesn't require real auth; the header is a stand-in for an eventual bearer token / mTLS / signed JWT.
-- **Rate limiting.** Not in scope; the runtime (Fly.io) gives us a basic concurrency cap.
+- **Rate limiting.** Not in scope; Cloudflare's edge rate limiting (free tier: 10k requests/month per rule) and the Go server's own connection handling give us a basic concurrency cap.
 - **Per-agent conversation list pagination.** Current `ListConversationsForAgent` returns everything the agent is a member of. Fine for the take-home; needs cursor pagination at scale.
 - **Multi-region.** One region, one machine. See `FUTURE.md` for the multi-region plan.
 - **Message-level encryption.** S2 encrypts at rest; we don't layer end-to-end.

@@ -57,8 +57,8 @@ func TestReconnectWithLastEventID(t *testing.T) {
 }
 
 // TestHistoryEndpointReturnsCompletedMessages validates that the history
-// endpoint surfaces completed messages in send order with strictly
-// increasing seq_start.
+// endpoint default (no query params) surfaces completed messages newest-first
+// with strictly decreasing seq_start.
 func TestHistoryEndpointReturnsCompletedMessages(t *testing.T) {
 	ts := startTestServer(t, false)
 	defer ts.Close()
@@ -81,9 +81,9 @@ func TestHistoryEndpointReturnsCompletedMessages(t *testing.T) {
 		t.Fatalf("expected >=3 messages, got %d", len(hist.Messages))
 	}
 	var lastStart uint64
-	for _, m := range hist.Messages {
-		if m.SeqStart <= lastStart {
-			t.Fatalf("history seq_start non-monotone: %d <= %d", m.SeqStart, lastStart)
+	for i, m := range hist.Messages {
+		if i > 0 && m.SeqStart >= lastStart {
+			t.Fatalf("history seq_start not strictly decreasing: %d >= %d", m.SeqStart, lastStart)
 		}
 		lastStart = m.SeqStart
 	}

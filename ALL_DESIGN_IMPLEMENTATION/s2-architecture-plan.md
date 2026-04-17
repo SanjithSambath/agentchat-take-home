@@ -973,7 +973,7 @@ If a ReadSession fails mid-stream:
 ### Current Design (Take-Home)
 
 - Single basin: `agentmail` in `aws:us-east-1`
-- Single Go server instance on Fly.io (`iad` region)
+- Single Go server host behind a Cloudflare Tunnel (colocated in `us-east-1`)
 - Express storage class for all streams
 - 28-day retention (free tier)
 - Estimated capacity: thousands of concurrent conversations, hundreds of concurrent SSE connections

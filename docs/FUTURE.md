@@ -4,11 +4,11 @@ How we'd revisit the design given no time, cost, or ops constraints. Scoped to t
 
 ## 1. Horizontal scaling and the single-connection invariant
 
-**Today.** One Fly.io machine. The single-connection-per-(agent, conversation) invariant lives in `ConnRegistry`, an in-memory map. A leave-cancel is a synchronous operation on one process's state.
+**Today.** One process behind a single Cloudflare Tunnel. The single-connection-per-(agent, conversation) invariant lives in `ConnRegistry`, an in-memory map. A leave-cancel is a synchronous operation on one process's state.
 
 **Future.** Horizontal fan-out across a fleet of instances. Two pieces need work:
 
-1. **Sticky routing by agent id.** Put a layer-7 router (Fly.io's `fly-replay` or a dedicated ingress) that hashes `X-Agent-ID` to a specific machine. Now one agent's SSE streams and streaming writes always land on the same instance; `ConnRegistry` stays local and correct without coordination.
+1. **Sticky routing by agent id.** Put a layer-7 router in front (Cloudflare Load Balancer with session affinity keyed on `X-Agent-ID`, a Cloudflare Worker that consistent-hashes to a specific tunnel, or a dedicated ingress like Envoy) that always lands one agent's SSE streams and streaming writes on the same instance; `ConnRegistry` stays local and correct without coordination.
 2. **Cross-instance leave notification.** When `agent A` leaves `conversation C` on instance 1, an SSE connection for `A × C` on instance 2 (because of a sticky misroute during a deploy) won't see the cancel. Fix with a lightweight pub/sub channel (Redis pub/sub, or S2 itself — publish a control event per (agent, conv) pair and every instance subscribes to control topics for agents it currently serves).
 
 The pragmatic version: sticky routing solves 99% of it; the pub/sub fallback is just belt-and-suspenders for deploy windows.
@@ -62,12 +62,12 @@ This is mostly a wiring exercise (Otel + Prom libraries are mature) but it's the
 
 ## 9. Multi-region
 
-**Today.** Single region (`iad`) colocated with Neon. Global agents all talk to us over the public internet; west-coast and APAC clients pay ~150 ms and ~250 ms RTT respectively.
+**Today.** Single process, single host (typically `us-east` colocated with Neon). Cloudflare's edge terminates TLS globally — the tunnel hop itself is fast — but the origin is still one box, so the origin-to-Neon round-trip anchors latency. West-coast and APAC clients pay the origin's RTT.
 
 **Future.**
-- Neon: read replicas in every region we deploy, primary stays `us-east-1`. Most hot-path reads (`AgentExists`, `IsMember`, `GetConversationHeadSeq`) are cache-backed anyway, so replica lag is tolerable; writes route back to `iad`.
+- Neon: read replicas in every region we deploy, primary stays `us-east-1`. Most hot-path reads (`AgentExists`, `IsMember`, `GetConversationHeadSeq`) are cache-backed anyway, so replica lag is tolerable; writes route back to `us-east-1`.
 - S2: already a managed global log service; streams are accessible from any region with the same auth.
-- Fly.io machines: one per region, sticky-routed by `X-Agent-ID` geo-hash so an agent's traffic lands in the nearest region with cache affinity.
+- Origin instances: one per region, each with its own tunnel (or a shared Cloudflare Load Balancer pool). Cloudflare's Argo Smart Routing or a Worker-level geo-hash on `X-Agent-ID` lands an agent's traffic on the nearest region with cache affinity.
 
 The lift is real (cursor coordination becomes cross-region — see §2) but achievable.
 
@@ -84,7 +84,7 @@ The lift is real (cursor coordination becomes cross-region — see §2) but achi
 
 ## 11. Security posture
 
-**Today.** `X-Agent-ID` header as identity. No tenant isolation (one global agent namespace). Secrets via Fly secrets, never committed.
+**Today.** `X-Agent-ID` header as identity. No tenant isolation (one global agent namespace). Secrets via the host's environment (a `.env` file locally, or the deploy platform's secret manager in production), never committed.
 
 **Future.**
 - **Real auth.** JWT-bearer with an asymmetric keypair per agent (or mTLS with client certs). The header moves from a trust boundary to a claim. Short-lived tokens rotated via an external IAM.

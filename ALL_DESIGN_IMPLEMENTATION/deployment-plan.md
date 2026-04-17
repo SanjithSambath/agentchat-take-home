@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-This document specifies the complete deployment configuration for AgentMail: Dockerfile (multi-stage build), `fly.toml` (Fly.io app config), secrets management, `cmd/server/main.go` (server lifecycle), health checks, and the full startup/shutdown sequence. This is Gap 6 from the design audit — the last mechanical piece that must be specified so deployment is one-shot during build.
+This document specifies the complete deployment configuration for AgentMail: static Go binary (`go build ./cmd/server`), Cloudflare Tunnel as public ingress (`cloudflared`), secrets via process environment, `cmd/server/main.go` (server lifecycle), health checks, and the full startup/shutdown sequence. This is Gap 6 from the design audit — the last mechanical piece that must be specified so deployment is one-shot during build.
 
 ### Why This Matters
 
 A take-home with a broken deployment is a zero. The evaluators will:
 1. Hit the live URL. If it's down, everything else is irrelevant.
 2. Connect their own agents as clients. The service must be running, healthy, reachable, with the Claude agent active.
-3. Potentially redeploy if they fork the repo. The Dockerfile and fly.toml must work first-try.
+3. Potentially redeploy if they fork the repo. `go build` and `cloudflared tunnel --url http://localhost:8080` must work first-try.
 
 Deployment is "mechanical" but not trivial. A wrong decision here — wrong base image, missing env var, unhealthy health check, broken graceful shutdown — means the evaluator's first impression is "it doesn't work."
 
@@ -17,93 +17,45 @@ Deployment is "mechanical" but not trivial. A wrong decision here — wrong base
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Build strategy | Multi-stage Docker (builder + runtime) | Minimal attack surface, smallest image (~15 MB), no build tools in production |
-| Base image | `golang:1.23-alpine` → `alpine:3.20` | Alpine is 5 MB. Scratch would be smaller but lacks shell, CA certs, timezone data, and `dig`/`curl` for debugging. Alpine gives us all of that at 5 MB cost. |
-| Binary linking | Static (`CGO_ENABLED=0`) | No glibc dependency. Runs on any Linux. Required for alpine runtime. |
-| Fly.io machine | `shared-cpu-1x`, 512 MB RAM, `iad` region | Colocated with Neon (us-east-1). Shared CPU is sufficient — our bottleneck is I/O (network to S2 and Neon), not compute. 512 MB handles ~50K concurrent goroutines. |
-| Scaling | Single instance, no auto-scale | Take-home scope. Auto-scaling SSE is complex (sticky sessions, connection draining). Document the multi-instance path, don't build it. |
-| Secrets | `fly secrets set` — never in Dockerfile, fly.toml, or git | Fly.io injects as environment variables at runtime. Secrets are encrypted at rest, never logged, never in image layers. |
-| Health check | HTTP `GET /health` → Postgres ping + S2 connectivity | Fly.io restarts the machine if health checks fail. Must check real dependencies, not just "process is alive." |
-| Internal port | 8080 | Standard non-privileged port. Fly.io's Anycast proxy handles TLS termination and routes port 443 → internal 8080. |
-| Graceful shutdown | SIGTERM → 30s drain → force kill | Fly.io sends SIGTERM, waits `kill_timeout` seconds, then SIGKILL. Our shutdown sequence must complete within that window. |
+| Build strategy | `go build ./cmd/server` — single static binary | No container registry, no image tags, no multi-stage build. Ship the file, run the file. |
+| Binary linking | Static (`CGO_ENABLED=0`) | No glibc dependency. Runs on any Linux/macOS. Trivially copyable across hosts. |
+| Host | Any x86-64 or arm64 Linux/macOS box with outbound HTTPS | No inbound ports, no public IP required — the tunnel is outbound-initiated. Colocate in `us-east` to stay near Neon's `us-east-1` primary. |
+| Public ingress | `cloudflared tunnel` (quick or named) | Cloudflare's edge terminates TLS and forwards HTTP/2 to `http://localhost:8080`. Free tier. No certs to manage, no reverse proxy to configure. |
+| Scaling | Single instance, no auto-scale | Take-home scope. Auto-scaling SSE is complex (sticky sessions, connection draining). Document the multi-instance path via Cloudflare Load Balancer, don't build it. |
+| Secrets | Process environment (`.env` locally, `EnvironmentFile` or platform secret manager in production) — never in git | The server reads `os.Getenv`. No file format dependency, no platform lock-in. |
+| Health check | HTTP `GET /health` → Postgres ping + S2 connectivity | Probed externally by an uptime monitor or Cloudflare Worker cron — the tunnel itself doesn't probe upstream. Must check real dependencies, not just "process is alive." |
+| Internal port | 8080 | Standard non-privileged port. Tunneled via `--url http://localhost:8080`; Cloudflare's edge exposes it as HTTPS. |
+| Graceful shutdown | SIGTERM → 30s drain → force kill | Process managers (systemd, Ctrl-C, `cloudflared` killing its child) send SIGTERM. Our shutdown sequence must complete within that window. |
 
 ---
 
-## 1. Dockerfile — Multi-Stage Build
+## 1. Build — `go build` Static Binary
 
 ### The Problem
 
-A naive `FROM golang:1.23` produces a 1.2 GB image containing the entire Go toolchain, all source code, all build caches, and the compiled binary. This image:
-- Takes 60+ seconds to push to Fly.io's registry on each deploy.
-- Contains the Go compiler, git, and other tools an attacker could exploit.
-- Exposes source code in image layers.
-- Wastes disk on the Fly.io machine (billed per GB/month on larger plans).
+A container image is overhead for this service. Cloudflare Tunnel terminates at the host's process, not at a container runtime — there is no image registry to push to, no orchestrator pulling layers, no multi-tenant host to isolate the binary from. A Dockerfile would add: a build-context tax, a registry push on each deploy, a tag strategy, and operational machinery (image scanning, layer caching, garbage collection) the take-home doesn't use. Ship the binary directly.
 
-### Decision: Two-Stage Build
+### Decision: Plain `go build`, CGO disabled, stripped and trimmed
 
-**Stage 1 (builder):** Full Go toolchain. Downloads dependencies. Compiles a static binary.
-**Stage 2 (runtime):** Minimal Alpine image. Copies only the binary. Nothing else.
-
-```dockerfile
-# ============================================================
-# Stage 1: Build
-# ============================================================
-FROM golang:1.23-alpine AS builder
-
-RUN apk add --no-cache ca-certificates tzdata
-
-WORKDIR /src
-
-COPY go.mod go.sum ./
-RUN go mod download
-
-COPY . .
-
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+```bash
+CGO_ENABLED=0 go build \
     -ldflags="-s -w -X main.version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" \
     -trimpath \
-    -o /bin/agentmail \
+    -o agentmail \
     ./cmd/server
-
-# ============================================================
-# Stage 2: Runtime
-# ============================================================
-FROM alpine:3.20
-
-RUN apk add --no-cache ca-certificates tzdata curl
-
-COPY --from=builder /bin/agentmail /bin/agentmail
-
-EXPOSE 8080
-
-ENTRYPOINT ["/bin/agentmail"]
 ```
 
-### Line-by-Line Rationale
+Output: one `./agentmail` binary (~12-15 MB on linux/amd64, similar on arm64/darwin). Copy it to the host, make it executable, run it.
 
-**`FROM golang:1.23-alpine AS builder`**
-- Alpine-based Go image for the builder stage. Smaller download than `golang:1.23` (Debian-based, 800 MB vs 300 MB). Doesn't matter for final image size (we discard this stage), but speeds up CI builds and layer caching.
-- Go 1.23 is the current stable release. Pinned to minor version, not `latest`, for reproducible builds.
-
-**`RUN apk add --no-cache ca-certificates tzdata`**
-- `ca-certificates`: Needed at build time if `go mod download` fetches from HTTPS module proxies (it does). Also copied to runtime for HTTPS calls to S2, Neon, and Anthropic.
-- `tzdata`: Go's `time` package needs timezone data. We embed it in the builder so the runtime image has it via the binary's embedded tzdata (Go 1.15+ can embed timezone data with `import _ "time/tzdata"`, but having it in the filesystem is belt-and-suspenders).
-- `--no-cache`: Don't store the apk index in the image layer. Saves ~5 MB.
-
-**`COPY go.mod go.sum ./` then `RUN go mod download`**
-- Layer caching optimization. `go.mod` and `go.sum` change less frequently than source code. By copying them first and running `go mod download` in a separate layer, Docker caches the dependency download. Subsequent builds that only change source code skip the download entirely.
-- Without this: every source code change triggers a full dependency download (minutes, depending on network).
-
-**`COPY . .`**
-- Copies all source code. Relies on `.dockerignore` to exclude `.git`, `*.md`, `docs/`, and other non-build files (see §1.2).
+### Flag-by-Flag Rationale
 
 **`CGO_ENABLED=0`**
-- Produces a statically-linked binary. No dependency on glibc or musl. Runs on any Linux kernel. Required for running on Alpine (musl libc) and would also work on `scratch`.
+- Produces a statically-linked binary. No dependency on glibc or musl. Runs on any Linux kernel unchanged.
 - **Why not CGO?** We don't use any CGO-dependent libraries. `pgx` is pure Go. `uuid` is pure Go. `chi` is pure Go. `zerolog` is pure Go. The S2 SDK is pure Go. The Anthropic SDK is pure Go. There is zero reason to enable CGO.
 
-**`GOOS=linux GOARCH=amd64`**
-- Explicit target. Fly.io machines are Linux/amd64. If someone builds on an M-series Mac (arm64), this cross-compiles correctly.
-- **Why not arm64?** Fly.io supports arm64 machines and they're cheaper. However, the S2 SDK and all our dependencies are architecture-agnostic Go. We could switch to arm64 by changing this line and the `fly.toml` machine config. For the take-home, amd64 is the default and safe choice.
+**Target OS / architecture**
+- `GOOS=linux GOARCH=amd64` if building on one host and running on another (the common case). If building on the same host you'll run on, omit both — `go build` uses the host's defaults.
+- All our dependencies are architecture-agnostic pure Go, so arm64 works identically (`GOARCH=arm64`); pick whatever matches your host.
 
 **`-ldflags="-s -w -X main.version=..."`**
 - `-s`: Strip symbol table. Saves ~2 MB.
@@ -114,229 +66,151 @@ ENTRYPOINT ["/bin/agentmail"]
 **`-trimpath`**
 - Removes local filesystem paths from the binary. Without this, stack traces contain `/Users/sanjith/Desktop/agentmail-take-home/internal/api/messages.go`. With it, paths are relative: `internal/api/messages.go`. Cleaner, more portable, no information leakage.
 
-**`-o /bin/agentmail`**
-- Output path in the builder stage. We copy this single file to the runtime stage.
+**`-o agentmail`**
+- Output path. Plain filename — copy it wherever you want (`/usr/local/bin/agentmail`, `~/bin/agentmail`, or leave it in the repo root).
 
 **`./cmd/server`**
 - Build target. The `cmd/server/main.go` entry point.
 
-**`FROM alpine:3.20`**
-- Minimal runtime. 5 MB base. Contains a shell (`/bin/sh`), package manager, and standard Unix utilities.
-- **Why not `scratch`?** Scratch is 0 bytes — no shell, no CA certificates, no timezone data, no `curl`, no `sh`. This makes debugging impossible. You can't `fly ssh console` into a scratch container and run commands. You can't `curl` the health endpoint from inside the container. You can't inspect logs or the filesystem. For 5 MB, Alpine gives us all of that.
-- **Why not `distroless`?** Google's distroless images are ~2 MB and include CA certs and timezone data but no shell. Better than scratch, but still no debugging tools. The 3 MB difference from Alpine isn't worth losing `sh` and `curl`.
+### 1.1 What the binary needs at runtime
 
-**`RUN apk add --no-cache ca-certificates tzdata curl`**
-- `ca-certificates`: For outbound HTTPS to S2 (s2.dev), Neon (neon.tech), Anthropic (api.anthropic.com).
-- `tzdata`: Timezone data for Go's `time` package.
-- `curl`: For debugging. `fly ssh console` → `curl localhost:8080/health`. Invaluable during evaluation if something breaks.
+The static binary has no shared-library dependencies, but the host still needs:
 
-**`EXPOSE 8080`**
-- Documentation only. Doesn't actually publish the port. Tells the reader (and Fly.io's auto-detection) which port the app listens on.
+- **TLS root CAs** — for outbound HTTPS to S2 (`s2.dev`), Neon (`neon.tech`), Anthropic (`api.anthropic.com`). Any reasonable Linux/macOS install has these in `/etc/ssl/certs/ca-certificates.crt` or equivalent; no extra work required.
+- **Timezone data** — Go's `time` package uses the system's zoneinfo (or falls back to `time/tzdata` if imported). We don't import `time/tzdata` explicitly because every mainstream host provides it.
+- **`cloudflared` binary** — the public-ingress companion process. See §2.
+- **A process supervisor** (systemd, launchd, `tmux`, or `nohup` for the demo case) — to restart the binary if it exits and to feed it the process environment.
 
-**`ENTRYPOINT ["/bin/agentmail"]`**
-- Exec form (JSON array), not shell form. The binary receives signals directly (SIGTERM from Fly.io). With shell form (`ENTRYPOINT /bin/agentmail`), signals go to `/bin/sh`, which may not forward them, breaking graceful shutdown.
+No container runtime, no shell on the path, no `curl` dependency inside a container. The binary is invoked directly by the supervisor.
 
-### 1.1 .dockerignore
+### 1.2 Final artifact analysis
 
-```
-.git
-.gitignore
-*.md
-docs/
-tests/
-old/
-.env
-.env.*
-fly.toml
-Makefile
-LICENSE
-```
-
-**Why:** Keeps the Docker build context small. Excludes:
-- `.git`: Can be 100+ MB with history. Irrelevant to the build.
-- `*.md`, `docs/`: Documentation. Not compiled.
-- `tests/`: Test files. Not included in production binary (Go's build system excludes `_test.go` files automatically, but this keeps them out of the build context entirely).
-- `.env`, `.env.*`: Local development secrets. Must never end up in an image layer.
-- `fly.toml`: Fly.io config. Not needed inside the container.
-
-### 1.2 Final Image Analysis
-
-| Layer | Size | Contents |
+| Piece | Size | Contents |
 |---|---|---|
-| Alpine base | ~5 MB | musl libc, busybox, apk |
-| ca-certificates + tzdata + curl | ~4 MB | TLS root CAs, timezone database, curl binary |
-| agentmail binary | ~12-15 MB | Statically linked Go binary |
-| **Total** | **~21-24 MB** | |
+| `agentmail` binary | ~12-15 MB | Statically linked Go binary, stripped, trimpath'd |
+| `cloudflared` binary (on host) | ~36 MB (prebuilt darwin/arm64; linux builds similar) | Cloudflare's tunnel client; one-time install, not rebuilt per deploy |
+| **Deploy artifact** | **~12-15 MB** | Just the `agentmail` binary — `cloudflared` is a one-time host setup |
 
-Compare: `golang:1.23` base image alone is 800 MB. Our full runtime image is 3% of that.
+For comparison: a two-stage Docker image (Alpine + the same binary) would be ~21-24 MB and require a registry. We save the registry round-trip and the image layer tax on every deploy.
 
-### 1.3 Build Reproducibility
+### 1.3 Build reproducibility
 
 **Deterministic builds require:**
 1. `go.sum` checked into git (already done via `go mod tidy`).
 2. Go module proxy (`GOPROXY=https://proxy.golang.org,direct`) — the default. Modules are immutable and content-addressed.
-3. Pinned base image tags (`golang:1.23-alpine`, `alpine:3.20`, not `latest`).
+3. Pinned Go version via `go.mod`'s `go` directive (and ideally matched on the build host).
 4. `-trimpath` strips local paths.
 
 **What breaks reproducibility:**
 - `git describe` in ldflags — different commits produce different binaries. Acceptable: we want the version embedded.
-- `apk add` in the runtime stage — Alpine packages update over time. For full reproducibility, pin package versions: `apk add ca-certificates=20240226-r0`. For the take-home, unpinned is fine.
+- The build host's Go toolchain version — upgrading from `go1.22` to `go1.23` can change binary output deterministically but differently. Pin via `go.mod` or a CI `setup-go` action with an exact version to control this.
 
 ---
 
-## 2. fly.toml — Fly.io Application Configuration
+## 2. Cloudflared Tunnel — Public Ingress Configuration
 
 ### The Problem
 
-`fly.toml` controls how Fly.io deploys, routes, scales, and monitors the application. Wrong settings here mean: requests don't route correctly, health checks fail (triggering infinite restart loops), SSE connections get killed prematurely, or streaming POST bodies get buffered (destroying real-time token streaming).
+`cloudflared` is the companion process that brokers public traffic to our `localhost:8080` listener. Wrong settings here mean: tunnel auth fails, the tunnel flaps on deploy, SSE connections get killed prematurely by the edge's idle timeout, or streaming POST bodies get buffered (destroying real-time token streaming).
 
-### Configuration
+### Two modes: quick vs named
 
-```toml
-app = "agentmail"
-primary_region = "iad"
-kill_signal = "SIGTERM"
-kill_timeout = 35
+**Quick tunnel** — zero-config, ephemeral URL.
 
-[build]
+```bash
+cloudflared tunnel --url http://localhost:8080
+```
 
-[env]
-  PORT = "8080"
+Prints a `https://<random>.trycloudflare.com` URL on startup. No login, no DNS, no persisted config. The URL dies when the process exits. Right for local demos and the take-home evaluation window.
 
-[http_service]
-  internal_port = 8080
-  force_https = true
-  auto_stop_machines = "stop"
-  auto_start_machines = true
-  min_machines_running = 1
+**Named tunnel** — persistent, your own domain.
 
-  [http_service.concurrency]
-    type = "connections"
-    hard_limit = 10000
-    soft_limit = 8000
+```bash
+cloudflared tunnel login                         # one-time browser auth
+cloudflared tunnel create agentmail              # creates a tunnel + credentials file
+cloudflared tunnel route dns agentmail agentmail.<your-domain>.com
+cloudflared tunnel run --config ~/.cloudflared/agentmail.yml agentmail
+```
 
-[[http_service.checks]]
-  grace_period = "15s"
-  interval = "30s"
-  method = "GET"
-  path = "/health"
-  timeout = "5s"
-  unhealthy_threshold = 3
-  healthy_threshold = 1
+With a config file:
 
-[[services.http_checks]]
+```yaml
+# ~/.cloudflared/agentmail.yml
+tunnel: agentmail
+credentials-file: /home/agentmail/.cloudflared/<tunnel-uuid>.json
 
-[http_service.http_options]
-  h2_backend = true
-
-[[vm]]
-  size = "shared-cpu-1x"
-  memory = "512mb"
+ingress:
+  - hostname: agentmail.example.com
+    service: http://localhost:8080
+    originRequest:
+      noTLSVerify: false
+      connectTimeout: 5s
+      tlsTimeout: 5s
+      tcpKeepAlive: 30s
+      keepAliveConnections: 100
+      keepAliveTimeout: 90s
+      httpHostHeader: agentmail.example.com
+      disableChunkedEncoding: false
+  - service: http_status:404
 ```
 
 ### Line-by-Line Rationale
 
-**`app = "agentmail"`**
-- Fly.io app name. Globally unique across all Fly.io users. If `agentmail` is taken, use `agentmail-<username>` or similar.
+**`tunnel: agentmail`**
+- Named tunnel identifier. Cloudflare-account-scoped, not globally unique (unlike a Fly app name). Multiple tunnels can coexist on the same account — create one per environment (`agentmail-prod`, `agentmail-staging`) if needed.
 
-**`primary_region = "iad"`**
-- Washington, DC (us-east-1 equivalent). Colocated with Neon's default region (us-east-1, also Virginia). Network latency between our Fly.io machine and Neon: **~1-5ms**. If we picked `lax` (Los Angeles), that becomes ~60-80ms — every database query 10x slower.
-- S2's endpoint (`api.s2.dev`) is anycast, but their infrastructure is likely also US East. Even if not, S2 latency is already budgeted at 10-40ms for Express tier appends.
-- The evaluators are likely in the US. `iad` gives sub-50ms latency to most of the East Coast and sub-100ms to the West Coast.
+**Region choice — colocate with Neon, not the tunnel**
+- There is no `primary_region` directive: Cloudflare's edge is a global anycast network, not a region choice. What matters is where the **origin** (our Go binary) lives, because that's where Postgres round-trips happen.
+- Colocate the origin host in `us-east-1` (AWS Virginia) — same as Neon's default region. Expected origin-to-Neon latency: **~1-5 ms**. Moving the origin to `us-west-2` makes that ~60-80 ms — every database query 10× slower.
+- S2's endpoint (`api.s2.dev`) is anycast; latency depends on the origin host's geography too. US-East keeps both paths fast.
+- Cloudflare's edge is already close to every evaluator regardless of where they are — the public URL they hit terminates at the nearest PoP, and Cloudflare's backbone carries the request to our origin.
 
-**`kill_signal = "SIGTERM"`**
-- The signal Fly.io sends when it wants to stop the machine (deploy, scale down, maintenance). Our Go server traps this and starts graceful shutdown. SIGTERM is the Unix standard for "please shut down gracefully." SIGKILL (untrappable) follows after `kill_timeout`.
+**Signal handling — SIGTERM for graceful shutdown**
+- `cloudflared` is a Cloudflare-maintained binary; we don't configure its signal handling. What *we* configure is how our Go server reacts when the orchestrator (systemd, launchd, `tmux` shell, `docker stop`, or a foreground Ctrl-C) sends SIGTERM.
+- SIGTERM triggers the graceful shutdown sequence in §4. SIGKILL (untrappable) follows if the process manager decides we've exceeded its kill timeout.
 
-**`kill_timeout = 35`**
-- Seconds between SIGTERM and SIGKILL. Our graceful shutdown sequence (§4) needs up to 30 seconds to drain. We add 5 seconds of buffer. If shutdown hasn't completed in 35 seconds, Fly.io kills the process — better than hanging forever.
-- **Why 35 and not 30?** The Go `http.Server.Shutdown()` gets a 30-second context. But there's work before and after that call (flush cursors, close pools). 35 seconds gives the full sequence room to breathe.
+**Origin timeout and connection pooling**
+- `connectTimeout: 5s`: How long `cloudflared` waits to open a TCP connection to `http://localhost:8080`. Our binary listens on the same host — the connection is loopback, so this is effectively "is the Go server up?" 5 s is generous for loopback; 1 s would work.
+- `tlsTimeout: 5s`: Only relevant if the origin URL is `https://`. Ours is `http://` (loopback), so this is unused. Leaving the default documents intent.
+- `tcpKeepAlive: 30s`: Send TCP keepalives on the tunnel↔origin socket every 30 s. Keeps NAT/firewall state warm and detects dead origins. Matches our SSE heartbeat cadence (see http-api-layer-plan.md § SSE heartbeats).
+- `keepAliveConnections: 100`: Cap on idle pooled connections cloudflared keeps open to the origin. At 5K concurrent SSE clients we'll have 5K live connections regardless; the pool is only for idle CRUD connections. 100 is plenty.
+- `keepAliveTimeout: 90s`: Close idle pooled origin connections after 90 s. Slightly longer than Cloudflare's default 100 s client-side idle timeout so our side isn't the first to tear down.
 
-**`[build]`**
-- Empty `[build]` section tells Fly.io to build using the Dockerfile in the repo root. No custom build args, no buildpacks.
+**Chunked transfer and streaming**
+- `disableChunkedEncoding: false`: **Critical.** Chunked transfer encoding is how our NDJSON POST and SSE GET work over HTTP/1.1. Leaving this false lets the body flow through in real time. If we ever set it to `true`, streaming breaks: cloudflared would need a Content-Length, which we don't know up front.
+- HTTP/2 (the negotiated transport between cloudflared and our Go server) uses DATA frames, which don't have the chunking concept — but the setting still gates whether cloudflared will buffer to add Content-Length. Leave it false.
+- `httpHostHeader: agentmail.example.com`: Rewrites the `Host:` header on the origin request. Our server doesn't vhost on `Host`, but it does log it; setting it explicitly gives consistent logs.
 
-**`[env]`**
-- `PORT = "8080"`: The only non-secret environment variable. Our server reads `os.Getenv("PORT")` to determine the listen address.
-- **Why not hardcode 8080 in the binary?** Because local development may use a different port, and it's a one-line env var read vs a rebuild.
-- **CRITICAL: Secrets are NOT in `[env]`.** Secrets go via `fly secrets set` (§3). The `[env]` section is committed to git and visible in the Fly.io dashboard. Putting `DATABASE_URL` here would expose the Neon connection string (including password) in the repository.
+**Health checks — external, not tunnel-internal**
 
-**`[http_service]`**
+Cloudflare Tunnel does not probe upstream health itself (unlike Fly's `[[http_service.checks]]` or an AWS target group). If our origin is down, the tunnel returns 502 Bad Gateway to clients. We wire health monitoring externally:
 
-`internal_port = 8080`: The port our Go server listens on inside the container. Fly.io's Anycast proxy terminates TLS and forwards traffic to this port.
+- **Option A — uptime monitor.** UptimeRobot or Pingdom on a 1-minute cadence hitting `https://agentmail.example.com/health`. Free tier handles it.
+- **Option B — Cloudflare Worker cron.** A Worker that runs every minute, fetches `/health`, and pages via PagerDuty/Slack on failure. Costs $5/mo for the Workers Paid plan.
 
-`force_https = true`: Redirect HTTP → HTTPS. All our clients (AI agents) should use HTTPS. No reason to allow plaintext.
+Our `GET /health` endpoint (http-api-layer-plan.md §health) checks Postgres connectivity and S2 connectivity with 3-second per-check timeouts, returning 200 on both-ok and 503 otherwise.
 
-`auto_stop_machines = "stop"`: If no traffic for the configured idle period, Fly.io stops the machine (not destroys — it restarts on the next request). This saves money during periods of no evaluation.
+### Idle timeout and SSE heartbeats
 
-`auto_start_machines = true`: When a request arrives and no machine is running, Fly.io starts one automatically. Cold start: ~2-5 seconds (pull image from registry + boot Alpine + start Go binary + health check passes).
+Cloudflare's edge idle timeout for HTTP connections is **100 s** by default. SSE connections that don't send a byte for 100 s will be closed by Cloudflare. Our heartbeat cadence (30 s, see http-api-layer-plan.md § SSE) keeps every active SSE well under that ceiling.
 
-`min_machines_running = 1`: Keep at least one machine running at all times. **Critical for the evaluation.** Without this, the evaluator's first request triggers a cold start. With it, the machine is always warm. Cost: ~$3-5/month for a shared-cpu-1x running 24/7.
+For named tunnels, Cloudflare documents a **524 Origin Time-out** if the tunnel origin doesn't respond within 100 s. That's a *request-level* timeout, not an idle-connection timeout — for streaming bodies, as long as the origin keeps emitting bytes, the 524 doesn't fire.
 
-**Concurrency limits:**
+### HTTP/2 backend
 
-```toml
-[http_service.concurrency]
-  type = "connections"
-  hard_limit = 10000
-  soft_limit = 8000
-```
+`cloudflared` speaks HTTP/2 to the origin over a TLS loopback connection internally (even though our origin URL is `http://`; cloudflared can negotiate h2c). HTTP/2 matters for:
 
-`type = "connections"`: Concurrency is measured by active connections, not requests-per-second. This is correct for our workload: SSE connections are long-lived (minutes to hours), and each one counts as one connection.
-
-`hard_limit = 10000`: Maximum concurrent connections before Fly.io starts rejecting new ones. Our machine can handle this — a single Go process easily manages 10K+ goroutines. The bottleneck is memory: each goroutine uses ~4 KB stack, so 10K goroutines = 40 MB. Plus per-connection state (bufio buffers, S2 session). At ~20 KB per SSE connection (conservative), 10K connections = 200 MB. Well within our 512 MB.
-
-`soft_limit = 8000`: When connections exceed this, Fly.io would route new connections to another machine (if multi-instance). Since we're single-instance, this is informational. We set it below hard_limit as a warning threshold.
-
-**Health checks:**
-
-```toml
-[[http_service.checks]]
-  grace_period = "15s"
-  interval = "30s"
-  method = "GET"
-  path = "/health"
-  timeout = "5s"
-  unhealthy_threshold = 3
-  healthy_threshold = 1
-```
-
-`grace_period = "15s"`: After a machine starts, wait 15 seconds before health checking. Our startup sequence (§4.2) takes ~5-10 seconds (connect Postgres, warm caches, connect S2, start Claude agent). 15 seconds gives comfortable headroom. Without this, the health check fires immediately, the server isn't ready, it fails, Fly.io restarts the machine, repeat forever.
-
-`interval = "30s"`: Check health every 30 seconds. Frequent enough to detect failures within a minute. Infrequent enough to not waste resources. Each health check hits Postgres and S2, so we don't want it every 5 seconds.
-
-`method = "GET"`, `path = "/health"`: Standard HTTP health check. Our health endpoint (see http-api-layer-plan.md) checks Postgres connectivity and S2 connectivity with 3-second per-check timeouts.
-
-`timeout = "5s"`: If the health check doesn't respond in 5 seconds, consider it failed. Our health endpoint should respond in <100ms normally (Postgres ping + S2 check). 5 seconds accommodates Neon cold starts (up to ~500ms) and S2 transient latency.
-
-`unhealthy_threshold = 3`: Three consecutive failed checks before Fly.io considers the machine unhealthy and restarts it. This prevents a single transient failure (Neon hiccup, S2 blip) from triggering a restart. Three checks at 30-second intervals = 90 seconds of sustained failure before restart.
-
-`healthy_threshold = 1`: One successful check after being unhealthy = machine is healthy again. No need to wait for multiple successes — if the health check passes, the dependencies are reachable.
-
-**HTTP/2 backend:**
-
-```toml
-[http_service.http_options]
-  h2_backend = true
-```
-
-`h2_backend = true`: Fly.io's proxy speaks HTTP/2 to our Go server (inside the container). This is important for:
-- **SSE multiplexing:** Multiple SSE connections from the same client multiplex over a single TCP connection. Without H2, each SSE connection is a separate TCP connection from the proxy to our server.
+- **SSE multiplexing:** Multiple SSE connections from the same client multiplex over a single TCP connection at the edge↔cloudflared hop. Our local cloudflared↔Go server hop is just loopback TCP — H2 there is a nice-to-have, not a requirement.
 - **Streaming POST:** HTTP/2 DATA frames are the natural transport for NDJSON streaming bodies. No chunked transfer encoding ambiguity.
-- **Go's `net/http` supports HTTP/2 natively.** No code changes needed. `http.ListenAndServe` auto-negotiates H2 when TLS is not involved (Fly.io's proxy handles TLS, so the internal connection is plaintext H2 via h2c, or we let Fly manage the upgrade).
+- **Go's `net/http` supports HTTP/2 natively.** No code changes needed. `http.ListenAndServe` handles H1 by default; cloudflared connects over H1 unless we explicitly enable h2c on the Go listener, which is unnecessary for loopback.
 
-**VM sizing:**
+### Host sizing
 
-```toml
-[[vm]]
-  size = "shared-cpu-1x"
-  memory = "512mb"
-```
+There's no `[[vm]]` stanza — the host is whatever machine we chose to run on. Our target:
 
-`shared-cpu-1x`: Shared vCPU. Our workload is I/O-bound (waiting on S2 appends, Neon queries, Claude API). CPU usage is minimal — JSON serialization, event routing, goroutine scheduling. A dedicated CPU would be wasted money.
-
-`memory = "512mb"`: Memory breakdown:
 | Component | Estimate |
 |---|---|
-| Go runtime + binary | ~30 MB |
+| Go runtime + `agentmail` binary | ~30 MB |
 | Agent existence cache (sync.Map, 10K agents) | ~1 MB |
 | Membership LRU cache (100K entries) | ~10 MB |
 | Cursor hot tier (in-memory map) | ~5 MB |
@@ -344,14 +218,15 @@ kill_timeout = 35
 | Per-streaming-write (bufio + scanner) | ~10 KB × 100 = 1 MB |
 | Claude agent (history buffers, semaphore state) | ~20 MB |
 | Goroutine stacks (10K goroutines × 4 KB) | ~40 MB |
-| **Headroom** | **~300 MB** |
+| `cloudflared` resident footprint | ~40 MB |
+| **Headroom** | **~260 MB** |
 | **Total** | **~507 MB** |
 
-At 5K concurrent SSE connections (generous for a take-home), we're within budget. If we approach the limit, the first signal is goroutine scheduling latency, not OOM — Go's GC will work harder as heap pressure increases.
+Any host with 512 MB+ RAM and an x86-64 or arm64 CPU fits comfortably. A small EC2 `t4g.nano` (arm64, 0.5 GB) or equivalent is a good cloud target; a laptop or spare VM works for the demo.
 
-**Why not 256 MB?** We'd be fine for light evaluation (10 agents, 5 conversations). But if the evaluators spin up 100+ agents with concurrent streaming, 256 MB gets tight. 512 MB is the smallest comfortable size. Cost difference: ~$1.50/month.
+**Why not 256 MB?** Fine for light evaluation (10 agents, 5 conversations). But 100+ agents with concurrent streaming gets tight — the `cloudflared` footprint alone is ~40 MB before our workload. 512 MB is the smallest comfortable size.
 
-**Why not 1 GB?** Unnecessary for the take-home. We're not running 50K concurrent SSE connections. If we needed to scale, we'd go to a dedicated CPU machine before increasing memory.
+**Why not 1 GB?** Unnecessary for the take-home. We're not running 50K concurrent SSE connections. If we needed to scale, we'd add instances behind a Cloudflare Load Balancer before adding RAM to one host.
 
 ---
 
@@ -359,38 +234,50 @@ At 5K concurrent SSE connections (generous for a take-home), we're within budget
 
 ### The Problem
 
-The application needs four secrets to function. If any are missing, the server cannot start. If any leak (in Dockerfile, fly.toml, git history, image layers), the consequences range from data breach to account compromise.
+The application needs four secrets to function. If any are missing, the server cannot start. If any leak (in build flags, committed `.env` files, git history, log lines), the consequences range from data breach to account compromise.
 
 ### Complete Environment Variable Inventory
 
 | Variable | Required | Source | Example | Used By |
 |---|---|---|---|---|
-| `DATABASE_URL` | Yes | `fly secrets set` | `postgresql://user:pass@ep-xxx.us-east-1.aws.neon.tech/agentmail?sslmode=require` | pgxpool — Neon PostgreSQL connection |
-| `S2_ACCESS_TOKEN` | Yes | `fly secrets set` | `s2_tok_...` | S2 SDK — stream storage authentication |
-| `ANTHROPIC_API_KEY` | Yes | `fly secrets set` | `sk-ant-...` | Anthropic SDK — Claude API for resident agent |
-| `RESIDENT_AGENT_ID` | Yes | `fly secrets set` | `01904d3a-7e40-7f1e-...` (UUIDv7) | Stable identity for the in-process Claude agent |
-| `PORT` | No (default: `8080`) | `fly.toml [env]` | `8080` | HTTP listen address |
-| `S2_BASIN` | No (default: `agentmail`) | `fly.toml [env]` or `fly secrets set` | `agentmail` | S2 basin name |
-| `LOG_LEVEL` | No (default: `info`) | `fly.toml [env]` | `debug` | zerolog level |
+| `DATABASE_URL` | Yes | process env (`.env` → systemd `EnvironmentFile=` → cloud secret manager) | `postgresql://user:pass@ep-xxx.us-east-1.aws.neon.tech/agentmail?sslmode=require` | pgxpool — Neon PostgreSQL connection |
+| `S2_ACCESS_TOKEN` | Yes | process env | `s2_tok_...` | S2 SDK — stream storage authentication |
+| `ANTHROPIC_API_KEY` | Yes | process env | `sk-ant-...` | Anthropic SDK — Claude API for resident agent |
+| `RESIDENT_AGENT_ID` | Yes | process env | `01904d3a-7e40-7f1e-...` (UUIDv7) | Stable identity for the in-process Claude agent |
+| `PORT` | No (default: `8080`) | process env | `8080` | HTTP listen address |
+| `S2_BASIN` | No (default: `agentmail`) | process env | `agentmail` | S2 basin name |
+| `LOG_LEVEL` | No (default: `info`) | process env | `debug` | zerolog level |
 
 ### Secret Lifecycle
 
-**Setting secrets (one-time, before first deploy):**
+**Setting secrets (one-time, before the process starts):**
 
 ```bash
-fly secrets set \
-  DATABASE_URL="postgresql://agentmail:PASSWORD@ep-xxx.us-east-1.aws.neon.tech/agentmail?sslmode=require" \
-  S2_ACCESS_TOKEN="s2_tok_xxxxxxxxxxxxxxxxxxxx" \
-  ANTHROPIC_API_KEY="sk-ant-api03-xxxxxxxxxxxxxxxx" \
-  RESIDENT_AGENT_ID="01904d3a-7e40-7f1e-8000-000000000001"
+# Option A — local .env file (gitignored), sourced before `go run` or the binary.
+cat > .env <<'EOF'
+DATABASE_URL=postgresql://agentmail:PASSWORD@ep-xxx.us-east-1.aws.neon.tech/agentmail?sslmode=require
+S2_ACCESS_TOKEN=s2_tok_xxxxxxxxxxxxxxxxxxxx
+ANTHROPIC_API_KEY=sk-ant-api03-xxxxxxxxxxxxxxxx
+RESIDENT_AGENT_ID=01904d3a-7e40-7f1e-8000-000000000001
+EOF
+set -o allexport && source .env && set +o allexport
+./agentmail
+
+# Option B — systemd service with EnvironmentFile, file permissions 0600, owner = service user.
+#   /etc/systemd/system/agentmail.service
+#   [Service]
+#   EnvironmentFile=/etc/agentmail/env
+#   ExecStart=/usr/local/bin/agentmail
+
+# Option C — cloud secret manager (AWS SSM Parameter Store, GCP Secret Manager, HashiCorp Vault).
+# Fetch at launch, export to env, exec the binary. No secrets on disk.
 ```
 
-**How Fly.io handles secrets:**
-1. Secrets are encrypted at rest in Fly.io's secret store.
-2. On machine start, Fly.io injects them as environment variables in the process.
-3. Secrets are NOT visible in `fly.toml`, NOT in the Docker image, NOT in the build log.
-4. `fly secrets list` shows secret names but NOT values. Values are write-only from the CLI.
-5. Changing a secret triggers an automatic redeployment (new machine with updated env vars).
+**How the process reads secrets:**
+1. Exit the process: `cfg := LoadConfig()` calls `os.Getenv(...)` for each variable.
+2. There is no secret store embedded in the binary — it's entirely driven by the parent process's environment.
+3. Secrets are never logged (only key *names* are logged during startup, see "Log config at startup (redacted)" below).
+4. Changing a secret means updating the environment and restarting the process (`systemctl restart agentmail`, `kill -TERM <pid>` then relaunch, etc.). Graceful shutdown drains in-flight work first (§4.3).
 
 ### Validation on Startup
 
@@ -450,7 +337,7 @@ func LoadConfig() (Config, error) {
 
 **Key design decisions:**
 
-1. **Fail fast with ALL missing vars listed.** Don't fail on the first missing var, restart, fail on the second, repeat. Collect all missing vars and report them in one error. The operator fixes everything in one `fly secrets set` call.
+1. **Fail fast with ALL missing vars listed.** Don't fail on the first missing var, restart, fail on the second, repeat. Collect all missing vars and report them in one error. The operator fixes everything in one edit of the `.env` or secret-manager entry.
 
 2. **Validate format where possible.** `RESIDENT_AGENT_ID` must be a valid UUID. `DATABASE_URL` must parse as a connection string (pgxpool.ParseConfig does this). `PORT` must be a valid number. Catch config errors at startup, not at first request.
 
@@ -462,19 +349,19 @@ INF config loaded database_url=set s2_access_token=set anthropic_api_key=set res
 
 ### Security Considerations
 
-**Threat: Secret in Docker image layers.**
-If a `RUN echo $SECRET` or `ENV DATABASE_URL=...` appears in the Dockerfile, the secret is baked into an image layer permanently — even if a subsequent layer "removes" it. Image layers are immutable and inspectable via `docker history`.
+**Threat: Secret baked into the binary.**
+If a `-ldflags="-X main.dbURL=$DATABASE_URL"` appears in the build script, the secret lands in the compiled binary's read-only data section — extractable with `strings ./agentmail | grep postgres`.
 
-**Mitigation:** Our Dockerfile has zero references to secrets. Secrets arrive only at runtime via Fly.io's env var injection.
+**Mitigation:** Our `go build` invocation (§1) only sets `main.version`. Secrets are read at startup via `os.Getenv()`, never at build time.
 
 **Threat: Secret in git history.**
 A `.env` file committed to git, even if later deleted, lives in git history forever.
 
 **Mitigation:**
 1. `.gitignore` includes `.env`, `.env.*`, `.env.local`.
-2. `.dockerignore` includes `.env`, `.env.*`.
-3. No secret values in any committed file.
-4. The `LoadConfig()` function reads from `os.Getenv()`, not from files.
+2. No secret values in any committed file.
+3. The `LoadConfig()` function reads from `os.Getenv()`, not from files. The binary itself never opens `.env`.
+4. If deploying via systemd, the `EnvironmentFile=` path lives outside the git-tracked repo (`/etc/agentmail/env`).
 
 **Threat: Secret in build logs.**
 `go build -ldflags="-X main.dbURL=$DATABASE_URL"` would log the secret in the build output.
@@ -498,7 +385,7 @@ export RESIDENT_AGENT_ID="01904d3a-7e40-7f1e-8000-000000000001"
 export PORT="8080"
 ```
 
-The `LoadConfig()` function doesn't care whether env vars come from Fly.io secrets, a `.env` file, or manual export. Same code path everywhere.
+The `LoadConfig()` function doesn't care whether env vars come from a `.env` file, a systemd `EnvironmentFile=`, a cloud secret manager, or manual export. Same code path everywhere.
 
 ---
 
@@ -620,7 +507,7 @@ If startup order is wrong, the server crashes on the first request. If shutdown 
 | Start HTTP server | <1ms | Port in use → exit 1 |
 | **Total** | **~200ms (warm) / ~2s (cold)** | |
 
-**Why fail fast on external dependency failure:** The Fly.io health check grace period is 15 seconds. If Postgres or S2 is unreachable, it's better to exit immediately and let Fly.io restart the machine than to start in a degraded state where every request fails. The restart loop will converge once the dependency is available.
+**Why fail fast on external dependency failure:** An external uptime monitor probes `/health` every minute. If Postgres or S2 is unreachable, it's better to exit immediately and let the process supervisor (systemd `Restart=on-failure`, launchd `KeepAlive`, or a plain shell loop) restart the binary than to start in a degraded state where every request fails. The restart loop will converge once the dependency is available.
 
 **Exception: Claude agent.** If S2 is reachable but the Claude agent can't start listeners for some conversations (transient S2 error on specific streams), the agent starts in degraded mode — it listens to the conversations it can reach and retries the rest. The HTTP server is still fully functional for external agents. The Claude agent's degradation doesn't affect the core messaging service.
 
@@ -709,11 +596,11 @@ Step 7 happens BEFORE step 9 (close Postgres pool). The pool is still available.
 **Race: Claude agent is mid-response during shutdown.**
 Step 5 gives the agent 5 seconds to finish any in-flight Claude API call. If the Claude response is still streaming after 5 seconds, the agent cancels the context (which triggers `message_abort` on S2 via the streaming write handler's abort path). The message is properly aborted, not orphaned.
 
-**Race: Fly.io sends a new request to the stopped listener.**
-After `http.Server.Shutdown()` returns, the TCP listener is closed. Fly.io's proxy detects the closed connection and returns 502 to the client. The client retries (Fly.io's proxy has automatic retry for connection errors). Since we're mid-deploy, the new machine will be ready soon.
+**Race: Cloudflared forwards a new request to the stopped listener.**
+After `http.Server.Shutdown()` returns, the TCP listener is closed. `cloudflared` detects the closed loopback connection and returns 502 Bad Gateway to the Cloudflare edge, which surfaces to the client. The client retries; the next instance (or the same one after restart) picks it up.
 
-**Edge case: Shutdown takes longer than kill_timeout.**
-If our 30-second shutdown exceeds the 35-second kill_timeout, Fly.io sends SIGKILL. The process dies immediately. Consequences:
+**Edge case: Shutdown takes longer than the supervisor's kill timeout.**
+If our 30-second shutdown exceeds the supervisor's kill timeout (systemd default: 90 s — plenty; Docker default: 10 s — too tight, override with `--stop-timeout 35`), the supervisor sends SIGKILL. The process dies immediately. Consequences:
 - Dirty cursors NOT flushed → agents re-receive a few events on reconnect (at-least-once delivery, which is our documented guarantee).
 - In-progress streaming writes NOT aborted → recovery sweep on next startup handles this.
 - S2 sessions NOT cleanly closed → S2 server-side timeout closes them (~30s).
@@ -737,7 +624,7 @@ func main() {
     log.Info().
         Str("version", version).
         Str("port", cfg.Port).
-        Str("region", os.Getenv("FLY_REGION")).
+        Str("hostname", os.Getenv("HOSTNAME")).
         Msg("starting agentmail")
 
     ctx, cancel := context.WithCancel(context.Background())
@@ -863,140 +750,148 @@ Go's default is 1 MB for headers. Sufficient. We don't receive large headers —
 ### 5.1 First-Time Setup
 
 ```bash
-# 1. Install flyctl
-curl -L https://fly.io/install.sh | sh
-fly auth login
+# 1. Install cloudflared (macOS: Homebrew; Linux: direct download)
+brew install cloudflared                         # macOS
+# OR (linux amd64):
+#   curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+#   chmod +x cloudflared && sudo mv cloudflared /usr/local/bin/
 
-# 2. Create the app (one-time)
-fly apps create agentmail --region iad
-
-# 3. Provision Neon database (external — via Neon dashboard)
+# 2. Provision Neon database (external — via Neon dashboard)
 #    - Create project in us-east-1 (Virginia)
 #    - Create database "agentmail"
 #    - Get connection string from Neon dashboard
 #    - Disable scale-to-zero for evaluation period
 
-# 4. Provision S2 (external — via s2.dev)
+# 3. Provision S2 (external — via s2.dev)
 #    - Create account, get auth token
 #    - Create basin "agentmail" with Express storage class
 #    - Basin config: CreateStreamOnAppend=true, TimestampAppendOnArrival=true, retention=28d
 
-# 5. Generate resident agent ID (one-time, save it)
+# 4. Generate resident agent ID (one-time, save it)
 #    Use any UUIDv7 generator:
 #    python3 -c "import uuid; print(uuid.uuid7())"
 #    → 01904d3a-7e40-7f1e-8000-xxxxxxxxxxxx
 
-# 6. Set secrets
-fly secrets set \
-  DATABASE_URL="postgresql://..." \
-  S2_ACCESS_TOKEN="s2_tok_..." \
-  ANTHROPIC_API_KEY="sk-ant-..." \
-  RESIDENT_AGENT_ID="01904d3a-..."
+# 5. Populate .env (gitignored)
+cat > .env <<'EOF'
+DATABASE_URL=postgresql://...
+S2_ACCESS_TOKEN=s2_tok_...
+ANTHROPIC_API_KEY=sk-ant-...
+RESIDENT_AGENT_ID=01904d3a-...
+EOF
 
-# 7. Deploy
-fly deploy
+# 6. Build the binary
+CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=$(git describe --always)" -trimpath -o agentmail ./cmd/server
+
+# 7. Run the server (export env first)
+set -o allexport && source .env && set +o allexport
+./agentmail &
+
+# 8. Start the tunnel (quick mode for the demo)
+cloudflared tunnel --url http://localhost:8080
+# Prints: https://<random>.trycloudflare.com  — share this URL with evaluators.
 ```
 
 ### 5.2 Subsequent Deploys
 
 ```bash
-# Code change → deploy
-fly deploy
+# Code change → rebuild → restart
+git pull
+CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=$(git describe --always)" -trimpath -o agentmail ./cmd/server
 
-# That's it. Fly.io:
-# 1. Builds the Docker image (multi-stage)
-# 2. Pushes to Fly.io registry
-# 3. Starts new machine with the new image
-# 4. Runs health check (GET /health)
-# 5. Routes traffic to new machine
-# 6. Sends SIGTERM to old machine
-# 7. Old machine shuts down gracefully
+# Graceful restart: SIGTERM the running process, then relaunch.
+pkill -TERM -f '^./agentmail$'   # or: systemctl restart agentmail
+./agentmail &
+
+# The cloudflared tunnel stays up throughout — it just starts returning 502
+# for the ~1 s between the old process closing the listener and the new one
+# opening it, then resumes. No DNS changes, no URL rotation.
 ```
 
-### 5.3 Deploy Strategy: Rolling (Default)
+### 5.3 Deploy Strategy: Restart-in-Place (Default)
 
-Fly.io's default deploy strategy:
-1. Start new machine with new image.
-2. Wait for health check to pass.
-3. Route traffic to new machine.
-4. Send SIGTERM to old machine.
-5. Old machine drains and shuts down.
+For a single-instance deployment with cloudflared, the default deploy is simply "restart the binary":
 
-**During the transition (~15-30 seconds):**
-- CRUD requests route to either old or new machine (stateless, both are correct).
-- SSE connections on the old machine stay open until the old machine shuts down. When it sends SIGTERM, step 3 of our shutdown closes them. Clients reconnect, hit the new machine, resume from `Last-Event-ID`.
-- Streaming writes on the old machine: step 4 of our shutdown aborts them. The agent's scaffolding sees the connection close and can retry on the new machine.
+1. Build the new binary next to the old one (atomic via rename).
+2. Send SIGTERM to the running process — graceful shutdown begins (§4.3).
+3. Wait for the process to exit (up to 30 s).
+4. Launch the new binary; it listens on the same port; cloudflared reconnects to the origin and resumes forwarding.
 
-**Zero-downtime for CRUD. Brief interruption for SSE and streaming writes.** Clients auto-recover. This is acceptable for the take-home. Production would use blue-green with connection draining.
+**During the transition (~30 seconds):**
+- CRUD requests in-flight complete on the old process (HTTP server graceful shutdown waits for them).
+- New CRUD requests during the window: cloudflared → 502 → client retry → new process picks up.
+- SSE connections on the old process close when step 3 of shutdown fires. Clients reconnect, resume from `Last-Event-ID` against the new process.
+- Streaming writes: step 4 of shutdown aborts them on S2. The agent's scaffolding sees the abort and retries.
+
+**Brief interruption for all transports.** Clients auto-recover. For zero-downtime, see the horizontal-scaling path in FUTURE.md §1 — run N instances behind Cloudflare Load Balancer and roll one at a time.
 
 ### 5.4 Monitoring the Deploy
 
 ```bash
-# Watch deploy progress
-fly deploy --verbose
+# Tail the server's own logs (zerolog writes structured JSON to stderr)
+journalctl -u agentmail -f              # if installed as a systemd unit
+# OR, for a plain background process:
+tail -f agentmail.log
 
-# Check machine status
-fly status
+# Tail the tunnel's logs
+# (cloudflared runs in the foreground by default — watch its stderr)
 
-# Check logs in real-time
-fly logs
+# Verify the public URL responds
+curl https://<your-tunnel>.trycloudflare.com/health
 
-# SSH into the running container (debugging)
-fly ssh console
-
-# Inside the container:
-curl localhost:8080/health
+# Verify directly on the origin (skips Cloudflare)
+curl http://localhost:8080/health
 ```
 
 ---
 
-## 6. Fly.io-Specific Considerations
+## 6. Cloudflare-Specific Considerations
 
 ### 6.1 Proxy Behavior and Streaming
 
-Fly.io's Anycast proxy sits between the internet and our machine. Critical behaviors:
+Cloudflare's edge (plus the `cloudflared` tunnel client) sits between the internet and our origin. Critical behaviors:
 
 **Request body streaming (NDJSON POST):**
-Fly.io's proxy does NOT buffer request bodies by default. Chunked transfer encoding and HTTP/2 DATA frames pass through to the backend in real-time. Our NDJSON streaming POST works without configuration. (Unlike nginx, which defaults to `proxy_request_buffering on`.)
+Cloudflare does NOT buffer request bodies when the `Content-Type` is streaming-compatible and the body uses chunked transfer encoding or HTTP/2 DATA frames. Our NDJSON streaming POST works without additional configuration provided `disableChunkedEncoding: false` in the tunnel config (§2). (Unlike nginx, which defaults to `proxy_request_buffering on`.)
 
 **Response body streaming (SSE):**
-Fly.io's proxy does NOT buffer response bodies. SSE events flow through immediately. No special configuration needed. `Content-Type: text/event-stream` disables any implicit buffering.
+Cloudflare does NOT buffer `text/event-stream` responses. SSE events flow through immediately. The `Content-Type: text/event-stream` header is what signals this to Cloudflare's edge; no Worker-level tweak needed.
 
 **Connection timeout:**
-Fly.io's proxy has a 60-second idle timeout for HTTP connections. For CRUD requests (sub-second), this is irrelevant. For SSE connections, we send heartbeat comments every 30 seconds:
+Cloudflare's edge has a **100-second idle timeout** for HTTP connections (documented as the 524 Origin Time-out). For CRUD requests (sub-second), this is irrelevant. For SSE connections, we send heartbeat comments every 30 seconds:
 ```
 : heartbeat
 ```
-This keeps the connection alive through the proxy. Without heartbeats, a quiet conversation would see the SSE connection killed after 60 seconds of no events.
+This keeps the connection alive through the edge. Without heartbeats, a quiet conversation would see the SSE connection killed after 100 seconds of no events.
 
-For streaming writes, the proxy's idle timeout applies to the request body. If the client stops sending NDJSON lines for 60 seconds, the proxy may close the connection. Our server-side 5-minute idle timeout is more generous, but the proxy timeout wins. **Mitigation:** Document in CLIENT.md that streaming writes should send content within 60 seconds or the connection may be closed by the infrastructure. In practice, LLM token generation is continuous — gaps of 60+ seconds don't happen during normal generation.
+For streaming writes, the 100 s applies to origin response time — as long as the server keeps writing bytes of the acknowledgment response or the request body keeps arriving, the timer resets. **Mitigation:** Document in CLIENT.md that streaming writes should send content within 100 seconds or the connection may be closed by the infrastructure. In practice, LLM token generation is continuous — gaps of 100+ seconds don't happen during normal generation.
 
 ### 6.2 TLS Termination
 
-Fly.io terminates TLS at the proxy. Our Go server receives plaintext HTTP on port 8080. We do NOT configure TLS in the Go server — no certificates, no key files, no `ListenAndServeTLS`. Fly.io handles certificate provisioning (Let's Encrypt), renewal, and HTTPS enforcement.
+Cloudflare terminates TLS at the edge. `cloudflared` forwards plaintext HTTP to our loopback origin on port 8080 (or negotiates h2c). We do NOT configure TLS in the Go server — no certificates, no key files, no `ListenAndServeTLS`. Cloudflare handles edge certificate provisioning, renewal, and HTTPS enforcement automatically for any hostname proxied through a named tunnel; quick tunnels use Cloudflare's wildcard `*.trycloudflare.com` cert.
 
-The app is accessible at `https://agentmail.fly.dev`. Custom domains can be added via `fly certs create`.
+The app is accessible at `https://<random>.trycloudflare.com` (quick mode) or `https://agentmail.<your-domain>.com` (named mode). Custom domains are configured via `cloudflared tunnel route dns` once the DNS zone is on Cloudflare.
 
 ### 6.3 IPv6 and Anycast
 
-Fly.io uses Anycast routing. The app gets a shared IPv4 address and a dedicated IPv6 address. Requests from anywhere in the world route to the nearest Fly.io edge, then to the `iad` region where our machine runs.
+Cloudflare uses a massive anycast network — every `*.trycloudflare.com` or named-tunnel hostname resolves to addresses that route to the nearest Cloudflare PoP. Because our origin is behind a tunnel, the origin has **no public IP at all**: traffic terminates at Cloudflare's edge and travels over the outbound-initiated tunnel to our host.
 
-**For the evaluators:** The URL `https://agentmail.fly.dev` just works. No IP address management, no DNS configuration, no load balancer setup.
+**For the evaluators:** The URL `https://<tunnel>.trycloudflare.com` (or the named-tunnel hostname) just works. No IP address management, no DNS configuration on our side beyond `cloudflared tunnel route dns`, no load balancer setup.
 
 ### 6.4 Persistent Storage
 
-We do NOT use Fly.io volumes. Our server is stateless — all persistent state is in Neon (metadata) and S2 (messages). The machine can be destroyed and recreated without data loss. This is a deliberate design choice that enables:
-- Zero-downtime deploys (new machine, kill old one).
-- Auto-restart on crash (Fly.io starts a fresh machine).
-- Region migration (move to a different region by changing `primary_region`).
+We do NOT use any host-attached persistent volumes. Our server is stateless — all persistent state is in Neon (metadata) and S2 (messages). The host can be destroyed and recreated without data loss. This is a deliberate design choice that enables:
+- Near-zero-downtime deploys (new process in place of old one; cloudflared auto-reconnects).
+- Auto-restart on crash (supervisor spawns a fresh process; the tunnel auto-reconnects).
+- Host migration (move the binary + `.env` to a different VM in a different region; update `cloudflared` credentials, point DNS — no in-place "region migration" primitive to configure).
 
-### 6.5 Machine Restarts
+### 6.5 Process Restarts
 
-Fly.io may restart machines for:
-- **Deploy:** New image version. Graceful (SIGTERM → shutdown sequence).
-- **Health check failure:** Three consecutive failures. Graceful (SIGTERM → shutdown sequence).
-- **Host maintenance:** Fly.io moves the machine to different hardware. Graceful.
-- **OOM kill:** Machine exceeds memory limit. Ungraceful (SIGKILL, no shutdown sequence). Handled by recovery sweep on next startup.
+The binary may restart for:
+- **Deploy:** New build. Graceful (supervisor sends SIGTERM → shutdown sequence).
+- **Uptime-monitor alert-driven restart:** An external monitor sees `/health` fail N times in a row and an operator (or an auto-remediation hook) sends SIGTERM. Graceful.
+- **Host maintenance:** Cloud-provider host reboot, kernel upgrade, etc. Usually graceful (SIGTERM from the init system) but occasionally abrupt (power cycle).
+- **OOM kill:** Process exceeds host memory limit. Ungraceful (SIGKILL, no shutdown sequence). Handled by recovery sweep on next startup.
 
 In all cases, our startup sequence (§4.1) restores full functionality. The recovery sweep handles any orphaned state from ungraceful kills.
 
@@ -1025,17 +920,20 @@ lint:
 sqlc:
 	sqlc generate
 
-deploy:
-	fly deploy
+deploy: build
+	# Restart-in-place: send SIGTERM to the running binary, then relaunch.
+	-pkill -TERM -f '^./bin/agentmail$$'
+	./bin/agentmail &
+
+tunnel:
+	cloudflared tunnel --url http://localhost:8080
 
 logs:
-	fly logs
+	# Replace with your actual log source (systemd journal, file, Docker, etc.).
+	tail -f agentmail.log
 
 status:
-	fly status
-
-ssh:
-	fly ssh console
+	curl -fsS http://localhost:8080/health | jq .
 ```
 
 **`-race` in tests:** Go's race detector catches concurrent access bugs. Essential for a system with this many goroutines. Adds ~10x slowdown to tests — acceptable for correctness.
@@ -1050,7 +948,7 @@ ssh:
 
 ### 8.1 Single Instance Limits
 
-Our single Fly.io shared-cpu-1x, 512 MB machine can handle:
+A single host running `agentmail` + `cloudflared` with 512 MB RAM and a shared vCPU can handle:
 
 | Metric | Capacity | Bottleneck |
 |---|---|---|
@@ -1066,7 +964,7 @@ Our single Fly.io shared-cpu-1x, 512 MB machine can handle:
 
 When a single instance isn't enough:
 
-1. **Scale to 2-3 instances:** `fly scale count 3`. CRUD requests load-balance automatically. Problem: SSE connections are stateful (each instance has its own connection registry). An agent's SSE might connect to instance A, but a write to the same conversation arrives at instance B. The write goes to S2 (shared), so instance A's SSE (tailing S2) sees it immediately. **This works without sticky sessions** because S2 is the shared state, not the Go process.
+1. **Scale to 2-3 instances behind Cloudflare Load Balancer.** Run the binary on N hosts, each with its own `cloudflared` tunnel (or a shared Cloudflare Load Balancer pool routing to N origin servers). CRUD requests load-balance automatically. Problem: SSE connections are stateful (each instance has its own connection registry). An agent's SSE might connect to instance A, but a write to the same conversation arrives at instance B. The write goes to S2 (shared), so instance A's SSE (tailing S2) sees it immediately. **This works without sticky sessions** because S2 is the shared state, not the Go process.
 
 2. **Scale beyond 3 instances:** Membership cache invalidation becomes the challenge. Each instance has a local membership LRU cache. When agent A leaves a conversation on instance 1, instance 2's cache still says A is a member for up to 60 seconds. Solution: `LISTEN/NOTIFY` on Postgres (already designed in sql-metadata-plan.md §10) or Redis pub/sub for cache invalidation.
 
@@ -1076,12 +974,13 @@ When a single instance isn't enough:
 
 | Component | Monthly Cost | Notes |
 |---|---|---|
-| Fly.io shared-cpu-1x, 512 MB | ~$3.50 | 24/7 with min_machines_running=1 |
-| Fly.io outbound bandwidth | ~$0 | 100 GB/month free tier; text messaging is tiny |
+| Origin host (e.g. AWS `t4g.nano` arm64, 0.5 GB, `us-east-1`) | ~$3.00 | 24/7; equivalent on any cloud. Free on a spare VM / laptop. |
+| Cloudflare Tunnel (free tier) | $0 | Unlimited bandwidth, unlimited tunnels; 100k-req/mo rate-limiting rule free |
+| Outbound bandwidth to Cloudflare | $0 | Cloudflare doesn't charge for egress from origin through the tunnel |
 | Neon PostgreSQL (free tier) | $0 | 0.5 GB storage, 190 compute hours/month |
 | S2 (free tier credits) | $0 | $10 free credits; Express tier at ~$0.001/MB stored |
 | Anthropic API (provided key) | $0 | Provided by evaluators |
-| **Total** | **~$3.50/month** | |
+| **Total** | **~$3.00/month** | Or $0 if the origin host is a spare machine / existing VM |
 
 ---
 
@@ -1091,27 +990,27 @@ When a single instance isn't enough:
 
 **Scenario:** We deploy. The new machine starts. It tries to connect to Neon. Neon's compute has been idle for 5+ minutes and is suspended.
 
-**Impact:** Postgres connection takes ~500ms instead of ~5ms. Total startup time: ~2-3 seconds instead of ~200ms. Well within the 15-second health check grace period.
+**Impact:** Postgres connection takes ~500ms instead of ~5ms. Total startup time: ~2-3 seconds instead of ~200ms. Well within a normal uptime-monitor probe cadence.
 
 **Mitigation already in place:**
-- `min_machines_running = 1` keeps the server running, so Neon gets periodic health check queries every 30 seconds. Neon never goes idle.
-- If the old machine is shutting down while the new one is starting, there's a brief gap. Neon's 500ms cold start is still within the grace period.
+- The process is supposed to run 24/7, so Neon gets periodic `/health` queries from the external uptime monitor every minute. Neon never goes idle.
+- If the old process is shutting down while the new one is starting, there's a brief gap. Neon's 500ms cold start is short compared to the shutdown window.
 
 **Belt-and-suspenders:** Disable Neon's scale-to-zero for the evaluation period via Neon dashboard settings.
 
 ### 9.2 S2 Unreachable During Deploy
 
-**Scenario:** New machine starts. S2 is temporarily unreachable (API outage, DNS hiccup).
+**Scenario:** New process starts. S2 is temporarily unreachable (API outage, DNS hiccup).
 
-**Impact:** Server exits with fatal error. Fly.io sees the machine as failed, restarts it. Restart loop until S2 comes back.
+**Impact:** Server exits with fatal error. The supervisor sees the process exited non-zero and restarts it (systemd `Restart=on-failure`, `KeepAlive true` in launchd, or a shell `while true; do ./agentmail; done` loop). Restart loop until S2 comes back. External health monitor alerts after N failed probes.
 
-**Why fail fast is correct here:** Without S2, the server cannot deliver messages, cannot stream, cannot do its core job. Starting in degraded mode would mean every request returns 503 anyway. Better to fail fast, let Fly.io retry, and converge once S2 is back.
+**Why fail fast is correct here:** Without S2, the server cannot deliver messages, cannot stream, cannot do its core job. Starting in degraded mode would mean every request returns 503 anyway. Better to fail fast, let the supervisor retry, and converge once S2 is back.
 
 **Alternative considered:** Start without S2, return 503 on message operations, serve metadata operations from Postgres. Rejected — adds complexity for a scenario that should last seconds (S2 has 99.99% availability per their SLA). The evaluators would see 503s and think the service is broken.
 
 ### 9.3 OOM Kill
 
-**Scenario:** Memory usage exceeds 512 MB. Kernel sends SIGKILL (untrappable). Process dies immediately. No graceful shutdown.
+**Scenario:** Memory usage exceeds the host's RAM ceiling. Kernel sends SIGKILL (untrappable). Process dies immediately. No graceful shutdown.
 
 **Impact:**
 - Dirty cursors lost → agents re-receive up to 5 seconds of events (the flush interval). At-least-once delivery guarantee holds.
@@ -1120,13 +1019,13 @@ When a single instance isn't enough:
 - S2 sessions leaked → S2 server-side timeout closes them after ~30s.
 
 **Mitigation:**
-- Monitor memory via `fly logs` (Go runtime reports heap stats).
-- If approaching limit, increase to 1 GB (`fly scale memory 1024`).
-- Profile with `pprof` if the cause is a leak.
+- Monitor memory via the process's own zerolog output (Go runtime reports heap stats via `runtime.ReadMemStats` if we emit them) or host-level telemetry (`free -h`, `top`, Prometheus `node_exporter`).
+- If approaching limit, resize the host (bigger VM, swap up) and restart.
+- Profile with `pprof` if the cause is a leak — the binary exposes `/debug/pprof` when built with `-tags=pprof`.
 
 ### 9.4 Deploy During Active Streaming Write
 
-**Scenario:** Agent is mid-streaming-write (NDJSON POST, 60% of tokens sent). Deploy triggers SIGTERM on old machine.
+**Scenario:** Agent is mid-streaming-write (NDJSON POST, 60% of tokens sent). Deploy triggers SIGTERM on the old process.
 
 **Sequence:**
 1. SIGTERM received.
@@ -1134,13 +1033,13 @@ When a single instance isn't enough:
 3. Step 4 of shutdown: `CloseAllWrites()` cancels the streaming write's context.
 4. The streaming write handler detects context cancellation, appends `message_abort` to S2, returns.
 5. The agent's client sees the connection close.
-6. The agent can retry the message on the new machine (start a new streaming write with new content).
+6. The agent can retry the message against the new process (start a new streaming write with new content).
 
 **The message is NOT silently lost.** It's explicitly aborted on the S2 stream. Any reader sees `message_abort` and knows the message was incomplete.
 
 ### 9.5 Deploy During Active SSE Connection
 
-**Scenario:** 100 agents have SSE connections to the old machine. Deploy triggers SIGTERM.
+**Scenario:** 100 agents have SSE connections to the old process. Deploy triggers SIGTERM.
 
 **Sequence:**
 1. SIGTERM received.
@@ -1148,37 +1047,37 @@ When a single instance isn't enough:
 3. Each SSE handler detects cancellation, flushes the cursor for that connection, returns.
 4. The agent's SSE client sees the connection close.
 5. The agent reconnects (SSE auto-reconnect or manual retry).
-6. The new machine receives the reconnection.
+6. The new process receives the reconnection.
 7. The agent's `Last-Event-ID` or stored cursor positions the new SSE stream from where the old one left off.
 
 **Zero message loss.** At-least-once delivery. The agent may re-receive a few events (between last cursor flush and disconnection). Events have sequence numbers for deduplication.
 
 ### 9.6 Concurrent Deploy and Invite
 
-**Scenario:** Evaluator invites the Claude agent to a conversation at the exact moment a deploy is happening. Old machine is shutting down, new machine is starting up.
+**Scenario:** Evaluator invites the Claude agent to a conversation at the exact moment a deploy is happening. Old process is shutting down, new process is starting up.
 
 **Sequence:**
-1. The invite request hits either the old or new machine (Fly.io routes to the healthy one).
-2. If old machine: invite succeeds (Postgres write), then old machine shuts down. On the new machine, the Claude agent's startup reconciliation discovers the new conversation membership and starts listening.
-3. If new machine: invite succeeds. Claude agent's invite channel receives the notification and starts listening immediately.
+1. The invite request hits whichever process currently owns the listener. In a single-instance deploy there's a ~1 s gap where the old listener has closed and the new one hasn't bound — the client gets a 502 from cloudflared and retries.
+2. On retry, the new process is listening: invite succeeds (Postgres write). Claude agent's invite channel receives the notification and starts listening immediately.
+3. If the invite happened *before* the old process closed its listener, the write landed in Postgres. On the new process, the Claude agent's startup reconciliation discovers the new conversation membership and starts listening.
 
 **No missed invites.** The Claude agent's startup reconciliation scans all current memberships — it catches everything, regardless of when the invite happened.
 
-### 9.7 Image Registry Unavailability
+### 9.7 Cloudflare API / Tunnel Control-Plane Unavailability
 
-**Scenario:** Fly.io's Docker registry is down. `fly deploy` fails.
+**Scenario:** Cloudflare's tunnel control plane has a transient outage. `cloudflared` loses its connection to Cloudflare's edge.
 
-**Impact:** Deploy fails. The running machine is unaffected. The service continues operating on the current version.
+**Impact:** The tunnel is down — the public hostname returns 502 (no available origin). The running `agentmail` process is unaffected; requests directly to `localhost:8080` (if you're on the host) still work.
 
-**Mitigation:** Retry `fly deploy` later. This is a Fly.io infrastructure issue, not ours.
+**Mitigation:** `cloudflared` auto-reconnects with exponential backoff. Cloudflare's tunnel control plane has a 99.99% SLA on their enterprise plan; the free tier has best-effort availability but in practice sees the same uptime. No action needed — the tunnel comes back on its own.
 
 ### 9.8 DNS Resolution Failure
 
 **Scenario:** The Go binary can't resolve `api.s2.dev` or `ep-xxx.neon.tech` at runtime.
 
-**Impact:** All S2 and Postgres operations fail. Health check returns 503. After 3 failed health checks (90 seconds), Fly.io restarts the machine.
+**Impact:** All S2 and Postgres operations fail. Health check returns 503. External uptime monitor alerts after N failed probes.
 
-**Mitigation:** Fly.io machines use Fly.io's internal DNS resolver, which is highly available. External DNS failures (S2 or Neon DNS) are extremely rare but possible. The restart loop converges once DNS resolves.
+**Mitigation:** The host's system resolver is the authoritative DNS path. Use a reliable resolver (`systemd-resolved`, `1.1.1.1`, or whatever the cloud provider supplies) and configure DNS caching (`nscd` or the systemd cache) so short outages don't cascade. External DNS failures (S2 or Neon DNS) are extremely rare but possible. The supervisor's restart loop converges once DNS resolves.
 
 **Belt-and-suspenders for Neon:** Use the IP address instead of hostname in `DATABASE_URL`. Not recommended (Neon may change IPs), but available as a last resort.
 
@@ -1186,16 +1085,16 @@ When a single instance isn't enough:
 
 ## 10. Local Development vs. Production Parity
 
-| Aspect | Local | Production (Fly.io) |
+| Aspect | Local | Production (Cloudflare Tunnel) |
 |---|---|---|
-| Binary | `go run ./cmd/server` or `make run` | Static binary in Alpine container |
+| Binary | `go run ./cmd/server` or `make run` | Static `./agentmail` binary, supervised by systemd / launchd / shell loop |
 | Postgres | Local Postgres or Neon dev branch | Neon production branch |
 | S2 | Real S2 (no local emulator) | Real S2 |
 | Anthropic | Real API (or mock for unit tests) | Real API |
-| TLS | None (HTTP) | Fly.io proxy handles TLS |
-| Port | 8080 (or env override) | 8080 internal, 443 external |
-| Secrets | `.env` file or shell export | `fly secrets set` |
-| Health checks | Manual `curl localhost:8080/health` | Fly.io automated every 30s |
+| TLS | None (HTTP) | Cloudflare edge handles TLS; tunnel forwards plaintext HTTP to origin |
+| Port | 8080 (or env override) | 8080 on loopback; public via HTTPS on the Cloudflare hostname |
+| Secrets | `.env` file or shell export | `.env` / `EnvironmentFile=` / cloud secret manager (same `os.Getenv` code path) |
+| Health checks | Manual `curl localhost:8080/health` | External uptime monitor or Cloudflare Worker cron, 1-minute cadence |
 | Logging | Console (pretty-printed) | JSON (machine-parseable) |
 
 **The same binary runs everywhere.** No `#ifdef PRODUCTION`. No separate configs. The only difference is where environment variables come from and whether TLS is terminated externally. `LoadConfig()` reads `os.Getenv()` — it doesn't know or care about the environment.
@@ -1204,7 +1103,7 @@ When a single instance isn't enough:
 
 ## 11. Pre-Deploy Checklist
 
-Before the first `fly deploy`:
+Before the first public launch:
 
 - [ ] Neon database created in `us-east-1` with database `agentmail`
 - [ ] Neon scale-to-zero disabled for evaluation period
@@ -1212,15 +1111,17 @@ Before the first `fly deploy`:
 - [ ] S2 basin `agentmail` created with Express tier, `CreateStreamOnAppend=true`, arrival timestamping, 28-day retention
 - [ ] Anthropic API key available
 - [ ] Resident agent UUID generated and saved
-- [ ] `fly apps create agentmail --region iad` completed
-- [ ] All four secrets set via `fly secrets set`
-- [ ] `.dockerignore` includes `.env`, `.git`, `*.md`, `docs/`, `tests/`
-- [ ] `.gitignore` includes `.env`, `.env.*`, `bin/`
+- [ ] `cloudflared` installed on the origin host (`brew install cloudflared` on macOS, or direct download on Linux)
+- [ ] `.env` populated with all four required secrets (`DATABASE_URL`, `S2_ACCESS_TOKEN`, `ANTHROPIC_API_KEY`, `RESIDENT_AGENT_ID`)
+- [ ] `.gitignore` includes `.env`, `.env.*`, `bin/`, `agentmail` (the built binary)
 - [ ] `go mod tidy` run (go.sum up to date)
 - [ ] `go test ./... -race` passes locally
-- [ ] `fly deploy` succeeds
-- [ ] `curl https://agentmail.fly.dev/health` returns `{"status":"healthy","checks":{"postgres":"ok","s2":"ok"}}`
-- [ ] `curl https://agentmail.fly.dev/agents/resident` returns the resident agent IDs
+- [ ] `CGO_ENABLED=0 go build -o agentmail ./cmd/server` produces a runnable binary
+- [ ] Process starts: `./agentmail` logs `starting agentmail` without errors
+- [ ] `curl http://localhost:8080/health` returns `{"status":"healthy","checks":{"postgres":"ok","s2":"ok"}}`
+- [ ] `cloudflared tunnel --url http://localhost:8080` prints a `trycloudflare.com` URL (or a named-tunnel hostname resolves)
+- [ ] `curl https://<tunnel-url>/health` returns the same healthy response through the tunnel
+- [ ] `curl https://<tunnel-url>/agents/resident` returns the resident agent IDs
 - [ ] Send a message to the Claude agent → verify it responds
 
 ---
@@ -1230,10 +1131,10 @@ Before the first `fly deploy`:
 ```
 agentmail-take-home/
 ├── cmd/server/main.go          # Entry point (this document §4)
-├── Dockerfile                   # Multi-stage build (this document §1)
-├── .dockerignore                # Build context exclusions (this document §1.1)
-├── fly.toml                     # Fly.io app config (this document §2)
-├── Makefile                     # Build/test/deploy targets (this document §7)
+├── .env.example                # Env var template (secrets omitted)
+├── Makefile                    # Build/test/tunnel targets (this document §7)
 ```
 
-All five files are fully specified in this document — no design decisions remain for implementation.
+All three files are fully specified in this document — no design decisions remain for implementation.
+
+`cloudflared` config lives on the origin host (e.g. `~/.cloudflared/agentmail.yml` for named tunnels) and is not checked into this repo; the quick-tunnel path needs no config file at all.

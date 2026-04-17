@@ -16,8 +16,10 @@ import (
 )
 
 // Per-dependency ping budget. The spec (server-lifecycle-plan.md §Health
-// Checks) allots 5 s for the whole endpoint; running both checks in parallel
-// with a 3 s sub-budget each keeps us comfortably under that ceiling.
+// Checks) allots 5 s for the whole endpoint (the cloudflared tunnel's default
+// idle timeout is 100 s, so the real ceiling is the upstream prober); running
+// both checks in parallel with a 3 s sub-budget each keeps us comfortably
+// under 5 s end-to-end.
 const healthPingTimeout = 3 * time.Second
 
 // Status strings reported in the response body.

@@ -35,7 +35,7 @@
 
 **Two storage layers, cleanly separated:**
 * **S2:** All message content. One stream per conversation. Records are events (`message_start`, `message_append`, `message_end`, system events). S2 handles ordering, durability, replay, real-time tailing.
-* **PostgreSQL (Neon):** All metadata. Agent registry, conversation membership, read cursors. Managed serverless PostgreSQL via Neon, accessed over direct TCP from Go server on Fly.io.
+* **PostgreSQL (Neon):** All metadata. Agent registry, conversation membership, read cursors. Managed serverless PostgreSQL via Neon, accessed over direct TCP from the Go server host (typically colocated in `us-east-1`).
 
 **Transport:**
 * **HTTP POST** for all writes — two tiers: complete messages (single request-response) and streaming messages (NDJSON streaming body over a single persistent HTTP connection)
@@ -353,7 +353,7 @@ This keeps the client protocol dead simple — emit one handshake line, then `{"
 **Acknowledged tradeoffs:**
 
 * **No mid-stream server feedback.** If the agent is removed from the conversation while streaming, they won't know until the response (or via their SSE read connection). Mitigation: extremely rare edge case.
-* **Proxy buffering risk.** Some reverse proxies (nginx default config, Kubernetes ingress) buffer chunked POST request bodies. Mitigation: we control our deployment infrastructure (Fly.io supports streaming) and document the `proxy_request_buffering off` directive for self-hosted deployments. AI agents typically don't run behind buffering corporate proxies.
+* **Proxy buffering risk.** Some reverse proxies (nginx default config, Kubernetes ingress) buffer chunked POST request bodies. Mitigation: we control our deployment infrastructure (Cloudflare Tunnel supports streaming out of the box with `disableChunkedEncoding: false`) and document the `proxy_request_buffering off` directive for self-hosted deployments. AI agents typically don't run behind buffering corporate proxies.
 * **Read-once body means no automatic retries of the same HTTP request.** If the connection drops at 90% completion, the client can't resume the same body on the server side. What the client can (and MUST) do is re-send the entire streaming POST with the **same `message_id`**. The idempotency gate (see "When is a write successful" below) makes that retry correctness-safe: either the prior attempt completed (server replays the cached seqs) or it was aborted (server returns 409 and the client generates a fresh `message_id`).
 
 **Hidden complexities:**
@@ -677,26 +677,26 @@ type S2Store interface {
 - **`LISTEN/NOTIFY`** — multi-instance cache invalidation (scaling path)
 - **Mature ecosystem** — pgx, sqlc, monitoring, backups, replicas, partitioning — all battle-tested at scale
 
-**What we lose:** Zero-config embedded deployment. PostgreSQL is an external dependency. Single-binary simplicity. The Go binary now requires a database connection string. **These costs are already paid** by the decision to deploy on Fly.io + Neon.
+**What we lose:** Zero-config embedded deployment. PostgreSQL is an external dependency. Single-binary simplicity. The Go binary now requires a database connection string. **These costs are already paid** by the decision to host on Neon (see §1.6.2).
 
 #### 1.6.2 Hosting: Neon Serverless PostgreSQL
 
-Fly.io's own documentation is titled **"This Is Not Managed Postgres."** Their unmanaged Postgres is a VM running a Postgres Docker image — you handle backups, failover, monitoring, and recovery. Their truly managed offering starts at $38/month with no free tier.
+Running our own Postgres — on a VM, in a container, or as a self-managed cluster — means owning backups, failover, monitoring, and version upgrades. Neon is a fully managed serverless Postgres with a free tier that covers our take-home scale and a clear upgrade path.
 
-| Dimension | Neon | Fly.io Postgres (unmanaged) | Fly.io Managed Postgres |
+| Dimension | Neon | Self-managed Postgres (VM/container) | Managed Postgres (RDS/Cloud SQL) |
 |---|---|---|---|
 | **Management** | Fully managed | Self-managed | Fully managed |
-| **Cost** | Free tier (0.5 GB, 100 CU-hours/mo) | ~$0 (VM cost only) | $38/mo minimum |
+| **Cost** | Free tier (0.5 GB, 100 CU-hours/mo) | ~$0 (host cost only) | $15-40/mo minimum |
 | **Backups** | Automatic, point-in-time recovery | Manual | Automatic |
 | **Failover** | Automatic | Manual | Automatic |
-| **PostgreSQL version** | 16, 17 | Whatever you install | 16 |
-| **Connection pooling** | Built-in PgBouncer | DIY | Built-in |
+| **PostgreSQL version** | 16, 17 | Whatever you install | 15, 16 |
+| **Connection pooling** | Built-in PgBouncer | DIY | Add-on or DIY |
 
 **Architecture:**
 ```text
 ┌─────────────────────┐         TCP (direct)        ┌──────────────────────┐
 │  Go Server          │ ──────────────────────────→  │  Neon PostgreSQL     │
-│  (Fly.io, iad)      │         ~1-5ms latency       │  (AWS us-east-1)     │
+│  (us-east-1 host)   │         ~1-5ms latency       │  (AWS us-east-1)     │
 │                     │ ←──────────────────────────   │  PostgreSQL 17       │
 │  pgxpool (15 conns) │                              │                      │
 └─────────────────────┘                              └──────────────────────┘
@@ -1190,7 +1190,7 @@ Batch cursor flush uses raw pgx with `unnest()` arrays (not sqlc).
 
 #### 1.6.13 Scaling Roadmap (Millions → Billions)
 
-**Phase 1 — Current Design (Millions):** Single Fly.io instance + Neon Postgres. In-process membership cache (LRU, 100K entries, 60s TTL). In-memory cursor hot tier + batched Postgres flush. pgxpool with 15 connections. Handles ~1M agents, ~5M conversations, ~50K concurrent SSE connections.
+**Phase 1 — Current Design (Millions):** Single Go server host behind a Cloudflare Tunnel + Neon Postgres. In-process membership cache (LRU, 100K entries, 60s TTL). In-memory cursor hot tier + batched Postgres flush. pgxpool with 15 connections. Handles ~1M agents, ~5M conversations, ~50K concurrent SSE connections.
 
 **Phase 2 — Read Replicas (Tens of Millions):** Add Neon read replicas. Route reads to replicas, keep writes on primary. Membership cache reduces replica load by 90%+.
 
@@ -1202,7 +1202,7 @@ Batch cursor flush uses raw pgx with `unnest()` arrays (not sqlc).
 
 * **Server crash during leave transaction:** PostgreSQL rolls back. Member row restored. Leave didn't happen. Correct.
 * **Server crash during invite (after Postgres commit, before S2 event):** Agent is a member but no `agent_joined` event on S2 stream. Functional (agent can read/write), cosmetic gap in history. Production mitigation: reconciliation sweep on startup.
-* **Neon cold start during evaluation:** Disable scale-to-zero, or use Fly.io health checks to keep Neon compute warm.
+* **Neon cold start during evaluation:** Disable scale-to-zero, or use an external uptime check (UptimeRobot / Cloudflare Worker cron) against `/health` to keep Neon compute warm.
 * **pgxpool exhaustion:** pgxpool queues goroutines. Sub-millisecond queries mean wait is negligible. Set `context.WithTimeout(ctx, 5*time.Second)` on all DB ops for fail-fast.
 * **Membership cache poisoning (direct Postgres manipulation):** 60-second TTL self-corrects. Don't bypass the API.
 
@@ -1595,7 +1595,7 @@ A single HTTP POST request with a streaming NDJSON body. The client writes conte
 * **Industry precedent.** Elasticsearch Bulk API, ClickHouse HTTP interface, OpenObserve — all use NDJSON over HTTP POST for streaming writes in production at scale.
 
 **Acknowledged tradeoffs:**
-* **Proxy buffering.** Some reverse proxies (nginx default, Kubernetes ingress-nginx) buffer chunked POST bodies. Mitigation: we control deployment infra (Fly.io supports streaming); document `proxy_request_buffering off` for self-hosted. AI agents typically don't run behind buffering corporate proxies. Note: WebSocket has a symmetric problem — many corporate firewalls block or interfere with WebSocket upgrade.
+* **Proxy buffering.** Some reverse proxies (nginx default, Kubernetes ingress-nginx) buffer chunked POST bodies. Mitigation: we control deployment infra (Cloudflare Tunnel streams bodies with `disableChunkedEncoding: false`); document `proxy_request_buffering off` for self-hosted. AI agents typically don't run behind buffering corporate proxies. Note: WebSocket has a symmetric problem — many corporate firewalls block or interfere with WebSocket upgrade.
 * **No mid-stream server-to-client communication.** The response comes only after the body completes. Mitigation: the SSE read connection provides real-time feedback; mid-stream write errors are extremely rare edge cases.
 * **Read-once body breaks automatic retries of the same HTTP request.** The client cannot re-stream the same body against the same request. It CAN re-issue the entire streaming POST with the same client-supplied `message_id` — the server's dedup gate (`messages_dedup` + UNIQUE on `in_progress_messages`, see [sql-metadata-plan.md](sql-metadata-plan.md) §5) either replays the cached terminal outcome or returns `409 already_aborted` so the client generates a fresh `message_id`. For LLM output specifically, regenerating with a new `message_id` is often cheaper than resuming anyway.
 
@@ -1760,10 +1760,10 @@ The result: a Go server with ~1500 lines of code that does exactly what the spec
     * `FUTURE.md`: production-grade redesign
     * `CLIENT.md`: self-contained agent onboarding doc (including scaffolding examples)
 * **Step 11: Deployment (1 hr)**
-    * Dockerfile (multi-stage build)
-    * `fly.toml` configuration
-    * Deploy to Fly.io
-    * Verify Claude agent is running and reachable
+    * Build static Go binary (`CGO_ENABLED=0 go build -trimpath ./cmd/server`)
+    * Install and authenticate `cloudflared` on the host
+    * Start the tunnel (`cloudflared tunnel --url http://localhost:8080` for quick mode, or a named tunnel with `ingress:` config for a stable hostname)
+    * Verify Claude agent is running and reachable over the tunnel URL
 
 ### Files to Create
 
@@ -1824,8 +1824,7 @@ agentmail-take-home/
 │   └── CLIENT.md                   # Agent client documentation
 ├── go.mod
 ├── go.sum
-├── Dockerfile
-├── fly.toml
+├── cloudflared.yml                # Cloudflare Tunnel ingress config (named tunnel)
 ├── Makefile
 ├── sqlc.yaml                       # sqlc code generation config
 └── README.md                       # (already exists)
@@ -1849,7 +1848,7 @@ agentmail-take-home/
 | :--- | :--- | :--- |
 | **Go as language** | Slower to prototype than Python | Low — full rewrite. But Go is the right call for this domain. |
 | **S2 as stream storage** | S2 has an outage or API breaking change | Medium — swap S2 client for direct S3 + custom sequencing. The S2 wrapper (`internal/store/s2.go`) isolates the blast radius. |
-| **PostgreSQL (Neon) for metadata** | Neon outage or cold-start latency | Medium — fallback to Fly.io managed Postgres or self-hosted. Schema and queries are standard PostgreSQL. |
+| **PostgreSQL (Neon) for metadata** | Neon outage or cold-start latency | Medium — fallback to any managed Postgres (AWS RDS, Google Cloud SQL) or self-hosted. Schema and queries are standard PostgreSQL. |
 | **SSE for reads** | Client doesn't support SSE | High — history polling endpoint exists as alternative. |
 | **NDJSON streaming POST for writes** | Proxy buffers the body, losing real-time streaming | High — complete message POST works universally as fallback. Proxy config (`proxy_request_buffering off`) resolves for self-hosted. |
 | **One stream per conversation** | Hot conversation with many writers | Low — but S2 handles 100 MiBps per stream. LLM token rates won't come close. |
@@ -1866,4 +1865,4 @@ agentmail-take-home/
 5.  **Leave test:** Agent B leaves, verify B's SSE connection closes, verify B can't read/write.
 6.  **Claude agent test:** Invite Claude agent to conversation, send message, verify Claude responds with streaming tokens.
 7.  **Integration test suite:** `go test ./tests/... -v` — all scenarios pass.
-8.  **Deployed test:** Hit the live Fly.io URL, register agent, create conversation with Claude agent, have a conversation.
+8.  **Deployed test:** Hit the live Cloudflare Tunnel URL, register agent, create conversation with Claude agent, have a conversation.

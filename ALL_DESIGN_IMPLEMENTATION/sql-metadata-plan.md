@@ -8,7 +8,7 @@ This document specifies the complete design for AgentMail's relational metadata 
 - **Database:** PostgreSQL (Neon serverless, free tier)
 - **Driver:** pgx v5 native interface + sqlc code generation
 - **Primary keys:** UUIDv7 (time-ordered, RFC 9562)
-- **Hosting:** Neon (`us-east-1`) accessed from Go server on Fly.io (`iad`)
+- **Hosting:** Neon (`us-east-1`) accessed from a single Go server host (colocated in `us-east-1` behind a Cloudflare Tunnel)
 - **Cursor strategy:** Two-tier (in-memory hot + batched Postgres warm)
 - **Membership checks:** In-process LRU cache with TTL + synchronous invalidation
 - **Leave locking:** `SELECT ... FOR UPDATE` (row-level, per-conversation)
@@ -49,32 +49,32 @@ The original spec.md proposed SQLite. Here is why PostgreSQL is the correct choi
 - Zero-config embedded deployment. PostgreSQL is an external dependency.
 - Single-binary simplicity. The Go binary now requires a database connection string.
 
-**These costs are already paid** by the decision to deploy on Fly.io + Neon. The operational complexity is Neon's problem, not ours.
+**These costs are already paid** by the decision to host on Neon. The operational complexity is Neon's problem, not ours.
 
 ---
 
 ## 2. Hosting: Neon Serverless PostgreSQL
 
-### Why Neon, not Fly.io Postgres
+### Why Neon, not self-managed Postgres
 
-Fly.io's own documentation is titled **"This Is Not Managed Postgres."** Their unmanaged Postgres is a VM running a Postgres Docker image — you handle backups, failover, monitoring, and recovery. Their truly managed offering starts at $38/month with no free tier.
+Running our own Postgres — on a VM, in a container, or as a self-managed cluster — means owning backups, failover, monitoring, and version upgrades. Other fully managed offerings (AWS RDS, Google Cloud SQL) start at roughly $15-40/month with no free tier.
 
-| Dimension | Neon | Fly.io Postgres (unmanaged) | Fly.io Managed Postgres |
+| Dimension | Neon | Self-managed Postgres (VM/container) | Managed Postgres (RDS/Cloud SQL) |
 |---|---|---|---|
 | **Management** | Fully managed | Self-managed | Fully managed |
-| **Cost** | Free tier (0.5 GB, 100 CU-hours/mo) | ~$0 (VM cost only) | $38/mo minimum |
+| **Cost** | Free tier (0.5 GB, 100 CU-hours/mo) | ~$0 (host cost only) | $15-40/mo minimum |
 | **Backups** | Automatic, point-in-time recovery | Manual | Automatic |
 | **Failover** | Automatic | Manual | Automatic |
 | **Monitoring** | Built-in dashboard | DIY | Built-in |
-| **PostgreSQL version** | 16, 17 | Whatever you install | 16 |
-| **Connection pooling** | Built-in PgBouncer | DIY | Built-in |
+| **PostgreSQL version** | 16, 17 | Whatever you install | 15, 16 |
+| **Connection pooling** | Built-in PgBouncer | DIY | Add-on or DIY |
 
 ### Architecture
 
 ```text
 ┌─────────────────────┐         TCP (direct)        ┌──────────────────────┐
 │  Go Server          │ ──────────────────────────→  │  Neon PostgreSQL     │
-│  (Fly.io, iad)      │         ~1-5ms latency       │  (AWS us-east-1)     │
+│  (us-east-1 host)   │         ~1-5ms latency       │  (AWS us-east-1)     │
 │                     │ ←──────────────────────────   │  PostgreSQL 17       │
 │  pgxpool (15 conns) │                              │                      │
 └─────────────────────┘                              └──────────────────────┘
@@ -1151,12 +1151,12 @@ This section documents the path from the current design (millions of agents, sin
 
 ### Phase 1: Current Design (Millions)
 
-- Single Fly.io instance + Neon Postgres
+- Single Go server host behind a Cloudflare Tunnel + Neon Postgres
 - In-process membership cache (LRU, 100K entries, 60s TTL)
 - In-memory cursor hot tier + batched Postgres flush
 - pgxpool with 15 connections
 
-**Handles:** ~1M agents, ~5M conversations, ~50K concurrent SSE connections (limited by Fly.io instance memory/CPU)
+**Handles:** ~1M agents, ~5M conversations, ~50K concurrent SSE connections (limited by host memory/CPU)
 
 ### Phase 2: Read Replicas (Tens of Millions)
 
@@ -1212,7 +1212,7 @@ This section documents the path from the current design (millions of agents, sin
 
 **Scenario:** Evaluator hits the API after the Neon compute has been idle for 5+ minutes. First request takes ~500ms instead of ~5ms.
 
-**Mitigation:** Disable scale-to-zero for the evaluation period. Or: add a health check that queries Postgres — if the health check runs on a schedule (e.g., Fly.io's built-in health checks every 30 seconds), the Neon compute never goes idle.
+**Mitigation:** Disable scale-to-zero for the evaluation period. Or: add an external uptime check (UptimeRobot, Pingdom, BetterStack, or a Cloudflare Worker cron) that hits `/health` on a schedule — since `/health` pings Postgres, the Neon compute never goes idle.
 
 ### pgxpool Exhaustion
 

@@ -36,7 +36,7 @@ The agent needs a stable identity across server restarts. If the agent registers
 
 ### Decision: Environment Variable
 
-The agent's UUIDv7 is generated once during initial setup and stored as the `RESIDENT_AGENT_ID` environment variable (Fly.io secret). On every server startup, the agent ensures its identity exists in Postgres via idempotent insert.
+The agent's UUIDv7 is generated once during initial setup and stored as the `RESIDENT_AGENT_ID` environment variable (injected via the process environment: `.env` file loaded by the shell, a systemd `EnvironmentFile=`, or an equivalent secret manager). On every server startup, the agent ensures its identity exists in Postgres via idempotent insert.
 
 ```go
 // On startup:
@@ -83,10 +83,7 @@ This is degraded but functional. The API stands on its own without a resident ag
 # Generate the agent's ID once
 AGENT_ID=$(uuidgen)  # Or generate UUIDv7 in Go and print it
 
-# Set as Fly.io secret
-fly secrets set RESIDENT_AGENT_ID=$AGENT_ID
-
-# For local development
+# Persist into the process environment (shell, systemd EnvironmentFile, or secrets manager)
 echo "RESIDENT_AGENT_ID=$AGENT_ID" >> .env
 ```
 

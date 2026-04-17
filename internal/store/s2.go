@@ -276,12 +276,12 @@ type readSessionImpl struct {
 	current   model.SequencedEvent
 	err       error
 	closeOnce sync.Once
-	closed    bool
+	closed    atomic.Bool
 	convID    uuid.UUID
 }
 
 func (r *readSessionImpl) Next() bool {
-	if r.err != nil || r.closed {
+	if r.err != nil || r.closed.Load() {
 		return false
 	}
 	for r.session.Next() {
@@ -316,7 +316,7 @@ func (r *readSessionImpl) Err() error {
 func (r *readSessionImpl) Close() error {
 	var err error
 	r.closeOnce.Do(func() {
-		r.closed = true
+		r.closed.Store(true)
 		err = r.session.Close()
 	})
 	return err

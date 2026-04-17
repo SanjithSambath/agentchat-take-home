@@ -13,7 +13,7 @@ A server without a designed lifecycle makes ad-hoc decisions during implementati
 - **Configuration:** Environment variables only. No config files, no flags. 6 required, 4 optional with sensible defaults. Fail-fast on missing required vars — don't discover a missing `DATABASE_URL` ten seconds into startup after you've already connected to S2.
 - **Startup sequence:** Strict dependency order. Postgres first (migration + cache warming), S2 second (client + recovery sweep), cursor flush third, Claude agent fourth, HTTP server last. Each step has explicit failure handling: fail-fast for unrecoverable errors, log-and-continue for degraded-but-functional states.
 - **Graceful shutdown:** SIGINT/SIGTERM → stop accepting connections → drain in-flight requests → shut down Claude agent → cancel all SSE/streaming connections → flush cursors → close S2 → close Postgres → exit. Hard deadline: 30 seconds. Anything still running after 30 seconds is force-killed.
-- **Health endpoint:** Deep check (Postgres + S2 connectivity), structured JSON response, 5-second timeout. Bypasses agent auth. Used by Fly.io health checks to determine machine health.
+- **Health endpoint:** Deep check (Postgres + S2 connectivity), structured JSON response, 5-second timeout. Bypasses agent auth. Probed by an external uptime monitor (or Cloudflare Worker cron) since the Cloudflare tunnel itself does not probe upstream health.
 
 ---
 
@@ -49,7 +49,7 @@ The PostgreSQL connection string. Format: `postgresql://user:password@host:port/
 
 Why required with no default: A default like `localhost:5432` would silently connect to a local Postgres that has nothing to do with the production system. Fail-fast on missing connection string prevents the "it worked on my machine" class of deployment bugs.
 
-Validation: Attempt `pgxpool.ParseConfig(url)` — the pgx library validates the DSN format before any network call. If the DSN is malformed (wrong scheme, missing host, invalid options), it fails immediately with a descriptive error. This catches typos in Fly.io secrets before the server spends 30 seconds timing out on a bad connection.
+Validation: Attempt `pgxpool.ParseConfig(url)` — the pgx library validates the DSN format before any network call. If the DSN is malformed (wrong scheme, missing host, invalid options), it fails immediately with a descriptive error. This catches typos in the process environment before the server spends 30 seconds timing out on a bad connection.
 
 **`S2_AUTH_TOKEN` (required)**
 
@@ -61,9 +61,9 @@ Validation: non-empty string. The S2 SDK validates the token on first API call. 
 
 The TCP port the HTTP server listens on.
 
-Why 8080, not 80: Fly.io's `fly.toml` maps internal port to external port 443 (TLS-terminated by Fly proxy). The internal port doesn't matter to external clients. 8080 is the convention for non-privileged HTTP servers. Using port 80 would require root privileges in some environments.
+Why 8080, not 80: Cloudflare's tunnel forwards `https://<hostname>` (TLS-terminated at Cloudflare's edge) to whatever loopback port we tell it to (`cloudflared tunnel --url http://localhost:8080`). The internal port doesn't matter to external clients. 8080 is the convention for non-privileged HTTP servers. Using port 80 would require root privileges in some environments.
 
-Why not `$PORT` from Fly.io automatically: Fly.io sets `PORT=8080` in the environment for HTTP services. Our default matches. If someone deploys elsewhere, they can override.
+Why `$PORT` is configurable: Some environments set `PORT` for us (certain PaaS runtimes, local dev tooling). Our default is 8080; anyone can override via the environment without rebuilding.
 
 **`LOG_LEVEL` (optional, default "info")**
 
@@ -81,7 +81,7 @@ Why not `trace`: zerolog supports it, but trace-level logging in a streaming ser
 
 The hard deadline for graceful shutdown. After this many seconds, the process force-exits regardless of in-flight work.
 
-Why 30 seconds: The worst-case shutdown path (Section 3) takes ~15 seconds (10s for streaming write abort + 5s for cursor flush + overhead). 30 seconds provides 2x headroom. Fly.io sends SIGKILL 10 seconds after SIGTERM by default — we configure `kill_timeout = 35` in `fly.toml` to give our 30-second shutdown time to complete plus a 5-second buffer.
+Why 30 seconds: The worst-case shutdown path (Section 3) takes ~15 seconds (10s for streaming write abort + 5s for cursor flush + overhead). 30 seconds provides 2x headroom. Whichever process supervisor we use (systemd, launchd, Docker, or a foreground Ctrl-C) must be configured to wait at least 35 seconds between SIGTERM and SIGKILL — e.g. systemd `TimeoutStopSec=35s`, Docker `--stop-timeout 35`. That gives our 30-second shutdown time to complete plus a 5-second buffer.
 
 Range 5–300: Below 5 seconds, some components can't drain cleanly. Above 300 seconds (5 minutes), a stuck shutdown blocks deployments unacceptably.
 
@@ -237,34 +237,29 @@ This runs during config loading, before any network I/O. A typo like `postgresq:
 
 ### Environment Variable Source
 
-**Local development:** `.env` file loaded via `godotenv` (or manual `source .env` in the shell). Not committed to git.
+**Local development:** `.env` file sourced into the shell (`set -o allexport && source .env && set +o allexport`) before `go run`. Not committed to git.
 
-**Production (Fly.io):** `fly secrets set` for sensitive values (`DATABASE_URL`, `S2_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, `RESIDENT_AGENT_ID`). `fly.toml` `[env]` section for non-sensitive values (`PORT`, `LOG_LEVEL`, `S2_BASIN`).
+**Production (Cloudflare Tunnel deployment):** The process supervisor feeds the binary its entire environment — there is no two-tier "secrets vs non-secrets" split. Typical wirings:
+- **systemd:** `EnvironmentFile=/etc/agentmail/env` (file mode 0600, owned by the service user).
+- **launchd:** `<key>EnvironmentVariables</key>` plist, or a wrapper shell script that sources `.env` and `exec`s the binary.
+- **Cloud secret manager** (AWS SSM / GCP Secret Manager / Vault): fetch-at-launch shim that exports the values and `exec`s the binary.
 
-```toml
-# fly.toml
-[env]
-  PORT = "8080"
-  LOG_LEVEL = "info"
-  S2_BASIN = "agentmail"
-
-# Secrets set via: fly secrets set DATABASE_URL=... S2_AUTH_TOKEN=... etc.
-```
+All required vars (`DATABASE_URL`, `S2_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, `RESIDENT_AGENT_ID`) and optional vars (`PORT`, `LOG_LEVEL`, `S2_BASIN`) ride through the same `os.Getenv` path — our code doesn't know or care which mechanism populated the environment.
 
 ### Why No Config File (YAML/TOML/JSON)
 
 | Approach | Pro | Con |
 |---|---|---|
-| **Env vars (chosen)** | 12-factor standard. Works with Docker, Fly.io, CI. No file to mount. | No nesting, no complex types. |
-| **YAML/TOML config file** | Hierarchical, readable. | Must mount into container. Different path in dev vs prod. Easy to accidentally commit secrets. |
-| **CLI flags** | Type-safe, auto-generated `--help`. | Flags in Dockerfile `CMD` are clunky. Fly.io doesn't have a clean way to pass flags. |
+| **Env vars (chosen)** | 12-factor standard. Works with systemd, launchd, Docker, cloud secret managers, CI. No file to mount. | No nesting, no complex types. |
+| **YAML/TOML config file** | Hierarchical, readable. | Must be placed on the host or mounted into a container. Different path in dev vs prod. Easy to accidentally commit secrets. |
+| **CLI flags** | Type-safe, auto-generated `--help`. | Flags in `ExecStart=` / `entrypoint` are clunky. No standard way to pass flags from a cloud secret manager. |
 | **Combined (flags + env + file)** | Maximum flexibility. | Maximum complexity. Config precedence bugs. |
 
-For a Go server deployed on Fly.io with <10 configuration values, env vars are the sweet spot. No files to mount, no precedence rules, no YAML parsing library.
+For a Go server with <10 configuration values, env vars are the sweet spot. No files to mount, no precedence rules, no YAML parsing library.
 
 ### Why No `godotenv` in the Binary
 
-`godotenv` loads `.env` files at runtime. Including it in the production binary means the server looks for a `.env` file on the filesystem — a file that shouldn't exist in a Docker container. If it accidentally exists (stale deployment artifact), it silently overrides Fly.io secrets.
+`godotenv` loads `.env` files at runtime. Including it in the production binary means the server looks for a `.env` file on the filesystem — a file that shouldn't exist on a production host. If it accidentally exists (stale deployment artifact, a forgotten dev scratchpad), it silently overrides the values set by systemd / secret manager / launchd.
 
 **Decision:** Use `godotenv` for local development only (in a `//go:build dev` file or via `make dev`). The production binary reads only from `os.Getenv()`.
 
@@ -469,7 +464,7 @@ func initLogging(level string) {
 }
 ```
 
-Why stdout, not stderr: `fly logs` captures stdout. Structured JSON logs to stdout is the 12-factor convention. Error output to stderr is for unstructured fatal errors (step 0).
+Why stdout, not stderr: Most log collectors (systemd journal, Docker log drivers, cloud log agents, `tail -f` in a shell) capture stdout by default. Structured JSON logs to stdout is the 12-factor convention. Error output to stderr is reserved for unstructured fatal errors (step 0).
 
 Why caller info: Enables clicking through to source in IDE. Negligible overhead for the debugging value.
 
@@ -479,7 +474,7 @@ Why caller info: Enables clicking through to source in IDE. Negligible overhead 
 
 Why both SIGINT and SIGTERM:
 - SIGINT: Ctrl+C during local development
-- SIGTERM: Fly.io graceful shutdown, `docker stop`, `kill` default signal
+- SIGTERM: systemd graceful stop, launchd stop, `docker stop`, `cloudflared` tearing down its child, `kill` default signal
 
 Why a single root context: All components share a single cancellation tree. Canceling the root propagates to every goroutine — no orphaned goroutines, no forgotten cancellations. Components that need independent cancellation (e.g., cursor flush) derive child contexts.
 
@@ -1008,43 +1003,51 @@ If the 30-second shutdown timeout fires:
 
 **The only true data loss on hard shutdown:** In-memory cursor positions that haven't been flushed to Postgres. This is bounded by the flush interval (5 seconds) and results in at-least-once redelivery, not data loss.
 
-### Fly.io Integration
+### Process Supervisor Integration
 
-```toml
-# fly.toml
-[processes]
-  app = "cmd/server/main"
+The binary is shutdown-signal-driven; configuration lives in whichever supervisor launches it. Two representative examples:
 
-[[services]]
-  internal_port = 8080
-  protocol = "tcp"
+**systemd unit (`/etc/systemd/system/agentmail.service`):**
 
-  [[services.tcp_checks]]
-    interval = "15s"
-    timeout = "5s"
-    grace_period = "10s"
+```ini
+[Unit]
+Description=AgentMail server
+After=network-online.target
+Wants=network-online.target
 
-  [services.concurrency]
-    type = "connections"
-    hard_limit = 10000
-    soft_limit = 8000
+[Service]
+Type=simple
+User=agentmail
+EnvironmentFile=/etc/agentmail/env
+ExecStart=/usr/local/bin/agentmail
+KillSignal=SIGTERM
+TimeoutStopSec=35s
+Restart=on-failure
+RestartSec=5s
 
-[deploy]
-  strategy = "rolling"
-
-[kill_signal]
-  signal = "SIGTERM"
-  timeout = 35
+[Install]
+WantedBy=multi-user.target
 ```
 
-**`kill_signal.timeout = 35`:** Fly.io sends SIGTERM, then SIGKILL after this many seconds. Our `SHUTDOWN_TIMEOUT_SECONDS = 30` + 5 seconds buffer = 35. The server has 30 seconds to shut down gracefully, then 5 seconds of buffer before Fly.io force-kills it.
+**Docker run (if containerized, though cloudflared doesn't require it):**
 
-**`grace_period = 10s`:** After deploy, Fly.io waits 10 seconds before routing traffic to the new instance. This covers our ~3 second startup time with headroom.
+```bash
+docker run --rm \
+  --env-file /etc/agentmail/env \
+  --stop-signal SIGTERM \
+  --stop-timeout 35 \
+  -p 8080:8080 \
+  ghcr.io/you/agentmail:latest
+```
 
-**Rolling deploy:** Old instance receives SIGTERM and begins draining. New instance starts and begins accepting traffic after grace period. During the overlap:
-- Clients connected to the old instance stay on it until their connection closes
-- New connections go to the new instance
-- SSE clients on the old instance are disconnected during shutdown, reconnect to the new instance
+**`TimeoutStopSec=35s` / `--stop-timeout 35`:** Supervisor sends SIGTERM, then SIGKILL after this many seconds. Our `SHUTDOWN_TIMEOUT_SECONDS = 30` + 5 seconds buffer = 35. The server has 30 seconds to shut down gracefully, then 5 seconds of buffer before the supervisor force-kills it.
+
+**No in-supervisor health check:** Cloudflare Tunnel doesn't probe upstream health; neither does systemd by default. Health monitoring is wired externally (uptime monitor or Cloudflare Worker cron hitting `/health`) — see deployment-plan.md §2 and health-check section below.
+
+**Restart-in-place deploys:** The running process receives SIGTERM (via `systemctl restart agentmail` or `pkill -TERM`) and begins draining. The new process starts in its place and binds port 8080. During the ~30 s overlap:
+- Clients connected to the old process stay on it until their connection closes
+- New connections during the ~1 s listener gap get 502 from cloudflared → client retry → new process picks up
+- SSE clients are disconnected during shutdown and reconnect to the new process via `Last-Event-ID`
 
 ### Race Conditions
 
@@ -1209,12 +1212,12 @@ Already partially specified in `http-api-layer-plan.md` §5. This section comple
 
 | Approach | Checks | Pro | Con |
 |---|---|---|---|
-| **Shallow** (process alive) | Process responds | Near-instant, never false-negative | Machine is "healthy" even if Postgres and S2 are dead — routes traffic to a useless server |
-| **Deep** (chosen) | Postgres + S2 | Accurate — only routes traffic when the server can actually serve requests | Transient blip on Postgres causes 503 → health check fails → Fly.io may restart machine |
+| **Shallow** (process alive) | Process responds | Near-instant, never false-negative | Server is "healthy" even if Postgres and S2 are dead — upstream monitors don't alert on a useless server |
+| **Deep** (chosen) | Postgres + S2 | Accurate — only reports healthy when the server can actually serve requests | Transient blip on Postgres causes 503 → uptime monitor may page / restart the process |
 
-**Why deep wins for us:** Fly.io uses health checks to decide whether to route traffic to a machine. A shallow check that always returns 200 means traffic goes to a machine that can't serve requests. A deep check that returns 503 means Fly.io routes traffic to a healthy machine (in a multi-instance setup) or restarts this one (single instance).
+**Why deep wins for us:** External probes (uptime monitor, Cloudflare Worker cron) use `/health` to decide whether to page an operator or trigger an automated restart. A shallow check that always returns 200 means the server is "healthy" even when every request will fail with 503. A deep check returning 503 tells the monitor the truth — someone (or something) needs to act.
 
-**Mitigating false negatives from transient blips:** Fly.io health checks run every 15 seconds with a threshold (N consecutive failures before marking unhealthy). A single Postgres blip produces one 503, which doesn't trigger a restart. Three consecutive 503s (45 seconds of Postgres downtime) triggers a restart — which is the correct response.
+**Mitigating false negatives from transient blips:** Configure the uptime monitor with a threshold (e.g. 3 consecutive failed 1-minute probes = page). A single Postgres blip produces one 503, which doesn't trigger the alert. Three consecutive 503s (3 minutes of Postgres downtime) triggers the alert or auto-restart hook — which is the correct response.
 
 ### Implementation
 
@@ -1276,13 +1279,13 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 
 ### Design Choices
 
-**Parallel checks:** Postgres and S2 are checked concurrently. If both have 3-second timeouts, the worst case is 3 seconds (not 6). The health endpoint must respond within the Fly.io check timeout (5 seconds).
+**Parallel checks:** Postgres and S2 are checked concurrently. If both have 3-second timeouts, the worst case is 3 seconds (not 6). The health endpoint must respond within the external probe's timeout (typically 5 seconds for uptime monitors; Cloudflare's per-request edge timeout is 100 s so that's not the constraint).
 
 **`CheckTail` on `uuid.Nil` for S2:** `uuid.Nil` is `00000000-0000-0000-0000-000000000000`. Stream name: `conversations/00000000-0000-0000-0000-000000000000`. This stream doesn't exist, so S2 returns "stream not found" — which proves S2 is reachable and the auth token is valid. We treat stream-not-found as success.
 
 Why not a dedicated health-check stream: Creating and maintaining a dedicated stream adds unnecessary state. The stream-not-found error is a perfectly valid round-trip test.
 
-**No agent auth on health endpoint:** Health checks run from Fly.io's infrastructure, not from registered agents. Requiring `X-Agent-ID` would break infrastructure monitoring.
+**No agent auth on health endpoint:** Health checks run from external monitoring infrastructure (uptime monitor, Cloudflare Worker cron, operator `curl`), not from registered agents. Requiring `X-Agent-ID` would break infrastructure monitoring.
 
 **No caching:** Health status is checked fresh on every call. Caching would defeat the purpose — if Postgres goes down, a cached "ok" response continues for the cache TTL.
 
@@ -1316,49 +1319,43 @@ Why `map[string]string` for checks: Extensible without type changes. Adding a ne
 
 Why no uptime, version, or commit hash: The health endpoint answers "can this server serve requests?" Adding metadata conflates health checking with service discovery. If needed, add a separate `GET /info` endpoint.
 
-### Fly.io Health Check Configuration
+### External Health Check Configuration
 
-```toml
-[[services.tcp_checks]]
-  interval = "15s"
-  timeout = "5s"
-  grace_period = "10s"
+The probe lives outside the binary. Two typical setups:
 
-[[services.http_checks]]
-  interval = "15s"
-  timeout = "5s"
-  grace_period = "10s"
-  method = "get"
-  path = "/health"
-```
+**UptimeRobot / Pingdom / BetterStack HTTP monitor:**
 
 | Parameter | Value | Rationale |
 |---|---|---|
-| `interval` | 15s | Check every 15 seconds. Frequent enough to detect outages quickly. |
-| `timeout` | 5s | Must be > health check's internal timeout (5s). Matches. |
-| `grace_period` | 10s | After deploy, don't check for 10 seconds (server is starting up). |
+| URL | `https://agentmail.example.com/health` | Goes through Cloudflare edge → tunnel → origin |
+| Method | GET | Matches our handler |
+| Expected status | 200 | 503 = degraded = page |
+| Interval | 60 s (free tier) or 30 s (paid) | Frequent enough to catch real outages |
+| Timeout | 5 s | > our internal 4 s check budget |
+| Failure threshold | 3 consecutive | Ignores transient blips |
+| Alert | Email / Slack / PagerDuty | On 3rd consecutive failure |
+
+**Cloudflare Worker cron (alternative):** A Worker scheduled every minute that `fetch()`es `/health`, inspects the body's `checks` map, and posts to Slack/PagerDuty on degraded status. Costs $5/mo for Workers Paid.
 
 ### Edge Cases
 
 **Health check during startup (before HTTP server is ready):**
 
-The grace period (10 seconds) prevents Fly.io from checking health before the server starts. If the server starts in under 3 seconds (expected), there's a 7-second buffer.
+Before the HTTP listener binds port 8080, an external probe gets "connection refused" from cloudflared (no origin listening). This is the same 502 the probe would see during restart. The monitor's failure threshold (3 consecutive) tolerates the ~3 s startup window without alerting.
 
 **Health check during shutdown:**
 
-`srv.Shutdown()` stops accepting new connections. Health checks from Fly.io are new connections — they're rejected. Fly.io sees a connection refused, marks the machine as unhealthy, and stops routing traffic. This is correct — the machine IS shutting down.
+`srv.Shutdown()` stops accepting new connections. Probes from the uptime monitor are new connections — they're refused. The monitor sees connection-refused, counts it as a failure. During a graceful restart, the new process binds within ~1 s — well below the 3-consecutive-failure threshold.
 
 **Postgres and S2 both unreachable simultaneously:**
 
-Both checks fail within their 3-second timeouts. Total response time: 3 seconds (parallel). Response: 503 with both components showing unreachable. Fly.io marks machine unhealthy. If it persists, Fly.io restarts the machine. On restart, the server fails to connect to Postgres (step 3) and exits with Fatal. Fly.io sees the machine stopped and starts a new one. The cycle repeats until dependencies recover.
+Both checks fail within their 3-second timeouts. Total response time: 3 seconds (parallel). Response: 503 with both components showing unreachable. The monitor alerts after 3 consecutive probes. If the condition persists, whatever auto-remediation we've wired (e.g. a Worker that calls `systemctl restart agentmail`) fires. On restart, the server fails to connect to Postgres (step 3) and exits with Fatal. The supervisor's `Restart=on-failure` starts a new process. The cycle repeats until dependencies recover.
 
 **Health check timeout fires before both checks complete:**
 
-If Postgres takes 4 seconds and S2 takes 1 second, the 5-second overall timeout fires before the health handler returns the response. Fly.io sees a timeout, treats it as unhealthy. This is correct — if the health check itself can't complete in time, the server is degraded.
+If Postgres takes 4 seconds and S2 takes 1 second, the 5-second overall timeout fires before the health handler returns the response. The probe sees a timeout, treats it as unhealthy. This is correct — if the health check itself can't complete in time, the server is degraded.
 
-To prevent this: the health check's internal timeout (5 seconds) matches the Fly.io check timeout (5 seconds). Both fire at the same time. The handler returns a 503 "degraded" before the Fly.io timeout fires, giving the health check a chance to report WHY it's degraded.
-
-Actually, the internal timeout should be slightly LESS than the Fly.io timeout — say 4 seconds — to ensure the response is sent before Fly.io gives up:
+To prevent this: the health check's internal timeout should be slightly LESS than the external probe's timeout — say 4 seconds when the probe allows 5 — to ensure the response is sent before the probe gives up:
 
 ```go
 // Use 80% of the configured health check timeout for individual checks
@@ -1437,7 +1434,7 @@ Why not put startup/shutdown logic in `internal/server/`: For the take-home, `ma
 
 ### Single Instance (Take-Home)
 
-Everything in this document works as-is. One Fly.io machine, one Go process. Startup in <3 seconds. Shutdown in <15 seconds. Health checks verify both dependencies.
+Everything in this document works as-is. One host, one Go process behind one Cloudflare Tunnel. Startup in <3 seconds. Shutdown in <15 seconds. Health checks (probed externally) verify both dependencies.
 
 ### Multi-Instance (Horizontal Scaling)
 
@@ -1487,7 +1484,7 @@ Document, don't build.
 | **Two instances start simultaneously with empty database** | Both run migration simultaneously. Postgres serializes DDL — one succeeds, other is no-op. | No conflict. |
 | **RESIDENT_AGENT_ID points to an agent that doesn't exist in Postgres** | `EnsureExists()` inserts it. | Self-healing. |
 | **RESIDENT_AGENT_ID points to an agent that exists and is in 1000 conversations** | `reconcileConversations()` starts 1000 listeners sequentially. Startup takes ~10s. | Acceptable. Parallelize for production (document in FUTURE.md). |
-| **Port configured in fly.toml doesn't match PORT env var** | Server listens on PORT. Fly.io routes to fly.toml port. Health checks fail. No traffic reaches server. | Fix fly.toml or PORT to match. |
+| **Port in `cloudflared --url` doesn't match PORT env var** | Server listens on PORT. cloudflared tries to forward to the URL's port and gets "connection refused." All tunneled requests return 502. | Fix the `cloudflared tunnel --url http://localhost:<PORT>` invocation or the `PORT` env var to match. |
 
 ### Shutdown Edge Cases
 
@@ -1499,7 +1496,7 @@ Document, don't build.
 | **Streaming write in-flight during shutdown** | Context canceled. Handler writes `message_abort`. `in_progress_messages` row deleted. | Partial message on stream, properly aborted. |
 | **Postgres unreachable during final cursor flush** | `FlushAll()` returns error. Warning logged. | Cursors up to 5s stale. At-least-once redelivery on reconnect. |
 | **Shutdown timeout fires (30s exceeded)** | `srv.Close()` force-closes all connections. Defers run (pool.Close()). Process exits. | Same as crash — in-memory cursors lost, recovery sweep on next start. |
-| **SIGKILL during shutdown (Fly.io timeout)** | Process killed immediately. No cleanup. | Same as crash. Recovery sweep handles everything on next start. |
+| **SIGKILL during shutdown (supervisor timeout exceeded)** | Process killed immediately. No cleanup. | Same as crash. Recovery sweep handles everything on next start. |
 | **Shutdown called twice (second SIGTERM)** | First shutdown is in progress. Second signal handler calls `os.Exit(1)`. | Same as SIGKILL. |
 
 ### Runtime Edge Cases (Handled by Lifecycle Design)
@@ -1531,7 +1528,7 @@ internal/
                          # envIntOrDefault(), validation
 ```
 
-### Environment Variables Summary (for fly.toml and .env)
+### Environment Variables Summary (for `.env` / `EnvironmentFile=`)
 
 ```bash
 # Required

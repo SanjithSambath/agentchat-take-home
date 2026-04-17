@@ -142,7 +142,7 @@ Six tables: `agents`, `conversations` (with cached `head_seq` updated inline on 
 - Membership: LRU cache (100K entries, 60s TTL, synchronous invalidation on invite/leave)
 - Delivery cursor: In-memory hot tier with batched Postgres flush (every 5s). `ack_seq` is NOT cached — synchronous write-through for correctness.
 
-**Hosting:** Neon serverless PostgreSQL (free tier, `us-east-1`). Direct TCP connection from Go server on Fly.io (`iad`). ~1-5ms latency.
+**Hosting:** Neon serverless PostgreSQL (free tier, `us-east-1`). Direct TCP connection from the Go server host (recommended: an `us-east-1` colocated box behind a Cloudflare Tunnel). ~1-5ms latency.
 
 → Full design: [`sql-metadata-plan.md`](sql-metadata-plan.md)
 
@@ -200,7 +200,7 @@ Internal goroutine within the Go server process. Calls store/S2 layers directly 
 
 ### 12. Deployment
 
-Fly.io single instance (`shared-cpu-1x`, 512 MB RAM, `iad` region). Multi-stage Docker build (Go builder → Alpine runtime, ~15 MB image). Secrets via `fly secrets set`. Health check: `GET /health` (Postgres ping + S2 connectivity).
+Single static Go binary (`go build ./cmd/server`) running on any Linux/macOS host, exposed publicly via `cloudflared tunnel` — Cloudflare's edge terminates TLS and forwards HTTP/2 to `http://localhost:8080`. Secrets via the host's process environment (`.env` for local, `EnvironmentFile` for systemd, platform secret manager for cloud VMs). Health check: `GET /health` (Postgres ping + S2 connectivity), probed externally by an uptime monitor or Cloudflare Worker cron.
 
 → Full design: [`deployment-plan.md`](deployment-plan.md)
 
@@ -263,7 +263,7 @@ API handlers ARE the orchestration. The store handles data access, S2 handles st
 | 8 | Claude agent | 2 hr | Registration, SSE listeners, Claude API streaming, token forwarding |
 | 9 | Testing | 2 hr | Integration suite, concurrent writers, disconnect/reconnect |
 | 10 | Documentation | 1.5 hr | `DESIGN.md`, `FUTURE.md`, `CLIENT.md` |
-| 11 | Deployment | 1 hr | Dockerfile, fly.toml, deploy, verify |
+| 11 | Deployment | 1 hr | `go build`, `cloudflared tunnel --url`, verify public URL |
 
 **Total estimated: ~14.5 hours**
 
@@ -317,8 +317,6 @@ agentmail-take-home/
 │   └── CLIENT.md
 ├── go.mod
 ├── go.sum
-├── Dockerfile                       → deployment-plan.md §1
-├── fly.toml                         → deployment-plan.md §2
 ├── Makefile
 ├── sqlc.yaml
 └── README.md                        (immutable project spec)
@@ -365,7 +363,7 @@ agentmail-take-home/
 | [`http-api-layer-plan.md`](http-api-layer-plan.md) | Error format, middleware chain, request/response contracts, timeouts, agent validation | ~1770 |
 | [`claude-agent-plan.md`](claude-agent-plan.md) | Resident agent identity, discovery, Claude API integration, concurrency, error handling | ~1670 |
 | [`server-lifecycle-plan.md`](server-lifecycle-plan.md) | `main.go` startup/shutdown, configuration, health checks | ~1550 |
-| [`deployment-plan.md`](deployment-plan.md) | Dockerfile, fly.toml, secrets, Fly.io machine config | ~1240 |
+| [`deployment-plan.md`](deployment-plan.md) | `go build`, `cloudflared tunnel`, secrets via process env, health check wiring | ~1160 |
 | [`gaps.md`](gaps.md) | Design audit — what's exhaustively designed vs. sketched, gap analysis | ~270 |
 
 ---
@@ -379,4 +377,4 @@ agentmail-take-home/
 5. **Leave test:** Agent B leaves, verify SSE closes, verify B can't read/write.
 6. **Claude agent test:** Invite Claude agent, send message, verify streaming response.
 7. **Integration suite:** `go test ./tests/... -v` — all scenarios pass.
-8. **Deployed test:** Hit live Fly.io URL, register agent, converse with Claude agent.
+8. **Deployed test:** Hit the live Cloudflare Tunnel URL (quick or named), register agent, converse with Claude agent.

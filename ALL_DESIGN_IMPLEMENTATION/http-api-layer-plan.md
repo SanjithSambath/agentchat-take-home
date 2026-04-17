@@ -1544,9 +1544,9 @@ for {
 }
 ```
 
-**Why 30-second heartbeats:** Most load balancers (AWS ALB, Fly.io proxy, nginx default) timeout idle connections at 60 seconds. 30-second heartbeats keep the connection active with 2x safety margin. SSE comments (lines starting with `:`) are ignored by SSE clients — they don't trigger event handlers.
+**Why 30-second heartbeats:** Most load balancers and edge proxies (AWS ALB, Cloudflare edge, nginx default) timeout idle connections at 60-100 seconds. 30-second heartbeats keep the connection active with 2x-3x safety margin. SSE comments (lines starting with `:`) are ignored by SSE clients — they don't trigger event handlers.
 
-**Why 24-hour absolute cap:** Fly.io machines can restart for maintenance, deployments, or scaling events. A 24-hour cap ensures connections are periodically refreshed. The client auto-reconnects with `Last-Event-ID`, so there's no data loss. Without a cap, a leaked goroutine (client that disconnected but the server didn't detect it) runs forever.
+**Why 24-hour absolute cap:** The Go server host can restart for maintenance, binary redeploys, or `cloudflared` restarts. A 24-hour cap ensures connections are periodically refreshed. The client auto-reconnects with `Last-Event-ID`, so there's no data loss. Without a cap, a leaked goroutine (client that disconnected but the server didn't detect it) runs forever.
 
 **Bounded event channel and slow-consumer disconnect.** Each SSE connection owns two goroutines: a *tailer* reading from the S2 ReadSession and a *writer* flushing to the HTTP response. They communicate via a buffered channel `eventCh := make(chan SequencedEvent, 64)`. The cap is deliberate — it absorbs short stalls (GC pauses, proxy reconnects) but not unbounded lag. Every enqueue uses a 500 ms deadline:
 
@@ -2263,7 +2263,7 @@ func (h *Handler) ExampleEndpoint(w http.ResponseWriter, r *http.Request) {
 
 ### At Thousands (Take-Home)
 
-Everything in this document works as-is. Single Fly.io instance, `sync.Map` agent cache, no rate limiting, no CORS.
+Everything in this document works as-is. Single Go server host behind a Cloudflare Tunnel, `sync.Map` agent cache, no rate limiting, no CORS.
 
 ### At Millions
 
