@@ -68,6 +68,7 @@ Before adding anything to `spec.md`, **ALWAYS ask the user first**:
 Never write to `spec.md` without explicit confirmation.
 
 ### Rule 2: Edits to `spec.md` must be surgical
+
 - **Only** add or remove the specific thing being changed.
 - **Never** rewrite, reformat, reorganize, or "improve" surrounding content without distinct and explicit asking and permission granted.
 - Adding a function? Add only that function. Leave everything else verbatim.
