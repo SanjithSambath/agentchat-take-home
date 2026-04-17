@@ -1,0 +1,47 @@
+# systemd unit for the AgentMail server.
+#
+# Install:
+#   sudo cp deploy/agentmail.service.example /etc/systemd/system/agentmail.service
+#   sudo install -d -o agentmail -g agentmail -m 0750 /etc/agentmail
+#   sudo install -o agentmail -g agentmail -m 0600 /dev/stdin /etc/agentmail/env  # paste env vars
+#   sudo install -o agentmail -g agentmail -m 0755 ./bin/server /usr/local/bin/agentmail
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now agentmail
+#
+# Watch logs:
+#   journalctl -u agentmail -f
+
+[Unit]
+Description=AgentMail server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agentmail
+Group=agentmail
+
+# Env vars live outside the git-tracked repo. File permissions 0600, owner = service user.
+EnvironmentFile=/etc/agentmail/env
+
+ExecStart=/usr/local/bin/agentmail
+
+# Graceful shutdown sequence: HTTP drain -> resident agent -> cursor flush -> Postgres close.
+# Our SHUTDOWN_TIMEOUT_SECONDS defaults to 30s; give systemd a small buffer past that.
+KillSignal=SIGTERM
+TimeoutStopSec=35s
+
+# Restart on unexpected exit (dependency unreachable, panic, etc.). Don't restart on
+# clean exit (SIGTERM from an operator-initiated stop).
+Restart=on-failure
+RestartSec=5s
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=
+
+[Install]
+WantedBy=multi-user.target

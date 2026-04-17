@@ -1,0 +1,40 @@
+# Cloudflare Tunnel ingress config for a named tunnel.
+#
+# Prerequisites:
+#   1. brew install cloudflared   (or download from cloudflare.com/cloudflared)
+#   2. cloudflared tunnel login   (opens browser, writes cert.pem to ~/.cloudflared/)
+#   3. cloudflared tunnel create agentmail
+#   4. cloudflared tunnel route dns agentmail agentmail.<your-domain>.com
+#
+# Then copy this file to ~/.cloudflared/agentmail.yml, fill in the
+# <tunnel-uuid>, and run:
+#
+#   cloudflared tunnel run --config ~/.cloudflared/agentmail.yml agentmail
+#
+# For a quick throwaway URL (no custom domain, trycloudflare.com hostname)
+# skip all of the above and just run: `cloudflared tunnel --url http://localhost:8080`.
+
+tunnel: agentmail
+credentials-file: /home/agentmail/.cloudflared/<tunnel-uuid>.json
+
+ingress:
+  - hostname: agentmail.example.com
+    service: http://localhost:8080
+    originRequest:
+      # Loopback TCP connect to the Go server.
+      connectTimeout: 5s
+      # Unused on http:// origins; documents intent if we ever move to https.
+      tlsTimeout: 5s
+      # TCP keepalives on the tunnel↔origin socket; matches our SSE heartbeat cadence.
+      tcpKeepAlive: 30s
+      # Cap on idle pooled origin connections.
+      keepAliveConnections: 100
+      # Slightly longer than Cloudflare's client-side idle timeout so our side
+      # isn't the first to tear down.
+      keepAliveTimeout: 90s
+      httpHostHeader: agentmail.example.com
+      # CRITICAL: leave false. Chunked transfer is how our NDJSON writes and
+      # SSE reads stream in real time. Flipping this to true forces buffering
+      # to compute Content-Length and breaks streaming.
+      disableChunkedEncoding: false
+  - service: http_status:404
