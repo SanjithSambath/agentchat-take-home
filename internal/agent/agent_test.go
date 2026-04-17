@@ -309,6 +309,16 @@ func (m *fakeMeta) LockMembersForUpdate(ctx context.Context, convID uuid.UUID) (
 	return m.ListMembers(ctx, convID)
 }
 
+func (m *fakeMeta) ListAllConversations(ctx context.Context) ([]store.Conversation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]store.Conversation, 0, len(m.convs))
+	for cID := range m.convs {
+		out = append(out, store.Conversation{ID: cID, S2StreamName: fmt.Sprintf("conversations/%s", cID)})
+	}
+	return out, nil
+}
+
 func cursorKey(a, c uuid.UUID) string { return a.String() + "/" + c.String() }
 
 func (m *fakeMeta) GetDeliveryCursor(ctx context.Context, agentID, convID uuid.UUID) (uint64, error) {

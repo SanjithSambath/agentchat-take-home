@@ -20,3 +20,10 @@ SELECT head_seq FROM conversations WHERE id = $1;
 UPDATE conversations
 SET head_seq = $2
 WHERE id = $1 AND head_seq < $2;
+
+-- name: ListAllConversations :many
+-- Unfiltered feed for the observer UI. Newest-first.
+SELECT id, s2_stream_name, head_seq, created_at
+FROM conversations
+ORDER BY created_at DESC
+LIMIT 500;

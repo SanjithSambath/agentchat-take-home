@@ -2,3 +2,7 @@
 .env
 .env.*
 !.env.example
+
+/bin/
+.claude/
+negotiation/__pycache__/

@@ -201,6 +201,16 @@ func (f *fakeMeta) ListConversationsForAgent(ctx context.Context, agentID uuid.U
 	return out, nil
 }
 
+func (f *fakeMeta) ListAllConversations(ctx context.Context) ([]store.Conversation, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]store.Conversation, 0, len(f.convs))
+	for _, c := range f.convs {
+		out = append(out, *c)
+	}
+	return out, nil
+}
+
 func (f *fakeMeta) LockMembersForUpdate(ctx context.Context, convID uuid.UUID) ([]uuid.UUID, error) {
 	return f.ListMembers(ctx, convID)
 }

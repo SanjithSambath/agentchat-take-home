@@ -146,6 +146,11 @@ type MetadataStore interface {
 	// current member of. Powers GET /conversations.
 	ListConversationsForAgent(ctx context.Context, agentID uuid.UUID) ([]Conversation, error)
 
+	// ListAllConversations returns every conversation in the system, newest
+	// first. Powers the observer UI's GET /observer/conversations — does not
+	// filter by membership.
+	ListAllConversations(ctx context.Context) ([]Conversation, error)
+
 	// LockMembersForUpdate takes a SELECT ... FOR UPDATE lock on all member
 	// rows for the conversation. Called inside a transaction before RemoveMember
 	// to serialize concurrent leaves (prevents two last-members leaving at once).

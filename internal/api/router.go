@@ -53,6 +53,18 @@ func NewRouter(s2 store.S2Store, meta store.MetadataStore, resident ResidentInfo
 		r.Get("/agents/resident", h.GetResidentAgent)
 	})
 
+	// Observer group — omniscient read-only view for the UI. No AgentAuth,
+	// no membership gate. SSE bypasses the Timeout middleware like the
+	// member stream.
+	r.Group(func(r chi.Router) {
+		r.Use(Timeout(30 * time.Second))
+		r.Get("/observer/conversations", h.ObserverListConversations)
+		r.Get("/observer/conversations/{cid}/messages", h.ObserverGetHistory)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get("/observer/conversations/{cid}/stream", h.ObserverSSEStream)
+	})
+
 	// Authenticated, non-streaming group.
 	r.Group(func(r chi.Router) {
 		r.Use(AgentAuth(meta))

@@ -318,6 +318,23 @@ func (s *postgresMetadataStore) ListConversationsForAgent(ctx context.Context, a
 	return out, nil
 }
 
+func (s *postgresMetadataStore) ListAllConversations(ctx context.Context) ([]Conversation, error) {
+	rows, err := s.q.ListAllConversations(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("store: list all conversations: %w", err)
+	}
+	out := make([]Conversation, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, Conversation{
+			ID:           r.ID,
+			S2StreamName: r.S2StreamName,
+			HeadSeq:      uint64(r.HeadSeq),
+			CreatedAt:    r.CreatedAt.Time,
+		})
+	}
+	return out, nil
+}
+
 // LockMembersForUpdate returns the current member set under a row-level lock.
 // The lock only holds for the lifetime of this call (short-lived transaction) —
 // real serialization of concurrent leaves lives inside RemoveMember.

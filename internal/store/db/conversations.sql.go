@@ -84,3 +84,31 @@ func (q *Queries) UpdateConversationHeadSeq(ctx context.Context, arg UpdateConve
 	_, err := q.db.Exec(ctx, updateConversationHeadSeq, arg.ID, arg.HeadSeq)
 	return err
 }
+
+const listAllConversations = `-- name: ListAllConversations :many
+SELECT id, s2_stream_name, head_seq, created_at
+FROM conversations
+ORDER BY created_at DESC
+LIMIT 500
+`
+
+// Unfiltered feed for the observer UI. Newest-first.
+func (q *Queries) ListAllConversations(ctx context.Context) ([]Conversation, error) {
+	rows, err := q.db.Query(ctx, listAllConversations)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Conversation
+	for rows.Next() {
+		var i Conversation
+		if err := rows.Scan(&i.ID, &i.S2StreamName, &i.HeadSeq, &i.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
