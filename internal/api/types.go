@@ -38,6 +38,7 @@ type ConversationSummary struct {
 	ConversationID uuid.UUID   `json:"conversation_id"`
 	Members        []uuid.UUID `json:"members"`
 	CreatedAt      time.Time   `json:"created_at"`
+	HeadSeq        uint64      `json:"head_seq"`
 }
 
 // POST /conversations/{cid}/invite

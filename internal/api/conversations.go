@@ -101,6 +101,7 @@ func (h *Handler) ListConversations(w http.ResponseWriter, r *http.Request) {
 			ConversationID: c.ID,
 			Members:        members,
 			CreatedAt:      c.CreatedAt.UTC(),
+			HeadSeq:        c.HeadSeq,
 		})
 	}
 	WriteJSON(w, r, http.StatusOK, ListConversationsResponse{Conversations: out})

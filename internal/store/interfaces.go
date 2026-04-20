@@ -142,6 +142,11 @@ type MetadataStore interface {
 	// ListMembers returns all current member agent ids for a conversation.
 	ListMembers(ctx context.Context, convID uuid.UUID) ([]uuid.UUID, error)
 
+	// ListMembersForConversations returns members for every conversation in
+	// the input set in a single round trip. Powers the observer list endpoint,
+	// which would otherwise N+1 one ListMembers per conversation.
+	ListMembersForConversations(ctx context.Context, convIDs []uuid.UUID) (map[uuid.UUID][]uuid.UUID, error)
+
 	// ListConversationsForAgent returns all conversations the agent is a
 	// current member of. Powers GET /conversations.
 	ListConversationsForAgent(ctx context.Context, agentID uuid.UUID) ([]Conversation, error)

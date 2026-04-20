@@ -187,6 +187,21 @@ func (f *fakeMeta) ListMembers(ctx context.Context, convID uuid.UUID) ([]uuid.UU
 	return out, nil
 }
 
+func (f *fakeMeta) ListMembersForConversations(ctx context.Context, convIDs []uuid.UUID) (map[uuid.UUID][]uuid.UUID, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[uuid.UUID][]uuid.UUID, len(convIDs))
+	for _, cid := range convIDs {
+		m := f.members[cid]
+		ids := make([]uuid.UUID, 0, len(m))
+		for id := range m {
+			ids = append(ids, id)
+		}
+		out[cid] = ids
+	}
+	return out, nil
+}
+
 func (f *fakeMeta) ListConversationsForAgent(ctx context.Context, agentID uuid.UUID) ([]store.Conversation, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

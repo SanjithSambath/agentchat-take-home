@@ -11,6 +11,7 @@ import (
 
 	"agentmail/internal/model"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 )
 
@@ -27,18 +28,27 @@ func (h *Handler) ObserverListConversations(w http.ResponseWriter, r *http.Reque
 		WriteError(w, r, http.StatusInternalServerError, CodeInternalError, "internal server error")
 		return
 	}
+	ids := make([]uuid.UUID, 0, len(convs))
+	for _, c := range convs {
+		ids = append(ids, c.ID)
+	}
+	memberMap, err := h.meta.ListMembersForConversations(r.Context(), ids)
+	if err != nil {
+		log.Ctx(r.Context()).Error().Err(err).Msg("observer: bulk list members failed")
+		WriteError(w, r, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
 	out := make([]ConversationSummary, 0, len(convs))
 	for _, c := range convs {
-		members, err := h.meta.ListMembers(r.Context(), c.ID)
-		if err != nil {
-			log.Ctx(r.Context()).Error().Err(err).Msg("observer: list members failed")
-			WriteError(w, r, http.StatusInternalServerError, CodeInternalError, "internal server error")
-			return
+		members := memberMap[c.ID]
+		if members == nil {
+			members = []uuid.UUID{}
 		}
 		out = append(out, ConversationSummary{
 			ConversationID: c.ID,
 			Members:        members,
 			CreatedAt:      c.CreatedAt.UTC(),
+			HeadSeq:        c.HeadSeq,
 		})
 	}
 	WriteJSON(w, r, http.StatusOK, ListConversationsResponse{Conversations: out})

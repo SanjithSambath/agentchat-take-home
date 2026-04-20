@@ -301,6 +301,35 @@ func (s *postgresMetadataStore) ListMembers(ctx context.Context, convID uuid.UUI
 	return members, nil
 }
 
+// ListMembersForConversations collapses an N+1 list-members loop into one
+// round trip, which matters for the observer endpoint that otherwise pays
+// one Neon hop per conversation.
+func (s *postgresMetadataStore) ListMembersForConversations(ctx context.Context, convIDs []uuid.UUID) (map[uuid.UUID][]uuid.UUID, error) {
+	out := make(map[uuid.UUID][]uuid.UUID, len(convIDs))
+	if len(convIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT conversation_id, agent_id FROM members
+		 WHERE conversation_id = ANY($1)
+		 ORDER BY conversation_id, joined_at`, convIDs)
+	if err != nil {
+		return nil, fmt.Errorf("store: list members bulk: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var convID, agentID uuid.UUID
+		if err := rows.Scan(&convID, &agentID); err != nil {
+			return nil, fmt.Errorf("store: list members bulk scan: %w", err)
+		}
+		out[convID] = append(out[convID], agentID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list members bulk iter: %w", err)
+	}
+	return out, nil
+}
+
 func (s *postgresMetadataStore) ListConversationsForAgent(ctx context.Context, agentID uuid.UUID) ([]Conversation, error) {
 	rows, err := s.q.ListConversationsForAgent(ctx, agentID)
 	if err != nil {
