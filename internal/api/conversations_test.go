@@ -27,6 +27,7 @@ func routeHelper(t *testing.T, h *Handler, agentID uuid.UUID) chi.Router {
 	})
 	r.Post("/conversations", h.CreateConversation)
 	r.Get("/conversations", h.ListConversations)
+	r.Get("/conversations/{cid}", h.GetConversation)
 	r.Post("/conversations/{cid}/invite", h.InviteAgent)
 	r.Post("/conversations/{cid}/leave", h.LeaveConversation)
 	r.Post("/conversations/{cid}/messages", h.SendMessage)
@@ -63,6 +64,77 @@ func TestCreateConversation(t *testing.T) {
 	members, _ := meta.ListMembers(context.Background(), convID)
 	if len(members) != 1 || members[0] != agentID {
 		t.Fatalf("members = %v; want [%s]", members, agentID)
+	}
+}
+
+func TestGetConversation(t *testing.T) {
+	h, meta, _ := newTestHandler()
+	creator := registerAgent(t, meta)
+	invitee := registerAgent(t, meta)
+	stranger := registerAgent(t, meta)
+
+	// Creator router: creates conv + invites.
+	rCreator := routeHelper(t, h, creator)
+	convID := createConv(t, rCreator)
+	inviteBuf, _ := json.Marshal(InviteRequest{AgentID: invitee})
+	invReq := httptest.NewRequest(http.MethodPost,
+		"/conversations/"+convID.String()+"/invite", bytes.NewReader(inviteBuf))
+	invReq.Header.Set("Content-Type", "application/json")
+	invRec := httptest.NewRecorder()
+	rCreator.ServeHTTP(invRec, invReq)
+	if invRec.Code != http.StatusOK {
+		t.Fatalf("invite: %d %s", invRec.Code, invRec.Body.String())
+	}
+
+	// Creator can GET — expect creator + invitee in members.
+	rec := httptest.NewRecorder()
+	rCreator.ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/conversations/"+convID.String(), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("creator GET: %d %s", rec.Code, rec.Body.String())
+	}
+	var body ConversationSummary
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, rec.Body.String())
+	}
+	if body.ConversationID != convID {
+		t.Errorf("conversation_id = %s; want %s", body.ConversationID, convID)
+	}
+	gotMembers := map[uuid.UUID]bool{}
+	for _, m := range body.Members {
+		gotMembers[m] = true
+	}
+	if !gotMembers[creator] || !gotMembers[invitee] {
+		t.Errorf("members = %v; want both %s and %s", body.Members, creator, invitee)
+	}
+	if body.CreatedAt.IsZero() {
+		t.Error("created_at is zero")
+	}
+
+	// Invitee can GET too — they're a member after the invite.
+	rInvitee := routeHelper(t, h, invitee)
+	rec = httptest.NewRecorder()
+	rInvitee.ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/conversations/"+convID.String(), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("invitee GET: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Non-member — 403 not_member (prevents membership snooping via GET).
+	rStranger := routeHelper(t, h, stranger)
+	rec = httptest.NewRecorder()
+	rStranger.ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/conversations/"+convID.String(), nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("stranger GET: %d %s; want 403", rec.Code, rec.Body.String())
+	}
+
+	// Unknown conversation — 404 conversation_not_found.
+	rec = httptest.NewRecorder()
+	rCreator.ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/conversations/"+uuid.New().String(), nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown conv GET: %d %s; want 404", rec.Code, rec.Body.String())
 	}
 }
 

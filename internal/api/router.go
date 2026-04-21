@@ -73,6 +73,7 @@ func NewRouter(s2 store.S2Store, meta store.MetadataStore, resident ResidentInfo
 
 		r.Get("/conversations", h.ListConversations)
 		r.Post("/conversations", h.CreateConversation)
+		r.Get("/conversations/{cid}", h.GetConversation)
 
 		r.Post("/conversations/{cid}/invite", h.InviteAgent)
 		r.Post("/conversations/{cid}/leave", h.LeaveConversation)

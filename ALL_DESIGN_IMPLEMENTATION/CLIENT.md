@@ -208,6 +208,24 @@ Lists conversations the caller is a member of. No body, no pagination.
 ← 200 {"conversations":[{"conversation_id":"<uuid>","members":["<uuid>",...],"created_at":"..."}]}
 ```
 
+### 4.4b `GET /conversations/{cid}` — one conversation
+
+Returns one conversation's metadata plus the current member list — the
+single-item form of §4.4. Primary caller is `run_agent.py` verifying a
+`--target join:<cid>` before opening an SSE tail.
+
+```
+→ GET /conversations/{cid}
+  X-Agent-ID: <uuid>
+← 200 {"conversation_id":"<uuid>","members":["<uuid>",...],
+       "created_at":"...","head_seq":42}
+```
+
+Errors: `400 invalid_conversation_id`, `403 not_member`,
+`404 conversation_not_found`. 403 is the no-leak response for
+non-members — callers cannot distinguish "exists but not a member" from
+"doesn't exist at all" if they aren't invited.
+
 ### 4.5 `POST /conversations/{cid}/invite`
 
 Adds another agent. Idempotent on the invitee.

@@ -35,7 +35,7 @@ import requests
 from anthropic import Anthropic
 
 
-__VERSION__ = "2026-04-21.1"
+__VERSION__ = "2026-04-21.2"
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -770,11 +770,28 @@ def main() -> int:
         recent.append(agent)
         return False
 
-    if is_initiator and len(fetch_history(base, agent, cid)) == 0:
+    startup_history = fetch_history(base, agent, cid)
+    if is_initiator and len(startup_history) == 0:
         if run_one_turn("Begin the conversation now — make the first move per your brief."):
             stop_evt.set()
             post_leave(base, agent, cid)
             return print_summary(exit_reason, turns, cid, agent)
+    elif not is_initiator and startup_history:
+        # Responder joining a conversation that already has content. The SSE
+        # tail can only replay events still ahead of our server-side
+        # delivery_seq — if the server advanced the cursor on a prior
+        # (failed) connection, intermediate message_start/message_append
+        # frames may be gone and we'd see an orphan message_end that
+        # Tail._emit correctly drops. Seed the response from history so the
+        # conversation moves forward regardless of cursor state.
+        latest = startup_history[-1]
+        if (latest.get("sender_id") and latest.get("sender_id") != agent
+                and latest.get("status") == "complete"):
+            log("  joining mid-conversation; replying to latest peer message")
+            if run_one_turn(None):
+                stop_evt.set()
+                post_leave(base, agent, cid)
+                return print_summary(exit_reason, turns, cid, agent)
 
     # Main event loop.
     while not closing and turns < args.turns:

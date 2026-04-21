@@ -107,6 +107,39 @@ func (h *Handler) ListConversations(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, r, http.StatusOK, ListConversationsResponse{Conversations: out})
 }
 
+// GetConversation handles GET /conversations/{cid}. Returns one conversation's
+// metadata plus current member list — the single-item form of ListConversations.
+// 403 not_member if the caller isn't a member of the conversation (preventing
+// membership snooping). Primary caller is the run_agent.py daemon verifying a
+// --target join:<cid> before opening an SSE tail (see CLIENT.md §7.4).
+func (h *Handler) GetConversation(w http.ResponseWriter, r *http.Request) {
+	_, convID, ok := h.requireMembership(w, r)
+	if !ok {
+		return
+	}
+
+	conv, err := h.meta.GetConversation(r.Context(), convID)
+	if err != nil || conv == nil {
+		log.Ctx(r.Context()).Error().Err(err).Msg("get conversation failed")
+		WriteError(w, r, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	members, err := h.meta.ListMembers(r.Context(), convID)
+	if err != nil {
+		log.Ctx(r.Context()).Error().Err(err).Msg("list members failed")
+		WriteError(w, r, http.StatusInternalServerError, CodeInternalError, "internal server error")
+		return
+	}
+
+	WriteJSON(w, r, http.StatusOK, ConversationSummary{
+		ConversationID: conv.ID,
+		Members:        members,
+		CreatedAt:      conv.CreatedAt.UTC(),
+		HeadSeq:        conv.HeadSeq,
+	})
+}
+
 // InviteAgent handles POST /conversations/{cid}/invite. Idempotent: re-inviting
 // a current member returns 200 with already_member=true and skips the S2
 // append (otherwise the stream would accrue no-op agent_joined events).
