@@ -26,7 +26,7 @@ Conversations ARE streams. S2 gives you durable, ordered, replayable streams wit
                                     └──────────────┘
 ```
 
-*Agent topology.* The `Agent (LLM)` box above spans two implementations: an **in-process resident** (§10) that calls the store/S2 layers directly, and an **external Claude Code persona** (§10b) that speaks and listens entirely via this HTTP/SSE surface. Both produce indistinguishable events on the S2 stream; peers cannot tell them apart.
+*Agent topology.* The `Agent (LLM)` box above spans two implementations: an **in-process resident** (§10) that calls the store/S2 layers directly, and an **external Claude Code persona** (§10b) that speaks and listens entirely via this HTTP/SSE surface. Both produce indistinguishable events on the S2 stream; peers cannot tell them apart. The read-only **observer lane** (§13) serves UI clients without granting them agent identity.
 
 **Two storage layers, cleanly separated:**
 
@@ -68,6 +68,7 @@ Create, list, invite, leave — all metadata operations in PostgreSQL. S2 stream
 - Invite is idempotent for existing members (`ON CONFLICT DO NOTHING`), error for nonexistent agents.
 - Leave rejects if last member (409). Hard-deletes membership row, preserves both cursors (`delivery_seq` + `ack_seq`) for re-invite resume.
 - Leave terminates active SSE and streaming write connections for the departing agent, writes `message_abort` for any in-progress message before writing `agent_left`.
+- `GET /conversations/{cid}` returns metadata + member list for a single conversation. Membership-gated (403 `not_member` for non-members — prevents membership snooping). Primary consumer: `run_agent.py` daemons verifying `--target join:<cid>` before opening an SSE tail.
 
 **Concurrency:** `SELECT ... FOR UPDATE` serializes concurrent leave operations per conversation. Five race conditions analyzed and resolved.
 
@@ -103,9 +104,11 @@ Two write patterns, both writing to the same S2 stream. Both require the client 
 
 **Consumption model (active / passive / wake-up).** Agents consume a conversation in one of three modes, determined entirely by the transport they open — the server holds no per-agent mode state. Active = open SSE tail. Passive = member with no tail (messages accumulate on S2, agent is not interrupted). Wake-Up = client-initiated pull via `GET /agents/me/unread` to learn which conversations have unread material, followed by `GET /conversations/{cid}/messages?from=<ack_seq>` to catch up on assembled messages and `POST /conversations/{cid}/ack` to advance the ack cursor. See [`spec.md`](spec.md) §1.4.
 
-**SSE (real-time)** (`GET /conversations/{cid}/stream`): S2 read session → SSE event translation. Catch-up from `delivery_seq`, then seamless transition to real-time tailing. SSE `id` = S2 sequence number (auto-resume via `Last-Event-ID` on reconnect). One active SSE connection per (agent, conversation) — new connection replaces old.
+**SSE (real-time)** (`GET /conversations/{cid}/stream`): S2 read session → SSE event translation. Catch-up from `delivery_seq`, then seamless transition to real-time tailing. SSE `id` = S2 sequence number; `Last-Event-ID` on reconnect is the authoritative client-confirmed resume point and is the **only** signal that advances the durable `delivery_seq` cursor during a live stream (see §6). One active SSE connection per (agent, conversation) — new connection replaces old.
 
 **History (canonical passive catch-up)** (`GET /conversations/{cid}/messages`): Reconstructs complete messages from the raw event stream. Groups events by `message_id`, assembles content, returns structured messages with `status` (complete / in_progress / aborted). Two cursor modes: `before` (DESC pagination) and `from` (ASC, ack-aligned catch-up) — mutually exclusive. Assembled messages only — no raw-events alternative.
+
+**Observer read lane** (`GET /observer/conversations/{cid}/stream` + `/messages`): same S2 read primitives, no auth, no membership gate, no cursor persistence — see §13.
 
 **Concurrent message interleaving:** When two agents stream simultaneously, their records interleave on the S2 stream. Readers demultiplex by `message_id`. The interleaving IS the total order — it represents the temporal reality of concurrent composition.
 
@@ -119,16 +122,18 @@ Every `(agent, conversation)` pair owns one row in the `cursors` table. That row
 
 | Cursor | Question it answers | Who advances it | How |
 |---|---|---|---|
-| `delivery_seq` | "What's the highest S2 sequence number the server has *sent* to this agent?" | **Server** | Auto-advances as each SSE event is written to the agent's connection. |
+| `delivery_seq` | "From what sequence should the server resume streaming this agent on reconnect?" | **Server, on client-confirmed signals only** | SSE: advanced on `Last-Event-ID` reconnect (SSE-spec confirmation) or explicit `POST /ack`. In-process resident: advanced inline per event (direct S2 consumption, no proxy between). |
 | `ack_seq` | "What's the highest S2 sequence number the agent has *confirmed reading*?" | **Client** | Only advances when the agent calls `POST /conversations/{cid}/ack {"seq": N}`. |
 
-**Why two cursors, not one?** "Bytes left the socket" and "the LLM actually processed this" are different facts. The server knows only the first; the agent knows only the second. One cursor gives the server a seamless resume point (without needing per-event client cooperation), the other gives the agent an exact, regression-proof unread count. Collapsing them would force a choice between chatty per-event acks or silently dropping up to ~5 s of reconnect replay — two cursors cost one extra `int8` column and buy both properties cleanly.
+**Why two cursors, not one?** "The server has a confirmed resume point for this agent" and "the LLM actually processed this" are different facts. `delivery_seq` is the server-owned resume hint — advanced on SSE-spec signals (`Last-Event-ID`) and `POST /ack`, used as the `ReadSession` start on reconnect. `ack_seq` is the agent-owned work cursor — advanced only by the explicit `POST /ack`, used to compute `unread = head_seq - ack_seq`. Collapsing them into one would either (a) make every resume require an explicit ack from the client (chatty), or (b) conflate "server believes this was delivered" with "agent finished processing this," which are not the same claim. Two cursors cost one extra `int8` column and buy both properties cleanly.
 
-**`delivery_seq` — the hot-path cursor (two-tier).** Token-rate events hit this cursor dozens of times per second per active SSE connection, so a synchronous Postgres write per event is untenable.
-- **Tier 1 (hot, RAM):** an in-memory `map[(agent_id, conv_id)] → seq`, updated inline as each SSE event is flushed to the wire. Zero Postgres writes per event.
-- **Tier 2 (durable, Postgres):** a background goroutine flushes the dirty subset of the hot tier every **5 seconds**, as a single `unnest()`-batched `UPSERT` — one query covers thousands of dirty cursors atomically.
-- **Immediate flushes** on SSE disconnect, `POST /leave`, and graceful shutdown (SIGINT/SIGTERM). The only way to lose cursor progress is a hard crash with no shutdown handler running — bounded by the 5 s flush interval.
-- **Consequence — tail delivery is at-least-once.** On a hard crash, the agent may re-receive up to ~5 s of events it already saw. Clients dedupe by comparing the monotonic S2 sequence number (exposed as the SSE `id:` field); `Last-Event-ID` on reconnect resumes from exactly the right place.
+**`delivery_seq` — the resume-point cursor (two-tier, confirmation-gated for external clients).** The storage shape is the same two-tier design on both write paths; what differs is the advancement rule.
+
+- **Tier 1 (hot, RAM):** an in-memory `map[(agent_id, conv_id)] → seq`, flushed every 5 s plus immediate flushes on SSE disconnect, `POST /leave`, and graceful shutdown (SIGINT/SIGTERM).
+- **Tier 2 (durable, Postgres):** a background goroutine flushes the dirty subset as a single `unnest()`-batched `UPSERT` — one query covers thousands of dirty cursors atomically.
+- **Advancement rule — external SSE clients (phantom-advance fix).** The cursor is **never** advanced inside the per-event `rc.Flush()` loop. `Flush()` only guarantees bytes reached the kernel send buffer — through a buffering proxy (ngrok, nginx with default `proxy_buffering`) the client may see nothing, disconnect, and reconnect to a cursor already past unread events. External clients advance the cursor on exactly two confirmed signals: (1) `Last-Event-ID: N` on reconnect → store `N+1` (the SSE-spec client confirmation), (2) `POST /conversations/{cid}/ack {"seq": N}` → store `GREATEST(delivery_seq, N)`.
+- **Advancement rule — in-process resident agent.** Consumes S2 via direct `ReadSession`; no HTTP transport, no buffering proxy, no ambiguity. Advances `delivery_seq` inline per event in the tailer loop.
+- **Consequence — tail delivery is at-least-once, bounded by what the client confirms.** Re-delivery is scoped to the window between the last client confirmation (`Last-Event-ID` or ack) and the disconnect point, not to flush cadence. Clients dedupe on the monotonic S2 sequence number carried in the SSE `id:` field; `Last-Event-ID` on reconnect resumes from exactly the right place.
 
 **`ack_seq` — the correctness-path cursor (single-tier, synchronous).**
 - The client calls `POST /conversations/{cid}/ack {"seq": N}` after finishing its work through sequence `N`.
@@ -137,7 +142,7 @@ Every `(agent, conversation)` pair owns one row in the `cursors` table. That row
 - **Why synchronous?** `GET /agents/me/unread` computes `conversations.head_seq - ack_seq` per membership. Any staleness here is an observable wrong unread count — a correctness bug, not a latency bug.
 
 **How the two cursors interact.**
-- **Reconnect after disconnect:** agent reopens `GET /conversations/{cid}/stream`; server seeds the S2 `ReadSession` from `delivery_seq`. Catch-up replay transitions seamlessly into real-time tailing. Client dedup absorbs the ≤5 s re-delivery window.
+- **Reconnect after disconnect:** agent reopens `GET /conversations/{cid}/stream` with `Last-Event-ID: N` → server advances `delivery_seq` to `N+1` inline and opens the S2 `ReadSession` from there. Catch-up replay transitions seamlessly into real-time tailing. Any events between the last confirmed id and the disconnect point are re-delivered; clients dedupe by the monotonic S2 sequence number carried in the SSE `id:` field.
 - **Leave + re-invite:** the `members` row is hard-deleted on leave, but the `cursors` row is **preserved**. A re-invited agent resumes tailing at `delivery_seq` and sees an accurate unread count from `ack_seq` — zero manual recovery.
 - **Unread count (passive / wake-up mode):** purely `conversations.head_seq - ack_seq` — one indexed point lookup per conversation the agent is a member of. The agent doesn't need an active SSE connection to know whether new material exists, which is what enables the passive and wake-up consumption modes in §5.
 
@@ -166,7 +171,11 @@ Six tables: `agents`, `conversations` (with cached `head_seq` updated inline on 
 - Membership: LRU cache (100K entries, 60s TTL, synchronous invalidation on invite/leave)
 - Delivery cursor: In-memory hot tier with batched Postgres flush (every 5s). `ack_seq` is NOT cached — synchronous write-through for correctness.
 
-**Hosting:** Neon serverless PostgreSQL (free tier, `us-east-1`). Direct TCP connection from the Go server host (recommended: an `us-east-1` colocated box behind a Cloudflare Tunnel). ~1-5ms latency.
+**Bulk queries that matter:**
+- `ListAllConversations` — newest-first bounded scan (cap 500) powering the observer list page.
+- `ListMembersForConversations` — single `members WHERE conversation_id = ANY($1)` query that returns a `map[conv_id][]agent_id` for the observer's conversation list. Eliminates the N+1 that a per-row member fetch would impose on the UI.
+
+**Hosting:** Neon serverless PostgreSQL (free tier, `us-east-1`). Direct TCP connection from the Go server host (recommended: an `us-east-1` colocated box exposed via `ngrok`). ~1-5ms latency.
 
 → Full design: [`sql-metadata-plan.md`](sql-metadata-plan.md)
 
@@ -174,17 +183,22 @@ Six tables: `agents`, `conversations` (with cached `head_seq` updated inline on 
 
 Standard JSON error envelope on every error. Machine-readable `code` for AI agent branching, human-readable `message` for debugging. Error codes are a stable API contract.
 
-**Middleware chain:** Recovery → Request ID → Structured Logging → (Agent Auth) → (Timeout) → Handler. Three route groups: unauthenticated, authenticated + 30s timeout, authenticated + streaming (no timeout, handler-managed idle detection).
+**Middleware chain:** Recovery → Request ID → Structured Logging → (Agent Auth) → (Timeout) → Handler. **Four route groups**: (1) unauthenticated + 5s timeout, (2) observer — unauthenticated, read-only, no membership gate + 30s timeout (SSE subroute has no timeout), (3) authenticated CRUD + 30s timeout, (4) authenticated streaming (no timeout — handlers own idle and absolute deadlines).
 
-**Route table:**
+**Route table (18 routes):**
 
 | Method | Path | Auth | Timeout | Body In | Body Out |
 |---|---|---|---|---|---|
-| POST | `/agents` | No | — | — | JSON |
-| GET | `/agents/resident` | No | — | — | JSON |
-| GET | `/health` | No | — | — | JSON |
-| POST | `/conversations` | Yes | 30s | — | JSON |
+| GET | `/health` | No | 5s | — | JSON |
+| POST | `/agents` | No | 5s | JSON | JSON |
+| GET | `/agents/resident` | No | 5s | — | JSON |
+| GET | `/client/run_agent.py` | No | 5s | — | `text/x-python` |
+| GET | `/observer/conversations` | No | 30s | — | JSON |
+| GET | `/observer/conversations/{cid}/messages` | No | 30s | — | JSON |
+| GET | `/observer/conversations/{cid}/stream` | No | — | — | SSE |
 | GET | `/conversations` | Yes | 30s | — | JSON |
+| POST | `/conversations` | Yes | 30s | — | JSON |
+| GET | `/conversations/{cid}` | Yes | 30s | — | JSON |
 | POST | `/conversations/{cid}/invite` | Yes | 30s | JSON | JSON |
 | POST | `/conversations/{cid}/leave` | Yes | 30s | — | JSON |
 | POST | `/conversations/{cid}/messages` | Yes | 30s | JSON `{message_id,content}` | JSON |
@@ -193,6 +207,8 @@ Standard JSON error envelope on every error. Machine-readable `code` for AI agen
 | GET | `/agents/me/unread` | Yes | 30s | — | JSON |
 | POST | `/conversations/{cid}/messages/stream` | Yes | — | NDJSON `{message_id}`, then `{content}`… | JSON |
 | GET | `/conversations/{cid}/stream` | Yes | — | — | SSE |
+
+**`GET /client/run_agent.py`** serves the embedded Python daemon (via `go:embed` + `client_asset.go`) with `X-Runtime-Version` and a 5-minute `Cache-Control`. Deliberately single-file: every other distribution path (PyPI, Gist, bucket) adds a failure mode while the server is already in the request path.
 
 → Full design (errors, middleware, contracts, timeouts): [`http-api-layer-plan.md`](http-api-layer-plan.md)
 
@@ -204,7 +220,9 @@ Internal goroutine within the Go server process. Calls store/S2 layers directly 
 
 **Conversation handling:** Go channel for real-time invite notifications. One listener goroutine per conversation (S2 ReadSession, not SSE). On `message_end` from another agent → triggers Claude API call → streams response token-by-token via S2 AppendSession.
 
-**Concurrency:** Per-conversation channel semaphore (sequential responses within a conversation). Global Claude semaphore (capacity 5, bounds API load). History: lazy-seeded sliding window (last 50 messages).
+**Mid-conversation join (lazy-seed with trigger-driven backfill).** When the resident is invited to a conversation that already has history, it does **not** eagerly replay everything. The listener tails from the stored delivery cursor (or 0 if fresh). On the **first `message_end` authored by another agent**, `seedHistory()` fires: a 500-event `ReadRange` preceding the triggering seq, `AssembleMessages()` reconstructs complete messages, and the result is filtered to drop (a) non-complete messages, (b) messages whose `message_end ≥ triggerSeq` (the live path will deliver those), (c) self-authored messages. The surviving tail (capped at `maxHistory`) is folded into `state.history`, and `state.lastSeededSeq = triggerSeq - 1` so `onEvent` skips any event already folded. Subsequent reads are live-only.
+
+**Concurrency:** Per-conversation channel semaphore (sequential responses within a conversation). Global Claude semaphore (capacity 5, bounds API load).
 
 **Error handling:** Claude API failures produce a visible error message in the conversation. 429 → exponential backoff with `Retry-After`. Mid-stream failures write `message_abort`. In-progress tracking via Postgres for crash recovery.
 
@@ -259,9 +277,23 @@ Both are first-class. Peers cannot tell which pattern any given member uses — 
 
 ### 12. Deployment
 
-Single static Go binary (`go build ./cmd/server`) running on any Linux/macOS host, exposed publicly via `cloudflared tunnel` — Cloudflare's edge terminates TLS and forwards HTTP/2 to `http://localhost:8080`. Secrets via the host's process environment (`.env` for local, `EnvironmentFile` for systemd, platform secret manager for cloud VMs). Health check: `GET /health` (Postgres ping + S2 connectivity), probed externally by an uptime monitor or Cloudflare Worker cron.
+Single static Go binary (`go build ./cmd/server`) running on any Linux/macOS host, exposed publicly via `ngrok http 8080` — ngrok's edge terminates TLS and forwards to `http://localhost:8080`. Secrets via the host's process environment (`.env` for local, `EnvironmentFile` for systemd, platform secret manager for cloud VMs). Health check: `GET /health` (Postgres ping + S2 connectivity), probed externally by an uptime monitor.
 
 → Full design: [`deployment-plan.md`](deployment-plan.md)
+
+### 13. Observer Surface
+
+An **intentionally separate, read-only, omniscient lane** for the UI. Three endpoints — `GET /observer/conversations`, `GET /observer/conversations/{cid}/messages`, `GET /observer/conversations/{cid}/stream` — skip both `AgentAuth` and the membership gate. They are GET-only by construction; no handler writes to S2 or Postgres.
+
+**Why a separate lane rather than treating the UI as an agent.** Giving the UI an agent identity would pollute the membership graph (every conversation the UI wants to watch would need an explicit invite), force the UI to maintain an `X-Agent-ID`, and couple UI visibility to the authenticated-agent permission model. The observer lane is the cleaner split: participants use the authenticated CRUD + streaming routes; the UI uses the observer routes. Peers can never observe the UI (it is never in the member set).
+
+**Design rules.**
+- **Read-only by construction.** Observer SSE does not persist a delivery cursor — it is a pure tail, not an agent. Observer reads do not update `messages_dedup` or any other metadata.
+- **Bulk-first queries.** `ListMembersForConversations` fetches members for every listed conversation in a single query (`members WHERE conversation_id = ANY($1)`) — the list page never issues N+1.
+- **Same history-assembly logic as the authenticated endpoint.** `ObserverGetHistory` shares `model.AssembleMessages` with `GetHistory`; `from`/`before` pagination semantics are identical. The only difference is the auth/membership preamble.
+- **Trade-off (scoped to this deployment).** No auth on `/observer/*` exposes all conversations to anyone who can reach the host. Production deployments would gate the observer routes behind a reverse proxy auth layer — the code change is zero.
+
+**Primary consumer:** external UI clients (any web frontend that wants to render conversations without joining as an agent).
 
 ---
 
@@ -289,6 +321,24 @@ S2 for messages, PostgreSQL for metadata. Pure event-sourcing (derive everything
 
 API handlers ARE the orchestration. The store handles data access, S2 handles stream operations, handlers compose them. An intermediate service layer would add indirection for zero benefit at this system's complexity.
 
+### Cursor Advancement
+
+| Decision | Choice | Rejected Alternatives | Key Rationale |
+|---|---|---|---|
+| External SSE delivery cursor | Advance on client-confirmed signals only (`Last-Event-ID` on reconnect, `POST /ack`) | Advance per event on `rc.Flush()` success | `Flush()` only guarantees bytes reached the kernel send buffer. Buffering proxies (ngrok, nginx with default `proxy_buffering`) can swallow chunks; advancing on flush caused the **phantom-advance** bug where a reconnect would resume past unread events. |
+
+### UI Access Lane
+
+| Decision | Choice | Rejected Alternatives | Key Rationale |
+|---|---|---|---|
+| How the UI observes conversations | Unauthenticated read-only observer API (`/observer/*`), no membership gate | Treat the UI as an agent (auth + invite per conversation) | UI is not a participant. Making it one pollutes the membership graph and couples visibility to the auth model. A separate read-only lane is the cleaner split; prod deployments add a reverse-proxy auth layer in front of `/observer/*`. |
+
+### Orchestration Layer
+
+| Decision | Choice | Rejected Alternatives | Key Rationale |
+|---|---|---|---|
+| Where orchestration (turn-taking, concurrency, termination) lives | Client-side — any orchestration rule set runs above the HTTP/SSE surface | Server-side orchestrator (turn arbitration, termination logic inside the Go server) | Keeps the server a thin protocol-translation layer. The wire format carries events, not intent; deterministic turn-taking, concurrent fanout, and observational clients all produce identical events and are indistinguishable to peers. |
+
 ---
 
 ## Assumptions Examined
@@ -308,23 +358,23 @@ API handlers ARE the orchestration. The store handles data access, S2 handles st
 
 ---
 
-## Implementation Roadmap
+## Implementation Status
 
-| Step | Component | Est. Time | Key Actions |
+The system is implemented end-to-end. The table below is retained as historical record of the original build order (the order also matches the dependency graph between the per-component design docs). All 11 steps have shipped; see the route table in §9 for the current surface.
+
+| Step | Component | Shipped | Key Actions |
 |---|---|---|---|
-| 1 | Project scaffolding | 30 min | `go mod init`, chi router, Neon connection, schema migration, health endpoint, Makefile |
-| 2 | S2 client wrapper | 1 hr | Provision account, create basin, implement 5 operations, integration test |
-| 3 | Agent registry | 30 min | `POST /agents`, sqlc CRUD, agent auth middleware |
-| 4 | Conversation management | 1.5 hr | Create, list, invite, leave. Membership checks, system events to S2 |
-| 5 | Complete message send | 1 hr | `POST /messages`, batch S2 write (3 records atomic) |
-| 6 | SSE read stream | 2 hr | S2 read session → SSE, cursor management, connection registry |
-| 7 | Streaming write (NDJSON) | 1.5 hr | `POST /messages/stream`, scanner loop, abort on disconnect, recovery sweep |
-| 8 | Claude agent | 2 hr | Registration, SSE listeners, Claude API streaming, token forwarding |
-| 9 | Testing | 2 hr | Integration suite, concurrent writers, disconnect/reconnect |
-| 10 | Documentation | 1.5 hr | `DESIGN.md`, `FUTURE.md`, `CLIENT.md` |
-| 11 | Deployment | 1 hr | `go build`, `cloudflared tunnel --url`, verify public URL |
-
-**Total estimated: ~14.5 hours**
+| 1 | Project scaffolding | ✓ | `go mod init`, chi router, Neon connection, schema migration, health endpoint, Makefile |
+| 2 | S2 client wrapper | ✓ | Provision account, create basin, implement 5 operations, integration test |
+| 3 | Agent registry | ✓ | `POST /agents`, sqlc CRUD, agent auth middleware |
+| 4 | Conversation management | ✓ | Create, list, invite, leave, **single-fetch (`GET /conversations/{cid}`)**. Membership checks, system events to S2 |
+| 5 | Complete message send | ✓ | `POST /messages`, batch S2 write (3 records atomic) |
+| 6 | SSE read stream | ✓ | S2 read session → SSE, cursor management (client-confirmed advancement), connection registry |
+| 7 | Streaming write (NDJSON) | ✓ | `POST /messages/stream`, scanner loop, abort on disconnect, recovery sweep |
+| 8 | Resident Claude agent | ✓ | Registration, S2 listeners, Claude API streaming, token forwarding, **mid-conversation `seedHistory()`** |
+| 9 | Observer surface | ✓ | `/observer/*` read-only lane + bulk member fetch |
+| 10 | Client runtime | ✓ | `run_agent.py` embedded via `go:embed`, served at `/client/run_agent.py` |
+| 11 | Deployment | ✓ | `go build`, `ngrok http 8080`, systemd unit (`deploy/agentmail.service.example`) |
 
 ---
 
@@ -335,39 +385,50 @@ agentmail-take-home/
 ├── cmd/server/main.go              → server-lifecycle-plan.md
 ├── internal/
 │   ├── api/
-│   │   ├── router.go               → http-api-layer-plan.md
-│   │   ├── middleware.go            → http-api-layer-plan.md §2
+│   │   ├── router.go               → http-api-layer-plan.md (18 routes, 4 groups)
+│   │   ├── middleware.go           → http-api-layer-plan.md §2
 │   │   ├── errors.go               → http-api-layer-plan.md §1
-│   │   ├── helpers.go               → http-api-layer-plan.md §3
-│   │   ├── types.go                 → http-api-layer-plan.md §3
+│   │   ├── helpers.go              → http-api-layer-plan.md §3
+│   │   ├── types.go                → http-api-layer-plan.md §3
+│   │   ├── handlers.go             → handler struct + NewHandler
 │   │   ├── agents.go
-│   │   ├── conversations.go
+│   │   ├── conversations.go        (incl. GET /conversations/{cid})
 │   │   ├── messages.go
-│   │   ├── sse.go
+│   │   ├── streaming.go            → NDJSON write path
+│   │   ├── sse.go                  → SSE read path (phantom-advance fix)
+│   │   ├── ack.go                  → POST /ack (ack_seq + delivery_seq regression-guarded)
 │   │   ├── history.go
-│   │   └── health.go
+│   │   ├── observer.go             → /observer/* read-only lane
+│   │   ├── resident.go             → GET /agents/resident
+│   │   ├── health.go
+│   │   ├── conn_registry.go        → per-(agent,conv) SSE/streaming handles
+│   │   ├── client_asset.go         → GET /client/run_agent.py
+│   │   └── client/
+│   │       ├── embed.go            → go:embed RunAgentPy + Version
+│   │       ├── run_agent.py        → shared client runtime (see §10b)
+│   │       └── VERSION
 │   ├── store/
-│   │   ├── schema/schema.sql        → sql-metadata-plan.md §5
-│   │   ├── queries/*.sql            → sql-metadata-plan.md §12
-│   │   ├── db/                      (sqlc generated)
-│   │   ├── postgres.go              → sql-metadata-plan.md
-│   │   ├── agent_cache.go           → http-api-layer-plan.md §5
-│   │   ├── cursor_cache.go          → sql-metadata-plan.md §7
-│   │   ├── membership_cache.go      → sql-metadata-plan.md §8
-│   │   ├── conn_registry.go         → sql-metadata-plan.md §10
-│   │   ├── s2.go                    → s2-architecture-plan.md
-│   │   └── s2_test.go
+│   │   ├── schema/schema.sql       → sql-metadata-plan.md §5
+│   │   ├── queries/*.sql           → sql-metadata-plan.md §12
+│   │   ├── db/                     (sqlc generated)
+│   │   ├── interfaces.go           → store contracts (MetadataStore, S2Store)
+│   │   ├── postgres.go             → ListAllConversations, ListMembersForConversations
+│   │   ├── agent_cache.go          → http-api-layer-plan.md §5
+│   │   ├── cursor_cache.go         → sql-metadata-plan.md §7
+│   │   ├── membership_cache.go     → sql-metadata-plan.md §8
+│   │   ├── s2.go                   → s2-architecture-plan.md
+│   │   ├── names.go
+│   │   └── errors.go
 │   ├── model/
-│   │   ├── events.go                → event-model-plan.md
-│   │   └── types.go
+│   │   └── events.go               → event-model-plan.md (AssembleMessages, EnrichForSSE, payload parsers)
+│   ├── config/                     → environment-var loader (server-lifecycle-plan.md)
 │   └── agent/
-│       ├── agent.go                 → claude-agent-plan.md
-│       ├── listen.go                → claude-agent-plan.md §4
-│       ├── respond.go               → claude-agent-plan.md §5
-│       ├── state.go                 → claude-agent-plan.md §4
-│       ├── history.go               → claude-agent-plan.md §6
-│       ├── notifier.go              → claude-agent-plan.md §3
-│       └── discovery.go             → claude-agent-plan.md §3
+│       ├── agent.go                → claude-agent-plan.md (identity, registration, lifecycle)
+│       ├── listener.go             → claude-agent-plan.md §4 (S2 ReadSession loop, onEvent dispatch)
+│       ├── history.go              → claude-agent-plan.md §6 (seedHistory, 500-event window)
+│       ├── respond.go              → claude-agent-plan.md §5 (Claude API stream → S2 AppendSession)
+│       └── discovery.go            → claude-agent-plan.md §3
+├── deploy/                         → deployment-plan.md: ngrok.md, agentmail.service.example
 ├── tests/
 │   ├── integration_test.go
 │   ├── streaming_test.go
@@ -410,6 +471,8 @@ agentmail-take-home/
 | **NDJSON POST for writes** | Proxy buffers the body | High — complete message POST works universally as fallback. |
 | **One stream per conversation** | Hot conversation with many writers | Low — S2 handles 100 MiBps per stream. LLM rates won't come close. |
 | **Event-based record model** | Complexity in demultiplexing | Medium — could simplify to complete-message-only, but lose streaming. |
+| **Unauth observer lane (`/observer/*`)** | Exposes all conversations to anyone who can reach the host | High — gate behind a reverse-proxy auth layer (basic auth, OAuth sidecar); zero code changes. |
+| **Client-confirmed cursor advancement** | If `Last-Event-ID` is stripped by an intermediary, resume replays more than necessary | High — `POST /ack` still advances; fallback is a single extra ack per reconnect. |
 
 ---
 
@@ -417,26 +480,40 @@ agentmail-take-home/
 
 | Document | Scope | Lines |
 |---|---|---|
-| [`spec.md`](spec.md) | Original exhaustive design (transport analysis, assumption interrogation, detailed component breakdowns) | ~1600 |
-| [`s2-architecture-plan.md`](s2-architecture-plan.md) | S2 basin config, append strategies, read sessions, error handling, recovery, scaling | ~950 |
-| [`sql-metadata-plan.md`](sql-metadata-plan.md) | PostgreSQL schema, pgx/sqlc, cursor two-tier, caching, locking, connection registry | ~1020 |
-| [`event-model-plan.md`](event-model-plan.md) | Go type system for events — constants, payloads, constructors, serializers, SSE enrichment | ~1440 |
-| [`http-api-layer-plan.md`](http-api-layer-plan.md) | Error format, middleware chain, request/response contracts, timeouts, agent validation | ~1770 |
-| [`claude-agent-plan.md`](claude-agent-plan.md) | Resident agent identity, discovery, Claude API integration, concurrency, error handling | ~1670 |
+| [`spec.md`](spec.md) | Original exhaustive design (transport analysis, assumption interrogation, detailed component breakdowns) | ~1900 |
+| [`s2-architecture-plan.md`](s2-architecture-plan.md) | S2 basin config, append strategies, read sessions, error handling, recovery, scaling | ~1030 |
+| [`sql-metadata-plan.md`](sql-metadata-plan.md) | PostgreSQL schema, pgx/sqlc, cursor two-tier, caching, locking, connection registry | ~1270 |
+| [`event-model-plan.md`](event-model-plan.md) | Go type system for events — constants, payloads, constructors, serializers, SSE enrichment | ~1450 |
+| [`http-api-layer-plan.md`](http-api-layer-plan.md) | Error format, middleware chain, request/response contracts, timeouts, agent validation | ~2300 |
+| [`claude-agent-plan.md`](claude-agent-plan.md) | Resident agent identity, discovery, Claude API integration, mid-conversation seeding, concurrency, error handling | ~1720 |
 | [`server-lifecycle-plan.md`](server-lifecycle-plan.md) | `main.go` startup/shutdown, configuration, health checks | ~1550 |
-| [`deployment-plan.md`](deployment-plan.md) | `go build`, `cloudflared tunnel`, secrets via process env, health check wiring | ~1160 |
-| [`CLIENT.md`](CLIENT.md) | Client-facing contract (self-contained for naïve agents) + §2 Claude Code persona pattern with embedded reference scripts | ~1440 |
+| [`deployment-plan.md`](deployment-plan.md) | `go build`, `ngrok http`, secrets via process env, health check wiring | ~1160 |
+| [`CLIENT.md`](CLIENT.md) | Client-facing contract (self-contained for naïve agents) + Claude Code persona runtime | ~1270 |
+| [`CLAUDE.md`](CLAUDE.md) | Design-collaboration rules (surgical spec edits, source-of-truth ordering) | ~90 |
 | [`README.md`](README.md) | Immutable project spec from AgentMail (source of truth for requirements) | ~100 |
 
 ---
 
 ## Verification Plan
 
+**Core protocol**
 1. **Local smoke test:** Register two agents, create conversation, send messages, verify SSE delivery.
 2. **Streaming test:** Agent A streams write, verify agent B's SSE receives chunks in real-time.
 3. **Concurrent test:** Two agents stream simultaneously, verify both messages reconstructable from interleaved events.
-4. **Reconnect test:** Disconnect B's SSE, send messages from A, reconnect B, verify cursor-based catch-up.
-5. **Leave test:** Agent B leaves, verify SSE closes, verify B can't read/write.
-6. **Claude agent test:** Invite Claude agent, send message, verify streaming response.
-7. **Integration suite:** `go test ./tests/... -v` — all scenarios pass.
-8. **Deployed test:** Hit the live Cloudflare Tunnel URL (quick or named), register agent, converse with Claude agent.
+4. **Leave test:** Agent B leaves, verify SSE closes, verify B can't read/write.
+5. **Resident agent test:** Invite resident, send message, verify streaming response.
+
+**Cursor + reconnect semantics**
+6. **Phantom-advance regression:** Disconnect B's SSE before any `Last-Event-ID` or ack, reconnect with `Last-Event-ID: N`, verify server resumes at `N+1` and no events are skipped. (Covered by `internal/api/sse_cursor_test.go`.)
+7. **Ack cursor monotonicity:** Out-of-order `POST /ack` calls — verify `ack_seq = GREATEST(ack_seq, N)` holds and `GET /agents/me/unread` is regression-proof.
+
+**Mid-conversation + resident**
+8. **Mid-conversation join:** Two peers chat for a few messages, then invite the resident. Verify `seedHistory()` fires on the first foreign `message_end`, the resident's context contains the prior messages minus self-authored and still-in-flight messages, and no event is double-counted (`lastSeededSeq` high-water mark).
+
+**Observer surface (§13)**
+9. **Observer list + bulk members:** `GET /observer/conversations` returns all conversations with members populated in one query (inspect `ListMembersForConversations` SQL trace — one round trip regardless of conversation count).
+10. **Observer SSE:** `GET /observer/conversations/{cid}/stream` tails without persisting a delivery cursor; no `members` row is ever written for the observer.
+
+**Deploy**
+11. **Deployed test:** Hit the live ngrok URL, `curl /client/run_agent.py` → confirm `X-Runtime-Version` header, then register an agent and converse with the resident.
+12. **Integration suite:** `go test ./... -v` — all scenarios pass.
