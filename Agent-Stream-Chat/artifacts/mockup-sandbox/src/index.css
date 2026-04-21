@@ -1,0 +1,199 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * Discord-inspired palette shared with agentmail-ui. Vertical menus sit
+ * underneath the feed (sidebars are the deepest surface).
+ *   surface-0 #0A0A0C — app rail / top bar
+ *   surface-1 #121214 — vertical menu columns (channel + member sidebars)
+ *   surface-2 #1A1A1E — main feed / channel body
+ *   surface-3 #232327 — inputs, composer, elevated rows
+ *   surface-hover #2A2A2F — hover + selected pill
+ * Brand accents stay Discord canonical: blurple, green, yellow, red, fuchsia.
+ */
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+  --color-chart-1: hsl(var(--chart-1));
+  --color-chart-2: hsl(var(--chart-2));
+  --color-chart-3: hsl(var(--chart-3));
+  --color-chart-4: hsl(var(--chart-4));
+  --color-chart-5: hsl(var(--chart-5));
+  --color-sidebar: hsl(var(--sidebar));
+  --color-sidebar-foreground: hsl(var(--sidebar-foreground));
+  --color-sidebar-primary: hsl(var(--sidebar-primary));
+  --color-sidebar-primary-foreground: hsl(var(--sidebar-primary-foreground));
+  --color-sidebar-accent: hsl(var(--sidebar-accent));
+  --color-sidebar-accent-foreground: hsl(var(--sidebar-accent-foreground));
+  --color-sidebar-border: hsl(var(--sidebar-border));
+  --color-sidebar-ring: hsl(var(--sidebar-ring));
+
+  --color-surface-0: hsl(var(--surface-0));
+  --color-surface-1: hsl(var(--surface-1));
+  --color-surface-2: hsl(var(--surface-2));
+  --color-surface-3: hsl(var(--surface-3));
+  --color-surface-hover: hsl(var(--surface-hover));
+}
+
+/* LIGHT — Discord "Light" theme adjacent. */
+:root {
+  --button-outline: rgba(0,0,0, .10);
+  --badge-outline: rgba(0,0,0, .05);
+  --opaque-button-border-intensity: -8;
+
+  --elevate-1: rgba(0,0,0, .03);
+  --elevate-2: rgba(0,0,0, .08);
+
+  --surface-0: 220 13% 91%;   /* #E3E5E8 */
+  --surface-1: 210 11% 96%;   /* #F2F3F5 */
+  --surface-2: 0 0% 100%;     /* #FFFFFF */
+  --surface-3: 210 11% 96%;
+  --surface-hover: 220 13% 88%;
+
+  --background: 0 0% 100%;
+  --foreground: 214 13% 20%;   /* #2E3338 */
+  --card: 0 0% 100%;
+  --card-foreground: 214 13% 20%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 214 13% 20%;
+  --primary: 235 86% 65%;      /* Discord blurple stays constant */
+  --primary-foreground: 210 9% 95%;
+  --secondary: 210 11% 96%;
+  --secondary-foreground: 214 13% 20%;
+  --muted: 210 11% 96%;
+  --muted-foreground: 220 6% 46%; /* #6D6F78 */
+  --accent: 210 11% 96%;
+  --accent-foreground: 214 13% 20%;
+  --destructive: 359 87% 60%;
+  --destructive-foreground: 210 9% 95%;
+  --border: 220 7% 85%;        /* #D9DADC */
+  --input: 220 7% 85%;
+  --ring: 235 86% 65%;
+  --chart-1: 235 86% 65%;      /* blurple */
+  --chart-2: 139 65% 39%;      /* green */
+  --chart-3: 40 86% 57%;       /* yellow */
+  --chart-4: 328 81% 60%;      /* fuchsia */
+  --chart-5: 359 87% 60%;      /* red */
+  --sidebar: 210 11% 96%;
+  --sidebar-foreground: 214 13% 20%;
+  --sidebar-primary: 235 86% 65%;
+  --sidebar-primary-foreground: 210 9% 95%;
+  --sidebar-accent: 220 13% 91%;
+  --sidebar-accent-foreground: 214 13% 20%;
+  --sidebar-border: 220 7% 85%;
+  --sidebar-ring: 235 86% 65%;
+
+  --font-sans: 'Inter', sans-serif;
+  --font-serif: Georgia, serif;
+  --font-mono: 'JetBrains Mono', Menlo, monospace;
+  --radius: .5rem;
+  --spacing: 0.25rem;
+}
+
+/* DARK — Discord dark theme (primary). */
+.dark {
+  --button-outline: rgba(255,255,255, .10);
+  --badge-outline: rgba(255,255,255, .05);
+  --opaque-button-border-intensity: 9;
+
+  --elevate-1: rgba(255,255,255, .04);
+  --elevate-2: rgba(255,255,255, .09);
+
+  --surface-0: 240 9% 4%;     /* #0A0A0C */
+  --surface-1: 240 5% 7%;     /* #121214 sidebars */
+  --surface-2: 240 7% 11%;    /* #1A1A1E feed */
+  --surface-3: 240 5% 15%;    /* #232327 input */
+  --surface-hover: 245 6% 17%; /* #2A2A2F */
+
+  --background: 240 7% 11%;    /* feed */
+  --foreground: 214 8% 87%;
+  --card: 240 5% 7%;
+  --card-foreground: 214 8% 87%;
+  --popover: 240 5% 7%;
+  --popover-foreground: 214 8% 87%;
+  --primary: 235 86% 65%;      /* blurple */
+  --primary-foreground: 210 9% 95%;
+  --secondary: 240 5% 15%;
+  --secondary-foreground: 214 8% 87%;
+  --muted: 240 5% 7%;
+  --muted-foreground: 214 8% 61%;
+  --accent: 245 6% 17%;
+  --accent-foreground: 210 9% 95%;
+  --destructive: 359 87% 60%;
+  --destructive-foreground: 210 9% 95%;
+  --border: 240 6% 13%;
+  --input: 240 5% 15%;
+  --ring: 235 86% 65%;
+  --chart-1: 235 86% 65%;      /* blurple */
+  --chart-2: 139 65% 39%;      /* online green */
+  --chart-3: 40 86% 57%;       /* idle yellow */
+  --chart-4: 328 81% 60%;      /* fuchsia */
+  --chart-5: 359 87% 60%;      /* dnd red */
+  --sidebar: 240 5% 7%;
+  --sidebar-foreground: 214 8% 87%;
+  --sidebar-primary: 235 86% 65%;
+  --sidebar-primary-foreground: 210 9% 95%;
+  --sidebar-accent: 245 6% 17%;
+  --sidebar-accent-foreground: 210 9% 95%;
+  --sidebar-border: 240 6% 13%;
+  --sidebar-ring: 235 86% 65%;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply font-sans antialiased bg-background text-foreground;
+  }
+
+  ::selection {
+    background: hsl(var(--primary) / 0.35);
+    color: hsl(var(--accent-foreground));
+  }
+}
+
+@layer utilities {
+  /* Hide ugly search cancel button in Chrome */
+  input[type="search"]::-webkit-search-cancel-button {
+    @apply hidden;
+  }
+
+  /* Placeholder styling for contentEditable div */
+  [contenteditable][data-placeholder]:empty::before {
+    content: attr(data-placeholder);
+    color: hsl(var(--muted-foreground));
+    pointer-events: none;
+  }
+
+  .bg-surface-0 { background-color: hsl(var(--surface-0)); }
+  .bg-surface-1 { background-color: hsl(var(--surface-1)); }
+  .bg-surface-2 { background-color: hsl(var(--surface-2)); }
+  .bg-surface-3 { background-color: hsl(var(--surface-3)); }
+  .bg-surface-hover { background-color: hsl(var(--surface-hover)); }
+  .border-surface-1 { border-color: hsl(var(--surface-1)); }
+}
