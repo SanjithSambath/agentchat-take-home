@@ -1365,7 +1365,7 @@ The `ack_seq` column exists so the client has an authoritative cursor that refle
 
 **Decision:** AgentMail supports a **two-pattern agent topology**. The §1.8 resident is the server-bundled default responder; a second, client-side pattern — the Claude Code persona agent — is first-class, documented, and tested. Both produce indistinguishable events on the S2 stream; peers cannot tell them apart.
 
-**Motivation.** Early naive-agent test runs (`docs/test1.md`, `docs/test2.md`) revealed that a Claude Code session told "you are persona X" defaults to three failure modes: block `POST /messages` instead of the streaming endpoint; replay-streaming (decode the whole reply, then chunk it into NDJSON with `time.sleep`); and polling SSE with `sleep && tail` instead of reacting to events. All three satisfy the letter of the spec while violating the spirit of "stream tokens as they are generated." The fix is a structural one, not a prompt-engineering one: split the Claude Code session into an **orchestrator** (decides when to speak, never decodes persona text) and a **voice** (`speak.py`, a per-invocation Python helper that opens a fresh `anthropic.messages.stream(...)` and pipes deltas straight into the NDJSON body). Inbound events come from `listen.py`, backgrounded under Claude Code's Monitor tool so the loop is event-driven, not polled.
+**Motivation.** Early naive-agent test runs revealed that a Claude Code session told "you are persona X" defaults to three failure modes: block `POST /messages` instead of the streaming endpoint; replay-streaming (decode the whole reply, then chunk it into NDJSON with `time.sleep`); and polling SSE with `sleep && tail` instead of reacting to events. All three satisfy the letter of the spec while violating the spirit of "stream tokens as they are generated." The fix is a structural one, not a prompt-engineering one: a single long-running Python daemon (`run_agent.py`, served from the Go server at `GET /client/run_agent.py`) owns the SSE tail, opens a fresh `anthropic.messages.stream(...)` per turn with a bound `leave_conversation` tool, and pipes text deltas straight into the NDJSON body. Claude Code's role is reduced to **orchestrator**: it curls the runtime once, runs one command with `--target` + `--brief`, and blocks until the daemon exits (via the tool call, a peer-left cascade, SIGINT, or a safety cap). Claude Code never decodes persona text in its own turn.
 
 **Transport reuse — no new server surface.** This pattern adds **zero** new endpoints, event types, or error codes. It is a disciplined client of the existing HTTP/SSE surface: `POST /agents`, `POST /conversations`, `POST /conversations/{cid}/invite`, `POST /conversations/{cid}/messages/stream` (NDJSON write), `GET /conversations/{cid}/stream` (SSE read), `GET /conversations/{cid}/messages` (history seed for each speak turn). Idempotency, dedup, recovery, and `Last-Event-ID` resume all work unchanged.
 
@@ -1374,17 +1374,18 @@ The `ack_seq` column exists so the client has an authoritative cursor that refle
 | | **§1.8 resident** | **§1.8.1 Claude Code persona** |
 |---|---|---|
 | Process | in-server goroutine | external Claude Code session |
-| Anthropic call site | `internal/agent/respond.go` → S2 `AppendSession` direct | `speak.py` → `POST /.../messages/stream` (NDJSON) |
-| Inbound | direct S2 `ReadSession` | SSE via `GET /.../stream` |
+| Anthropic call site | `internal/agent/respond.go` → S2 `AppendSession` direct | `run_agent.py` daemon → `POST /.../messages/stream` (NDJSON) |
+| Inbound | direct S2 `ReadSession` | SSE via `GET /.../stream`, tailed in-process by the daemon |
+| Termination | HTTP `POST /leave` by the operator only (resident never leaves voluntarily) | `leave_conversation` tool call by the voice stream, plus backstops (peer-left cascade, signal, safety cap) |
 | Availability | always-on, bundled with every deployment | started by an operator on demand |
 | When to prefer | default responder, fixed voice | domain-specific voices, demos, adversarial testing |
 
-**Self-contained client doc.** Per `README.md` L82 + L96, `CLIENT.md` must be the *only* file a naive Claude Code agent needs. `§2 Canonical Agent Pattern` embeds the full `speak.py` and `listen.py` source plus the operator workflow inline — no external file dependencies. The three inputs the human operator owes the agent are: peer agent ID (or "resident"), topic/opener, stop condition.
+**Self-contained client doc.** Per `README.md` L82 + L96, `CLIENT.md` must be the *only* file a naive Claude Code agent needs. `§0 Claude Code: one-command bootstrap` gives the exact shell block; `§7 The run_agent.py runtime` is the behavioral contract for the daemon. The Python source itself is served from the Go server at `GET /client/run_agent.py` (embedded via `go:embed`), so the markdown is small and the runtime version is pinned to the deployed server. The three inputs the human operator owes the agent are: a name (`--name`), a target (`--target resident|peer:<id>|join:<cid>`), and the ask (`--brief`).
 
 **Out of scope for this design decision:**
 - Server enforcement of the orchestrator/voice split. It is a client-side discipline, reinforced by documentation and anti-pattern enumeration (`CLIENT.md §9`).
-- Per-token tool calls from Claude Code. Incompatible with Anthropic's decode model and explicitly discouraged by founder guidance; the fresh-stream-per-message approach is the endorsed workaround.
-- TypeScript parity for `speak.py` / `listen.py`. `CLIENT.md §6.4` and `§7.6` retain TypeScript equivalents of the kernels; a full TS operator variant is a future enhancement.
+- Per-token tool calls from Claude Code. Incompatible with Anthropic's decode model and explicitly discouraged by founder guidance; the fresh-stream-per-message approach is the endorsed workaround. A single `leave_conversation` tool evaluated once per message is not in this class — it is a boundary-of-message decision, not a hot-path call.
+- TypeScript parity for the `run_agent.py` daemon. `CLIENT.md §8.2` and `§8.4` retain TypeScript equivalents of the wire kernels; a full TS operator variant is a future enhancement.
 
 ---
 

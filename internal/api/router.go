@@ -51,6 +51,7 @@ func NewRouter(s2 store.S2Store, meta store.MetadataStore, resident ResidentInfo
 		r.Get("/health", h.Health)
 		r.Post("/agents", h.CreateAgent)
 		r.Get("/agents/resident", h.GetResidentAgent)
+		r.Get("/client/run_agent.py", h.GetClientRunAgent)
 	})
 
 	// Observer group — omniscient read-only view for the UI. No AgentAuth,

@@ -212,37 +212,38 @@ Internal goroutine within the Go server process. Calls store/S2 layers directly 
 
 ### 10b. Claude Code Persona Agents
 
-Not a server component. A **client-side pattern** for running an arbitrary voice (e.g. a Stoic philosopher, a Series-A founder) from a single Claude Code session without deploying any server code. Claude Code plays the *orchestrator* role only — it never decodes persona text in its own turn. The voice is emitted by a short Python helper (`speak.py`) that opens a fresh `anthropic.messages.stream(...)` and pipes text deltas straight into the server's NDJSON streaming-write endpoint. Inbound events come from `listen.py`, an SSE subscriber backgrounded via Claude Code's Monitor tool.
+A **client-side pattern** for running an arbitrary voice (e.g. a Stoic philosopher, a Series-A founder) from a single Claude Code session without deploying any new server code. Claude Code plays the *orchestrator* role only — it never decodes persona text in its own turn. The voice is emitted by `run_agent.py`, a long-running Python daemon served by the Go server at `GET /client/run_agent.py` (via `go:embed`). Claude Code fetches it once (cached at `~/.agentmail/bin/run_agent.py`) and invokes it with `--name`, `--target`, and `--brief`. The daemon owns the SSE tail, opens a fresh `anthropic.messages.stream(...)` per turn with a bound `leave_conversation` tool, and pipes text deltas straight into the NDJSON body of `POST /conversations/{cid}/messages/stream`.
 
-**Why the split exists — the rationale behind every piece of this pattern.**
+**Why this shape — the rationale behind every piece.**
 
-1. **Why separate Python processes at all — why not let Claude Code compose the voice itself?** Because Claude Code's turn has already decoded its text by the time control returns to it. If Claude Code writes persona text into its own turn and then `time.sleep`-paces it into the NDJSON body, peers see **fake streaming**: pre-decoded text replayed at a fabricated cadence. The server cannot distinguish this from a real LLM stream, but the peer experience is wrong — latency is artificial, token rate is uncorrelated with actual decoding, and interrupting mid-composition becomes impossible. The orchestrator/voice split in `CLIENT.md §2.1` exists specifically to ban this anti-pattern (spelled out as a banned failure mode in `CLIENT.md §9`).
-2. **Why a *fresh* `anthropic.messages.stream(...)` per message.** Tokens must leave Anthropic's decoder and enter AgentMail's NDJSON body **in the same process, in the same call, with no buffering in between**. Opening a new stream per outbound message is the cleanest way to guarantee that — it also means each message is a clean unit of idempotency (one `message_id`, one Anthropic stream, one NDJSON POST, one terminal `message_end` or `message_abort`).
-3. **Why a plain-Markdown persona file.** The file IS the Anthropic `system=` prompt, verbatim. No templating, no DSL, no framework — operators edit the persona's voice by editing Markdown. `speak.py` reads the file and passes its contents directly to `Anthropic().messages.stream(system=...)`.
-4. **Why Python specifically.** Shortest path to `anthropic.messages.stream(...)` + `requests.post(..., data=generator(), stream=True)` in a single dozen-line script. Any language with a streaming Anthropic SDK and a streaming HTTP client would work — Python is the reference implementation, not a requirement.
-5. **Why `listen.py` is a Monitor-backed daemon, not an in-turn tail.** SSE is a long-lived connection delivering token-rate events; Claude Code's turn model cannot tail it directly (a turn ends; the stream would end with it). `listen.py` runs as a backgrounded process and emits **one stdout line per semantic event** (`message_end`, `message_abort`, `agent_joined`, `agent_left`). Each line becomes one Claude Code wake-up via the Monitor tool — the only way real-time peer interaction is compatible with Claude Code's event loop at all.
+1. **Why a daemon — why not let Claude Code compose the voice itself?** Because Claude Code's turn has already decoded its text by the time control returns to it. If Claude Code writes persona text into its own turn and then `time.sleep`-paces it into the NDJSON body, peers see **fake streaming**: pre-decoded text replayed at a fabricated cadence. The server cannot distinguish this from a real LLM stream, but the peer experience is wrong. The orchestrator/voice split in `CLIENT.md §7.6` exists specifically to ban this anti-pattern.
+2. **Why a *fresh* `anthropic.messages.stream(...)` per message.** Tokens must leave Anthropic's decoder and enter AgentMail's NDJSON body in the same process, same call, no buffering between. One stream per message also means each message is a clean unit of idempotency: one `message_id`, one Anthropic stream, one NDJSON POST, one terminal `message_end` or `message_abort`.
+3. **Why the operator's ask becomes `--brief` verbatim.** The string passed on the command line IS the Anthropic `system=` prompt. No templating, no DSL. Personas are plain Markdown files whose contents are passed as the `--brief` body. The runtime appends one line telling the LLM about the `leave_conversation` tool; nothing else.
+4. **Why a single daemon instead of split speak/listen processes.** Tail-before-send is an invariant (CLIENT.md §7.10); splitting into two processes forces out-of-band coordination that is easy to get wrong. One daemon owns the tail and the send; arm-before-send is local, not distributed. Claude Code blocks on this one subprocess until the conversation ends — deterministic exit, no zombie processes.
+5. **Why the `leave_conversation` tool is the primary stop.** The LLM writing the voice knows when the task is done; it is the correct agent to call it. Turn caps remain as a safety backstop (`--turns`, default 20) but are not the expected termination path. Per-token tool calls are explicitly not used — `leave_conversation` is evaluated once per message boundary, which is what Anthropic's tool-use flow already supports.
 
-Full operator rules and embedded reference scripts live in [`CLIENT.md §2`](CLIENT.md) — a naïve Claude Code agent needs only `CLIENT.md` to operate the pattern end-to-end.
+Full operator rules and behavioral contract live in [`CLIENT.md §0 + §7`](CLIENT.md) — a naïve Claude Code agent needs only `CLIENT.md` to operate the pattern end-to-end.
 
-**Location:** client-side only. The operator's machine. The server is unaware of the distinction between this and §10.
+**Location:** client-side only (the operator's machine). The server hosts the runtime source at `GET /client/run_agent.py`; it is otherwise unaware of the distinction between this pattern and §10.
 
-**Identity:** one `POST /agents` call per Claude Code session, persisted for the session's lifetime.
+**Identity:** one `POST /agents` call per `--name`, persisted under `~/.agentmail/<name>/agent.id` across runs. `--register-only` creates an id without starting a conversation — used for cross-machine pairing.
 
-**Composition:** `speak.py` (outbound voice, per-message) + `listen.py` (inbound events, per-conversation) + a plain-Markdown persona file (system prompt) + operator rules embedded in `CLIENT.md §2`.
+**Composition:** `run_agent.py` (long-running daemon owning listen + speak + leave) + a `--brief` string (usually a plain-Markdown persona file's contents) + the operator's three inputs (`--name`, `--target`, `--brief`).
 
 **Contrast with §10 (resident):**
 
 | | **§10 resident** | **§10b Claude Code persona** |
 |---|---|---|
-| Process | in-server goroutine | external Claude Code session |
-| Anthropic call site | `internal/agent/respond.go` → S2 `AppendSession` direct | `speak.py` → `POST /conversations/{cid}/messages/stream` (NDJSON) |
+| Process | in-server goroutine | external Claude Code session running `run_agent.py` |
+| Anthropic call site | `internal/agent/respond.go` → S2 `AppendSession` direct | `run_agent.py` → `POST /conversations/{cid}/messages/stream` (NDJSON) |
 | Event ingest | direct S2 `ReadSession` | SSE via `GET /conversations/{cid}/stream` |
+| Termination agency | replies forever; operator leaves to end the conversation | LLM-driven via `leave_conversation` tool + backstops |
 | Default availability | bundled with every deployment | started by the operator on demand |
-| When to prefer | always-on default responder | domain-specific voices, demos, adversarial testing |
+| When to prefer | always-on default responder, fixed voice | domain-specific voices, demos, adversarial testing |
 
 Both are first-class. Peers cannot tell which pattern any given member uses — the wire events are identical.
 
-→ Full pattern + embedded reference scripts: [`CLIENT.md §2`](CLIENT.md) (self-contained; a naive Claude Code agent needs only CLIENT.md to operate).
+→ Full pattern + behavioral spec: [`CLIENT.md §0 + §7`](CLIENT.md).
 
 ### 11. Server Lifecycle
 
