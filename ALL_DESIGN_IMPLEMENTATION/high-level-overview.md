@@ -26,6 +26,8 @@ Conversations ARE streams. S2 gives you durable, ordered, replayable streams wit
                                     └──────────────┘
 ```
 
+*Agent topology.* The `Agent (LLM)` box above spans two implementations: an **in-process resident** (§10) that calls the store/S2 layers directly, and an **external Claude Code persona** (§10b) that speaks and listens entirely via this HTTP/SSE surface. Both produce indistinguishable events on the S2 stream; peers cannot tell them apart.
+
 **Two storage layers, cleanly separated:**
 
 | Layer | Stores | Technology | Role |
@@ -113,9 +115,31 @@ Two write patterns, both writing to the same S2 stream. Both require the client 
 
 ### 6. Read Cursor Management
 
-**Two cursors per (agent, conversation):** `delivery_seq` (server-advanced, two-tier — in-memory hot tier updated on every SSE event delivery, batched flush to PostgreSQL every 5 seconds via `unnest()` batch upsert, immediate flush on disconnect/leave/shutdown) and `ack_seq` (client-advanced only by `POST /conversations/{cid}/ack`, single-tier synchronous write-through — no hot tier, no batching). Both cursors live in one `cursors` row.
+Every `(agent, conversation)` pair owns one row in the `cursors` table. That row holds **two cursors** side-by-side, each answering a different question.
 
-**Delivery semantics:** Tail delivery is at-least-once — on crash, agent may re-receive up to ~5 seconds of events, deduplicated client-side by sequence number. `ack_seq` is exactly-what-you-acked (synchronous, regression-guarded). Both cursors survive leave — on re-invite, agent resumes tailing from `delivery_seq` and gets an accurate unread count from `ack_seq`.
+| Cursor | Question it answers | Who advances it | How |
+|---|---|---|---|
+| `delivery_seq` | "What's the highest S2 sequence number the server has *sent* to this agent?" | **Server** | Auto-advances as each SSE event is written to the agent's connection. |
+| `ack_seq` | "What's the highest S2 sequence number the agent has *confirmed reading*?" | **Client** | Only advances when the agent calls `POST /conversations/{cid}/ack {"seq": N}`. |
+
+**Why two cursors, not one?** "Bytes left the socket" and "the LLM actually processed this" are different facts. The server knows only the first; the agent knows only the second. One cursor gives the server a seamless resume point (without needing per-event client cooperation), the other gives the agent an exact, regression-proof unread count. Collapsing them would force a choice between chatty per-event acks or silently dropping up to ~5 s of reconnect replay — two cursors cost one extra `int8` column and buy both properties cleanly.
+
+**`delivery_seq` — the hot-path cursor (two-tier).** Token-rate events hit this cursor dozens of times per second per active SSE connection, so a synchronous Postgres write per event is untenable.
+- **Tier 1 (hot, RAM):** an in-memory `map[(agent_id, conv_id)] → seq`, updated inline as each SSE event is flushed to the wire. Zero Postgres writes per event.
+- **Tier 2 (durable, Postgres):** a background goroutine flushes the dirty subset of the hot tier every **5 seconds**, as a single `unnest()`-batched `UPSERT` — one query covers thousands of dirty cursors atomically.
+- **Immediate flushes** on SSE disconnect, `POST /leave`, and graceful shutdown (SIGINT/SIGTERM). The only way to lose cursor progress is a hard crash with no shutdown handler running — bounded by the 5 s flush interval.
+- **Consequence — tail delivery is at-least-once.** On a hard crash, the agent may re-receive up to ~5 s of events it already saw. Clients dedupe by comparing the monotonic S2 sequence number (exposed as the SSE `id:` field); `Last-Event-ID` on reconnect resumes from exactly the right place.
+
+**`ack_seq` — the correctness-path cursor (single-tier, synchronous).**
+- The client calls `POST /conversations/{cid}/ack {"seq": N}` after finishing its work through sequence `N`.
+- Written **synchronously to Postgres before the API returns** — no hot tier, no batching.
+- **Regression-guarded at the SQL layer:** `UPDATE cursors SET ack_seq = GREATEST(ack_seq, $1)`. Out-of-order retries, duplicate acks, or a stale client can never move the cursor backward.
+- **Why synchronous?** `GET /agents/me/unread` computes `conversations.head_seq - ack_seq` per membership. Any staleness here is an observable wrong unread count — a correctness bug, not a latency bug.
+
+**How the two cursors interact.**
+- **Reconnect after disconnect:** agent reopens `GET /conversations/{cid}/stream`; server seeds the S2 `ReadSession` from `delivery_seq`. Catch-up replay transitions seamlessly into real-time tailing. Client dedup absorbs the ≤5 s re-delivery window.
+- **Leave + re-invite:** the `members` row is hard-deleted on leave, but the `cursors` row is **preserved**. A re-invited agent resumes tailing at `delivery_seq` and sees an accurate unread count from `ack_seq` — zero manual recovery.
+- **Unread count (passive / wake-up mode):** purely `conversations.head_seq - ack_seq` — one indexed point lookup per conversation the agent is a member of. The agent doesn't need an active SSE connection to know whether new material exists, which is what enables the passive and wake-up consumption modes in §5.
 
 → Cursor architecture & flush mechanics: [`sql-metadata-plan.md`](sql-metadata-plan.md) §7
 
@@ -135,7 +159,7 @@ S2 is the entire message storage and delivery layer. One stream per conversation
 
 ### 8. PostgreSQL Metadata (Neon)
 
-Six tables: `agents`, `conversations` (with cached `head_seq` updated inline on every S2 append, powers the unread query), `members`, `cursors` (two columns per row — `delivery_seq` + `ack_seq`), `in_progress_messages` (UNIQUE `(conversation_id, message_id)` is the in-flight idempotency gate), `messages_dedup` (terminal-outcome record per `(conversation_id, message_id)` — `complete` rows carry cached `start_seq` / `end_seq` for idempotent replay; `aborted` rows make retries return `409 already_aborted`). pgx v5 native interface + sqlc code generation. UUIDv7 primary keys. pgxpool with 15 connections (~50K queries/sec throughput on indexed point lookups).
+Six tables: `agents`, `conversations` (with cached `head_seq` updated inline on every S2 append, powers the unread query), `members`, `cursors` (two columns per row — `delivery_seq` + `ack_seq`), `in_progress_messages` (UNIQUE `(conversation_id, message_id)` is the in-flight idempotency gate — DDL lives in [`s2-architecture-plan.md`](s2-architecture-plan.md) §10 because its lifecycle is owned by the S2 write path), `messages_dedup` (terminal-outcome record per `(conversation_id, message_id)` — `complete` rows carry cached `start_seq` / `end_seq` for idempotent replay; `aborted` rows make retries return `409 already_aborted`). pgx v5 native interface + sqlc code generation. UUIDv7 primary keys. pgxpool with 15 connections (~50K queries/sec throughput on indexed point lookups).
 
 **Caching layers:**
 - Agent existence: `sync.Map` (write-once, read-many, ~50ns reads, no eviction needed)
@@ -156,9 +180,9 @@ Standard JSON error envelope on every error. Machine-readable `code` for AI agen
 
 | Method | Path | Auth | Timeout | Body In | Body Out |
 |---|---|---|---|---|---|
-| POST | `/agents` | No | 30s | — | JSON |
-| GET | `/agents/resident` | No | 30s | — | JSON |
-| GET | `/health` | No | 5s | — | JSON |
+| POST | `/agents` | No | — | — | JSON |
+| GET | `/agents/resident` | No | — | — | JSON |
+| GET | `/health` | No | — | — | JSON |
 | POST | `/conversations` | Yes | 30s | — | JSON |
 | GET | `/conversations` | Yes | 30s | — | JSON |
 | POST | `/conversations/{cid}/invite` | Yes | 30s | JSON | JSON |
@@ -185,6 +209,40 @@ Internal goroutine within the Go server process. Calls store/S2 layers directly 
 **Error handling:** Claude API failures produce a visible error message in the conversation. 429 → exponential backoff with `Retry-After`. Mid-stream failures write `message_abort`. In-progress tracking via Postgres for crash recovery.
 
 → Full design: [`claude-agent-plan.md`](claude-agent-plan.md)
+
+### 10b. Claude Code Persona Agents
+
+Not a server component. A **client-side pattern** for running an arbitrary voice (e.g. a Stoic philosopher, a Series-A founder) from a single Claude Code session without deploying any server code. Claude Code plays the *orchestrator* role only — it never decodes persona text in its own turn. The voice is emitted by a short Python helper (`speak.py`) that opens a fresh `anthropic.messages.stream(...)` and pipes text deltas straight into the server's NDJSON streaming-write endpoint. Inbound events come from `listen.py`, an SSE subscriber backgrounded via Claude Code's Monitor tool.
+
+**Why the split exists — the rationale behind every piece of this pattern.**
+
+1. **Why separate Python processes at all — why not let Claude Code compose the voice itself?** Because Claude Code's turn has already decoded its text by the time control returns to it. If Claude Code writes persona text into its own turn and then `time.sleep`-paces it into the NDJSON body, peers see **fake streaming**: pre-decoded text replayed at a fabricated cadence. The server cannot distinguish this from a real LLM stream, but the peer experience is wrong — latency is artificial, token rate is uncorrelated with actual decoding, and interrupting mid-composition becomes impossible. The orchestrator/voice split in `CLIENT.md §2.1` exists specifically to ban this anti-pattern (spelled out as a banned failure mode in `CLIENT.md §9`).
+2. **Why a *fresh* `anthropic.messages.stream(...)` per message.** Tokens must leave Anthropic's decoder and enter AgentMail's NDJSON body **in the same process, in the same call, with no buffering in between**. Opening a new stream per outbound message is the cleanest way to guarantee that — it also means each message is a clean unit of idempotency (one `message_id`, one Anthropic stream, one NDJSON POST, one terminal `message_end` or `message_abort`).
+3. **Why a plain-Markdown persona file.** The file IS the Anthropic `system=` prompt, verbatim. No templating, no DSL, no framework — operators edit the persona's voice by editing Markdown. `speak.py` reads the file and passes its contents directly to `Anthropic().messages.stream(system=...)`.
+4. **Why Python specifically.** Shortest path to `anthropic.messages.stream(...)` + `requests.post(..., data=generator(), stream=True)` in a single dozen-line script. Any language with a streaming Anthropic SDK and a streaming HTTP client would work — Python is the reference implementation, not a requirement.
+5. **Why `listen.py` is a Monitor-backed daemon, not an in-turn tail.** SSE is a long-lived connection delivering token-rate events; Claude Code's turn model cannot tail it directly (a turn ends; the stream would end with it). `listen.py` runs as a backgrounded process and emits **one stdout line per semantic event** (`message_end`, `message_abort`, `agent_joined`, `agent_left`). Each line becomes one Claude Code wake-up via the Monitor tool — the only way real-time peer interaction is compatible with Claude Code's event loop at all.
+
+Full operator rules and embedded reference scripts live in [`CLIENT.md §2`](CLIENT.md) — a naïve Claude Code agent needs only `CLIENT.md` to operate the pattern end-to-end.
+
+**Location:** client-side only. The operator's machine. The server is unaware of the distinction between this and §10.
+
+**Identity:** one `POST /agents` call per Claude Code session, persisted for the session's lifetime.
+
+**Composition:** `speak.py` (outbound voice, per-message) + `listen.py` (inbound events, per-conversation) + a plain-Markdown persona file (system prompt) + operator rules embedded in `CLIENT.md §2`.
+
+**Contrast with §10 (resident):**
+
+| | **§10 resident** | **§10b Claude Code persona** |
+|---|---|---|
+| Process | in-server goroutine | external Claude Code session |
+| Anthropic call site | `internal/agent/respond.go` → S2 `AppendSession` direct | `speak.py` → `POST /conversations/{cid}/messages/stream` (NDJSON) |
+| Event ingest | direct S2 `ReadSession` | SSE via `GET /conversations/{cid}/stream` |
+| Default availability | bundled with every deployment | started by the operator on demand |
+| When to prefer | always-on default responder | domain-specific voices, demos, adversarial testing |
+
+Both are first-class. Peers cannot tell which pattern any given member uses — the wire events are identical.
+
+→ Full pattern + embedded reference scripts: [`CLIENT.md §2`](CLIENT.md) (self-contained; a naive Claude Code agent needs only CLIENT.md to operate).
 
 ### 11. Server Lifecycle
 
@@ -303,9 +361,11 @@ agentmail-take-home/
 │   │   └── types.go
 │   └── agent/
 │       ├── agent.go                 → claude-agent-plan.md
-│       ├── listener.go              → claude-agent-plan.md §4
+│       ├── listen.go                → claude-agent-plan.md §4
 │       ├── respond.go               → claude-agent-plan.md §5
+│       ├── state.go                 → claude-agent-plan.md §4
 │       ├── history.go               → claude-agent-plan.md §6
+│       ├── notifier.go              → claude-agent-plan.md §3
 │       └── discovery.go             → claude-agent-plan.md §3
 ├── tests/
 │   ├── integration_test.go
@@ -364,7 +424,8 @@ agentmail-take-home/
 | [`claude-agent-plan.md`](claude-agent-plan.md) | Resident agent identity, discovery, Claude API integration, concurrency, error handling | ~1670 |
 | [`server-lifecycle-plan.md`](server-lifecycle-plan.md) | `main.go` startup/shutdown, configuration, health checks | ~1550 |
 | [`deployment-plan.md`](deployment-plan.md) | `go build`, `cloudflared tunnel`, secrets via process env, health check wiring | ~1160 |
-| [`gaps.md`](gaps.md) | Design audit — what's exhaustively designed vs. sketched, gap analysis | ~270 |
+| [`CLIENT.md`](CLIENT.md) | Client-facing contract (self-contained for naïve agents) + §2 Claude Code persona pattern with embedded reference scripts | ~1440 |
+| [`README.md`](README.md) | Immutable project spec from AgentMail (source of truth for requirements) | ~100 |
 
 ---
 
