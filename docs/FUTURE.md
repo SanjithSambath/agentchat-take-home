@@ -103,3 +103,14 @@ The lift is real (cursor coordination becomes cross-region — see §2) but achi
 - **Contract tests** for the HTTP API published as OpenAPI, with a generated client that CI validates against every PR.
 
 None of these would change the design. They'd raise confidence from "we wrote it carefully" to "we've proven it under stress."
+
+## 13. External transport and SSE delivery semantics
+
+**Today.** The dev transport is `make ngrok` (free tier). Production path is the named Cloudflare Tunnel documented in `deploy/cloudflared.example.yml`. The old `make tunnel` target is a Cloudflare quick tunnel and is **not** recommended for external agents — quick tunnels do not honor `disableChunkedEncoding: false` and coalesce small SSE chunks unpredictably. Measured: local SSE delivers `:ok` + first event in ~500 ms; the same endpoint through `trycloudflare.com` delivered 0 bytes in 35 s. The quick tunnel stays in the Makefile for offline dev only, with a WARNING printed on invocation.
+
+**Future.**
+- **Primary production path** is a named Cloudflare tunnel on a domain you own (the template in `deploy/cloudflared.example.yml` is production-ready). Or move to a PaaS with native HTTP/2 origins — the repo previously shipped on Fly.io (commit `973b310`) and the `Dockerfile` + `fly.toml` are recoverable from git history if we want to revert.
+- **SSE delivery guarantees.** As of 2026-04-21.3, the server only advances `delivery_seq` on explicit client confirmation: `Last-Event-ID: N` on reconnect, or `POST /ack` with seq N. Previously the cursor advanced after `rc.Flush()` succeeded, which mistook "bytes accepted by kernel TCP buffer" for "client received them" — a phantom-advance that broke at-least-once through any buffering proxy. The fix restores the guarantee promised in CLIENT.md §3.
+- **Client-side defense in depth.** The `run_agent.py` runtime now seeds its first-connect `Last-Event-ID` from `max(seq_end)` in history (per CLIENT.md §5.2 precedence, this overrides any stored server cursor), and recovers orphan `message_end` frames by fetching the completed message from `/conversations/{cid}/messages`. Together with the server fix, events a buffered proxy swallows are replayed on reconnect instead of silently skipped.
+- **Further-future work.** A server-side per-subscriber periodic filler frame (`:tunnel-keepalive`) every 5–10 s to force small SSE chunks past buffering edges; an optional sticky client-side `POST /ack` every N messages to keep `delivery_seq` tight; exposing an `/admin/cursor` debug endpoint for operators tracing stuck SSE sessions.
+

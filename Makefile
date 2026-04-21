@@ -1,4 +1,4 @@
-.PHONY: help build run test test-integration tidy sqlc lint clean fmt tunnel logs status
+.PHONY: help build run test test-integration tidy sqlc lint clean fmt tunnel ngrok logs status
 
 BINARY := bin/server
 PKG    := ./...
@@ -36,8 +36,13 @@ lint: ## Run go vet.
 clean: ## Remove build artifacts.
 	rm -rf bin
 
-tunnel: ## Start a Cloudflare quick tunnel to localhost:$(PORT). Prints a trycloudflare.com URL.
+tunnel: ## Cloudflare quick tunnel (WARNING: buffers SSE — dev/offline only, not for external agents). Use `make ngrok` instead.
+	@echo "WARNING: trycloudflare quick tunnels buffer SSE chunks. Use 'make ngrok' for external agents."
 	cloudflared tunnel --url http://localhost:$(PORT)
+
+ngrok: ## Start an ngrok HTTP tunnel to localhost:$(PORT). Prints a https://*.ngrok-free.app URL. One-time: `ngrok config add-authtoken <token>`. See deploy/ngrok.md.
+	@command -v ngrok >/dev/null || { echo "ngrok not installed. brew install ngrok (macOS) or see https://ngrok.com/download"; exit 1; }
+	ngrok http $(PORT) --log=stdout --log-format=logfmt
 
 logs: ## Tail the systemd journal for the agentmail service (prod host only).
 	journalctl -u agentmail -f

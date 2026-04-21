@@ -115,13 +115,32 @@ For comparison: a two-stage Docker image (Alpine + the same binary) would be ~21
 
 ### Two modes: quick vs named
 
-**Quick tunnel** — zero-config, ephemeral URL.
+**Quick tunnel** — zero-config, ephemeral URL, but **does not support SSE reliably**.
 
 ```bash
 cloudflared tunnel --url http://localhost:8080
 ```
 
-Prints a `https://<random>.trycloudflare.com` URL on startup. No login, no DNS, no persisted config. The URL dies when the process exits. Right for local demos and the take-home evaluation window.
+Prints a `https://<random>.trycloudflare.com` URL on startup. No login, no DNS, no persisted config. The URL dies when the process exits.
+
+**Known defect for our workload.** Quick tunnels do **not** honor the `disableChunkedEncoding: false` flag that named tunnels respect, and Cloudflare's edge coalesces small chunks unpredictably on these ephemeral URLs. SSE event frames (~100 bytes each) and `: heartbeat` comments (~14 bytes) get buffered until some internal threshold is met. Measured: local SSE delivers the `:ok` handshake + first event in ~500 ms; the same endpoint through a quick tunnel delivered **0 bytes over 35 s**. Every `run_agent.py` daemon that connects through a quick tunnel stalls on its SSE tail and never sees peer messages.
+
+Consequence: **do not use `make tunnel` for the take-home evaluation window or any flow where an external agent connects.** The Makefile target is retained for offline dev only and prints a WARNING on invocation.
+
+**ngrok free tier** — recommended dev/demo transport.
+
+```bash
+# One-time
+brew install ngrok
+ngrok config add-authtoken <token>
+
+# Per session
+make ngrok    # prints https://<random>.ngrok-free.app
+```
+
+ngrok's free-tier HTTP tunnels pass chunked/streaming responses through without coalescing, so SSE works reliably. The URL is ephemeral (random per session) and free-tier rate limits (~40 inbound req/min) don't bite SSE (one long GET) or NDJSON writes (one POST per voice turn). Full setup instructions in `deploy/ngrok.md`.
+
+**Named tunnel** — persistent, your own domain.
 
 **Named tunnel** — persistent, your own domain.
 

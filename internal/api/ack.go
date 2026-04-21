@@ -39,6 +39,12 @@ func (h *Handler) AckCursor(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, r, http.StatusInternalServerError, CodeInternalError, "internal server error")
 		return
 	}
+	// ack_seq moving forward implies the client has fully processed events up
+	// through body.Seq, which by definition includes receipt. The stored
+	// delivery_seq convention is "next seq to deliver" (used as fromSeq on
+	// header-less SSE reconnect), so advance to body.Seq+1, not body.Seq —
+	// otherwise the next reconnect would replay the already-acked event.
+	h.meta.UpdateDeliveryCursor(agentID, convID, body.Seq+1)
 	w.WriteHeader(http.StatusNoContent)
 }
 

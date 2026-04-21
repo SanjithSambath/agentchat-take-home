@@ -35,7 +35,27 @@ import requests
 from anthropic import Anthropic
 
 
-__VERSION__ = "2026-04-21.2"
+__VERSION__ = "2026-04-21.3"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Typed exceptions for membership/transport errors.
+#
+# Without these, every HTTP failure looked like "not a member" to the
+# caller — a 5xx or a DNS hiccup would exit with the wrong error message
+# and no retry.
+# ─────────────────────────────────────────────────────────────────────
+
+class NotMemberError(Exception):
+    """403 not_member on a conversation endpoint."""
+
+
+class ConversationNotFoundError(Exception):
+    """404 conversation_not_found."""
+
+
+class TransientError(Exception):
+    """5xx, network, or other retriable failure after exhausted retries."""
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -134,17 +154,76 @@ def http_json(method: str, url: str, agent: str | None = None, **kw):
 
 
 def fetch_members(base: str, agent: str, cid: str) -> list[str]:
-    try:
-        r = http_json("GET", f"{base}/conversations/{cid}", agent)
-        return list(r.get("members") or [])
-    except Exception:
-        return []
+    """Return the current member list for (agent, cid). Raises:
+      - NotMemberError: 403, caller is not a member (real auth failure).
+      - ConversationNotFoundError: 404, cid doesn't exist.
+      - TransientError: all transport/5xx/malformed-response after retries.
+    Distinct exceptions matter: "not a member" and "server is down" are
+    very different remediation paths for the operator.
+    """
+    last_err = "unknown"
+    for attempt in range(3):
+        try:
+            r = requests.get(
+                f"{base}/conversations/{cid}",
+                headers={"X-Agent-ID": agent},
+                timeout=15,
+            )
+        except requests.RequestException as e:
+            last_err = f"network error: {e}"
+            time.sleep(min(5.0, 0.5 * 2 ** (attempt + 1)) * (0.5 + random.random()))
+            continue
+        if r.status_code == 200:
+            try:
+                return list((r.json() or {}).get("members") or [])
+            except Exception as e:
+                raise TransientError(f"invalid server response: {e}")
+        if r.status_code == 403:
+            raise NotMemberError()
+        if r.status_code == 404:
+            raise ConversationNotFoundError()
+        if r.status_code >= 500:
+            last_err = f"server {r.status_code}: {r.text[:160]}"
+            time.sleep(min(5.0, 0.5 * 2 ** (attempt + 1)) * (0.5 + random.random()))
+            continue
+        # Other 4xx (400, 401, 405, etc.) — not retriable, distinct from membership.
+        raise TransientError(f"HTTP {r.status_code}: {r.text[:200]}")
+    raise TransientError(last_err)
 
 
 def fetch_history(base: str, agent: str, cid: str, limit: int = 100) -> list[dict]:
     r = http_json("GET", f"{base}/conversations/{cid}/messages", agent,
                   params={"limit": limit})
     return list(reversed(r.get("messages", []) or []))
+
+
+def seed_listen_state(state_file: Path, history: list[dict]) -> int | None:
+    """Pre-seed the listen state file from history's max(seq_end).
+
+    Guarantees the Tail's first SSE connect sends `Last-Event-ID: <max_seq>`,
+    which per CLIENT.md §5.2 precedence overrides any stored server-side
+    delivery_seq (including a phantom-advanced one). Makes the client
+    authoritative about its resume position on first connect.
+
+    No-op if the state file already exists or history has no complete messages.
+    Returns the seeded seq value, or None.
+    """
+    if state_file.exists():
+        return None
+    max_seq = 0
+    for m in history:
+        se = m.get("seq_end")
+        if isinstance(se, int) and se > max_seq and m.get("status") == "complete":
+            max_seq = se
+    if max_seq <= 0:
+        return None
+    try:
+        tmp = state_file.with_suffix(state_file.suffix + ".tmp")
+        tmp.write_text(str(max_seq))
+        tmp.replace(state_file)
+        return max_seq
+    except Exception:
+        return None
 
 
 def post_leave(base: str, agent: str, cid: str) -> None:
@@ -211,12 +290,31 @@ def resolve_peer_and_conversation(
 
     if target.kind == "join":
         cid = target.value
-        members = fetch_members(base, agent, cid)
-        if agent not in members:
+        try:
+            members = fetch_members(base, agent, cid)
+        except NotMemberError:
             sys.exit(
                 f"run_agent.py: not a member of conversation {cid}. "
                 f"Ask the initiator to invite your agent first: "
                 f"POST /conversations/{cid}/invite with body {{\"agent_id\":\"{agent}\"}}."
+            )
+        except ConversationNotFoundError:
+            sys.exit(
+                f"run_agent.py: conversation {cid} does not exist. "
+                f"Double-check the id the initiator shared with you."
+            )
+        except TransientError as e:
+            sys.exit(
+                f"run_agent.py: service unavailable while verifying membership: {e}. "
+                f"Confirm BASE_URL is reachable and try again."
+            )
+        if agent not in members:
+            # Server returned 200 but our id isn't in the list. This shouldn't
+            # normally happen (403 would have fired) — defensive.
+            sys.exit(
+                f"run_agent.py: server reports conversation {cid} exists but "
+                f"our agent id {agent} is not in its members. Possible race "
+                f"with a leave — retry the join."
             )
         file_write(conv_id_path, cid)
         return (None, cid, False)
@@ -315,7 +413,11 @@ class Tail(threading.Thread):
                             if (etype and data is not None and seq is not None
                                     and seq not in seen):
                                 seen[seq] = True
-                                if len(seen) > 4096:
+                                # Bounded dedup set. Raised from 4096 →
+                                # 65536 because longer conversations (>4k
+                                # events) were hitting eviction and seeing
+                                # duplicate emissions after reconnect-replay.
+                                if len(seen) > 65536:
                                     seen.pop(next(iter(seen)))
                                 try:
                                     self._emit(etype, json.loads(data), seq, pending)
@@ -354,8 +456,31 @@ class Tail(threading.Thread):
                 e["c"].append(d.get("content", ""))
             return
         if etype in ("message_end", "message_abort"):
-            e = pending.pop(d["message_id"], None)
-            if not e or e["sender"] == self.agent:
+            mid = d.get("message_id", "")
+            e = pending.pop(mid, None)
+            if e is None:
+                # Orphan: we saw message_end/abort without the matching
+                # message_start (joined mid-message, or server advanced its
+                # cursor past the start frames). Fall back to fetching the
+                # fully-assembled message from /messages — it's durable in
+                # the store regardless of SSE replay state. Silent drop here
+                # used to be the spec-suggested behavior, but it meant the
+                # daemon sat idle when the peer's only message predated our
+                # tail's replay window.
+                recovered = self._fetch_orphan(mid)
+                if recovered is None:
+                    return
+                sender = recovered.get("sender_id", "")
+                if not sender or sender == self.agent:
+                    return
+                kind = "message" if etype == "message_end" else "aborted"
+                self.out.put({
+                    "kind": kind, "seq": seq,
+                    "sender": sender,
+                    "content": recovered.get("content", "") or "",
+                })
+                return
+            if e["sender"] == self.agent:
                 return
             kind = "message" if etype == "message_end" else "aborted"
             self.out.put({
@@ -371,6 +496,29 @@ class Tail(threading.Thread):
                 "kind": "joined" if etype == "agent_joined" else "left",
                 "agent_id": aid,
             })
+
+    def _fetch_orphan(self, message_id: str) -> dict | None:
+        """Fetch a single completed message by id from /messages. Used to
+        recover the content of a message whose start-frames we missed.
+        Keeps the fetch narrow: /messages returns the 50 most-recent by
+        default, and we scan for message_id. On any failure we return None
+        rather than killing the tail.
+        """
+        try:
+            r = requests.get(
+                f"{self.base}/conversations/{self.cid}/messages",
+                headers={"X-Agent-ID": self.agent},
+                params={"limit": 50},
+                timeout=10,
+            )
+            if not r.ok:
+                return None
+            for m in (r.json().get("messages") or []):
+                if m.get("message_id") == message_id:
+                    return m
+        except Exception:
+            return None
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -472,7 +620,14 @@ def speak(
         state = {"leave_requested": False, "leave_reason": None}
 
         def body():
-            yield (json.dumps({"message_id": mid}) + "\n").encode()
+            # Defer the message_id header line until we have our first text
+            # token. If the Anthropic stream produces no text at all (LLM
+            # went straight to tool_use, or just emitted end_turn with no
+            # content), body() yields nothing → the POST body is empty →
+            # server returns 400 missing_message_id, which we translate
+            # into a "silent_turn" result below. This avoids publishing
+            # zero-content messages on the wire that confuse peers.
+            header_sent = False
             with Anthropic().messages.stream(
                 model=model, max_tokens=max_tokens,
                 system=system, messages=msgs, tools=[TOOL_LEAVE],
@@ -493,6 +648,9 @@ def speak(
                         if dtype == "text_delta":
                             text = getattr(delta, "text", "") or ""
                             if text:
+                                if not header_sent:
+                                    yield (json.dumps({"message_id": mid}) + "\n").encode()
+                                    header_sent = True
                                 sent_text.append(text)
                                 yield (json.dumps({"content": text}) + "\n").encode()
                         elif dtype == "input_json_delta":
@@ -554,6 +712,21 @@ def speak(
                 "leave_reason": state["leave_reason"],
                 "ok": False,
                 "error_code": code,
+            }
+        if code == "missing_message_id":
+            # body() yielded nothing → POST body was empty → server got no
+            # first line. Means the Anthropic stream produced no text at
+            # all (no text_delta events). Either the LLM called
+            # leave_conversation without a closing message (state[
+            # "leave_requested"] == True) or it just went silent. Either
+            # way, no voice to publish. Surface as a silent-turn result
+            # so run_one_turn can decide whether to nudge-retry or leave.
+            return {
+                "text": "",
+                "leave_requested": state["leave_requested"],
+                "leave_reason": state["leave_reason"],
+                "ok": True,
+                "error_code": "silent_turn",
             }
         if r.status_code >= 500 or code in ("internal_error", "timeout"):
             time.sleep(min(30.0, 0.5 * 2 ** (attempt + 1)) * random.random())
@@ -704,26 +877,41 @@ def main() -> int:
         log(f"⚠ share this conversation id with the peer so they can join:")
         log(f"   {cid}")
 
+    # Pre-seed the listen state file from history's max(seq_end) BEFORE the
+    # Tail starts. On first connect the Tail's _load_last() reads the seeded
+    # value and sends Last-Event-ID: <max_seq>, which per CLIENT.md §5.2
+    # precedence overrides the server's stored delivery_seq. Guards against
+    # server-side cursor drift — even if the server's cursor has been
+    # phantom-advanced by a prior buffered connection, we explicitly resume
+    # from where history says we are.
+    state_file = sd / f"listen_{agent}_{cid}.state"
+    startup_history = fetch_history(base, agent, cid)
+    seeded = seed_listen_state(state_file, startup_history)
+    if seeded is not None:
+        log(f"   seeded Last-Event-ID  {seeded} (from history)")
+
     # Arm the tail before any send. The server flushes `:ok\n\n` on connect
     # so armed.wait() returns quickly over a healthy network.
     events: queue.Queue = queue.Queue()
     stop_evt = threading.Event()
-    tail = Tail(
-        base, agent, cid,
-        sd / f"listen_{agent}_{cid}.state",
-        events, stop_evt,
-    )
+    tail = Tail(base, agent, cid, state_file, events, stop_evt)
     tail.start()
     if not tail.armed.wait(timeout=15):
         sys.exit("run_agent.py: SSE tail failed to arm within 15s")
 
     # Track live membership. The server returns the authoritative set at
-    # this moment; agent_joined/agent_left deltas keep us current.
-    members = set(fetch_members(base, agent, cid))
+    # this moment; agent_joined/agent_left deltas keep us current. If the
+    # membership GET fails here (5xx, network), fall back to just {self,
+    # peer} — we already passed resolve_peer_and_conversation, so the
+    # membership is valid even if we can't read it now.
+    try:
+        members = set(fetch_members(base, agent, cid))
+    except (NotMemberError, ConversationNotFoundError, TransientError) as e:
+        log(f"  membership read failed ({type(e).__name__}); assuming local view")
+        members = set()
     members.add(agent)
     if peer_id:
         members.add(peer_id)
-    peers = members - {agent}
     policy = resolve_policy(args.policy, len(members))
     log(f"   policy              {policy}   members: {len(members)}")
 
@@ -741,9 +929,18 @@ def main() -> int:
     turns = 0
     exit_reason = "unknown"
     peers_gone = False
+    peers_gone_at: float | None = None
+    PEERS_LEFT_DEADLINE_SEC = 30.0
 
-    def run_one_turn(directive: str | None) -> bool:
-        """Do one voice turn. Returns True if we should exit after this turn."""
+    def run_one_turn(directive: str | None, silence_retry: bool = False) -> bool:
+        """Do one voice turn. Returns True if we should exit after this turn.
+
+        Silent-turn handling: if the voice stream produces no text and no
+        leave_conversation tool call, retry ONCE with a nudging directive.
+        If the retry is also silent, auto-leave with reason `silent_turns`.
+        Prevents infinite silent-turn loops and keeps empty messages off
+        the wire.
+        """
         nonlocal turns, exit_reason, peers_gone
         turns += 1
         result = speak(
@@ -751,8 +948,31 @@ def main() -> int:
             system_prompt=brief, model=args.model, max_tokens=args.max_tokens,
             directive=directive, peers_left=peers_gone,
         )
+
+        is_silent = result.get("error_code") == "silent_turn"
         toks = approx_tokens(result.get("text", ""))
-        tag = "you spoke" if result.get("text") else "you spoke (silent)"
+
+        if is_silent and result.get("leave_requested"):
+            # LLM called leave_conversation without any closing text.
+            # Acceptable — just exit cleanly. No message published.
+            log(f"▸ turn {turns:>2}  leave_conversation (no closing message)")
+            exit_reason = "leave_tool"
+            return True
+
+        if is_silent:
+            if not silence_retry:
+                log(f"▸ turn {turns:>2}  voice produced no text; nudging and retrying")
+                return run_one_turn(
+                    "Your previous turn produced no text. Say something "
+                    "substantive now, or call leave_conversation if the "
+                    "task is complete.",
+                    silence_retry=True,
+                )
+            log(f"▸ turn {turns:>2}  still silent after nudge; auto-leaving")
+            exit_reason = "silent_turns"
+            return True
+
+        tag = "you spoke"
         log(f"▸ turn {turns:>2}  {tag:<20} (~{toks} tokens)")
 
         if result.get("leave_requested"):
@@ -770,7 +990,6 @@ def main() -> int:
         recent.append(agent)
         return False
 
-    startup_history = fetch_history(base, agent, cid)
     if is_initiator and len(startup_history) == 0:
         if run_one_turn("Begin the conversation now — make the first move per your brief."):
             stop_evt.set()
@@ -795,6 +1014,17 @@ def main() -> int:
 
     # Main event loop.
     while not closing and turns < args.turns:
+        # Peer-left deadline: if all peers have left and no event arrives
+        # within PEERS_LEFT_DEADLINE_SEC, auto-leave. Protects against the
+        # case where `peers_gone` is set but no subsequent turn event fires
+        # (nothing to wake us up) — we'd otherwise sit idle until --turns.
+        if peers_gone and peers_gone_at is not None:
+            elapsed = time.time() - peers_gone_at
+            if elapsed > PEERS_LEFT_DEADLINE_SEC:
+                log(f"  peer-left deadline reached ({elapsed:.0f}s); leaving")
+                exit_reason = "peers_left"
+                break
+
         try:
             ev = events.get(timeout=1.0)
         except queue.Empty:
@@ -812,6 +1042,11 @@ def main() -> int:
             if aid:
                 members.add(aid)
                 log(f"+ joined  {aid}")
+                # A new peer reset peers_gone — we have someone to talk to.
+                if peers_gone and (members - {agent}):
+                    peers_gone = False
+                    peers_gone_at = None
+                    log("  peers_gone cleared (new member joined)")
             continue
 
         if kind == "left":
@@ -821,7 +1056,10 @@ def main() -> int:
                 log(f"- left    {aid}")
             if members - {agent} == set() and not peers_gone:
                 peers_gone = True
-                log("  all peers have left; next turn will leave_conversation")
+                peers_gone_at = time.time()
+                log(f"  all peers have left; {PEERS_LEFT_DEADLINE_SEC:.0f}s "
+                    f"deadline before auto-leave (next turn will try "
+                    f"leave_conversation first)")
             continue
 
         if kind not in ("message", "aborted"):

@@ -77,6 +77,19 @@ func TestClientRunAgentShapeSanity(t *testing.T) {
 		"--target",
 		"--brief",
 		"--register-only",
+		// Phase-3 markers — protocol hardening shipped in 2026-04-21.3.
+		"NotMemberError",
+		"ConversationNotFoundError",
+		"TransientError",
+		"seed_listen_state",
+		"_fetch_orphan",
+		"silent_turn",
+		"PEERS_LEFT_DEADLINE_SEC",
+	}
+	// Minimum VERSION the embedded script must be — forces bumping when
+	// any of the markers above change.
+	if !strings.Contains(body, `__VERSION__ = "2026-04-21.3`) {
+		t.Errorf("embedded run_agent.py __VERSION__ is older than 2026-04-21.3; bump both VERSION and the constant")
 	}
 	for _, m := range markers {
 		if !strings.Contains(body, m) {

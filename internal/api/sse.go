@@ -50,11 +50,25 @@ func (h *Handler) SSEStream(w http.ResponseWriter, r *http.Request) {
 	// Last-Event-ID overrides the stored cursor (per SSE spec) iff ?from is
 	// absent. If both are present, ?from wins — explicit query params beat
 	// headers.
+	//
+	// IMPORTANT: Last-Event-ID is the SSE-spec-defined client confirmation
+	// that the client received everything up to N. It's our only authoritative
+	// signal of actual delivery — rc.Flush() only tells us bytes hit the
+	// kernel send buffer, not that the client read them (buffering proxies
+	// can swallow chunks). So we advance the durable delivery_seq cursor HERE,
+	// on confirmed resume, rather than in the hot per-event loop below.
 	if !fromPresent {
 		if lei := r.Header.Get("Last-Event-ID"); lei != "" {
 			if v, err := strconv.ParseUint(lei, 10, 64); err == nil {
 				fromSeq = v + 1
 				fromPresent = true
+				// Advance the stored cursor. Client confirmed receipt up
+				// through seq v, so the next thing to deliver is v+1.
+				// The stored cursor's convention is "next seq to deliver"
+				// (it's used directly as fromSeq on a subsequent connect
+				// without headers), so store v+1, not v. Storing v would
+				// cause the next header-less reconnect to replay seq v.
+				h.meta.UpdateDeliveryCursor(agentID, convID, v+1)
 			}
 		}
 	}
@@ -175,7 +189,13 @@ func (h *Handler) SSEStream(w http.ResponseWriter, r *http.Request) {
 			if err := rc.Flush(); err != nil {
 				return
 			}
-			h.meta.UpdateDeliveryCursor(agentID, convID, ev.SeqNum)
+			// Deliberately NOT advancing delivery_seq here. rc.Flush()
+			// succeeded means bytes reached the kernel send buffer, not that
+			// the client read them — through a buffering proxy (Cloudflare
+			// quick tunnel, nginx with default proxy_buffering, etc.) these
+			// are not the same. The cursor is advanced on Last-Event-ID
+			// reconnect (above) or POST /ack (see ack.go). This is the
+			// at-least-once semantics promised by CLIENT.md §3.
 		}
 	}
 }

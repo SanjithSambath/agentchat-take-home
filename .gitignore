@@ -6,3 +6,4 @@
 /bin/
 .claude/
 negotiation/__pycache__/
+internal/api/client/__pycache__/
